@@ -1,0 +1,19 @@
+{
+  "packages": [
+{
+  "SPDXID" : "SPDXRef-resource-0",
+  "checksums" : 
+  [
+    {
+      "algorithm" : "SHA512",
+      "checksumValue" : "7a58f237a38b3faed778fbe8508eadd9e5b282bd38ef4a0f40118498cf578fe96f1d4272c0b839bd290150e6ff25c6d44fe7362e3fc046b04d44ade8edd091ea"
+    }
+  ],
+  "copyrightText" : "NOASSERTION",
+  "downloadLocation" : "git+https://github.com/cameron314/concurrentqueue@v1.0.5",
+  "licenseConcluded" : "NOASSERTION",
+  "licenseDeclared" : "NOASSERTION",
+  "name" : "cameron314/concurrentqueue"
+}
+  ]
+}

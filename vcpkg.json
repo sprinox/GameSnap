@@ -1,6 +1,7 @@
 {
   "dependencies": [
+    "concurrentqueue",
     "spdlog",
-    "concurrentqueue"
+    "cpptrace"
   ]
 }

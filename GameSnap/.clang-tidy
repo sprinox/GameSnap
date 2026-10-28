@@ -1,0 +1,49 @@
+# 启用检查的类别，采用“白名单”模式，从 - 开始以禁用所有默认检查
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  cert-*,
+  -cert-err58-cpp,
+  clang-analyzer-*,
+  concurrency-*,
+  cppcoreguidelines-*,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-type-union-access,
+  modernize-*,
+  -modernize-use-trailing-return-type,
+  performance-*,
+  portability-*,
+  readability-*,
+  -readability-magic-numbers,
+  -readability-function-cognitive-complexity,
+  -readability-identifier-length,
+  -readability-braces-around-statements,
+  -clang-analyzer-optin.cplusplus.UninitializedObject,
+
+# 头文件过滤，建议仅检查项目自己的头文件
+HeaderFilterRegex: '.*(include|src)/.*\.(h|hpp)$'
+
+# 将部分关键检查视为错误，阻止 CI 通过
+WarningsAsErrors: 'bugprone-*,cert-*,clang-analyzer-*,concurrency-*'
+
+# 命名约定（请根据团队规范调整）
+CheckOptions:
+  # 命名规范
+  - { key: readability-identifier-naming.ClassCase,           value: CamelCase }
+  - { key: readability-identifier-naming.StructCase,          value: CamelCase }
+  - { key: readability-identifier-naming.NamespaceCase,       value: lower_case }
+  - { key: readability-identifier-naming.FunctionCase,        value: lower_case }
+  - { key: readability-identifier-naming.VariableCase,        value: lower_case }
+  - { key: readability-identifier-naming.PrivateMemberPrefix, value: 'm_' }
+  - { key: readability-identifier-naming.ConstantCase,        value: UPPER_CASE }
+  - { key: readability-identifier-naming.EnumConstantCase,    value: CamelCase }
+  # 其他
+  - { key: readability-identifier-naming.IgnoreMainLikeFunctions, value: 1 }
+  - { key: performance-unnecessary-value-param.AllowedTypes,   value: 'std::string;std::vector' }
+
+# 适用于 C++17/20 项目，避免对旧标准代码产生误报
+InheritParentConfig: false

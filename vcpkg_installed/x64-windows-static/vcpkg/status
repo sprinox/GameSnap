@@ -48,3 +48,22 @@ Multi-Arch: same
 Description: Omit %z timezone offset (use on platforms without tm_gmtoff)
 Status: install ok installed
 
+Package: concurrentqueue
+Version: 1.0.5
+Depends: vcpkg-cmake:x64-windows, vcpkg-cmake-config:x64-windows
+Architecture: x64-windows-static
+Multi-Arch: same
+Abi: a7003c589ba661794c94f76e1a909f9a31782c942978508e435ac907a48a1b1c
+Description: A fast multi-producer, multi-consumer lock-free concurrent queue for C++11
+Status: install ok installed
+
+Package: cpptrace
+Version: 1.0.4
+Port-Version: 2
+Depends: vcpkg-cmake:x64-windows, vcpkg-cmake-config:x64-windows
+Architecture: x64-windows-static
+Multi-Arch: same
+Abi: fa72834f7bc1d8b7effbd69c32a920df26b18abf1538662b612197e6b84f469d
+Description: Simple, portable, and self-contained stacktrace library for C++11 and newer
+Status: install ok installed
+

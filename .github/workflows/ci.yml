@@ -36,16 +36,6 @@ jobs:
           Write-Host "MSBuild: $vs\MSBuild\Current\Bin\MSBuild.exe"
           Write-Host "MSVC: $($msvc.Name) -> $toolset"
 
-      - name: Restore vcpkg cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ env.VCPKG_ROOT }}\downloads
-            ${{ env.VCPKG_ROOT }}\buildtrees
-            ${{ github.workspace }}\vcpkg_installed
-          key: vcpkg-${{ runner.os }}-${{ env.MSVC_TOOLSET }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: vcpkg-${{ runner.os }}-${{ env.MSVC_TOOLSET }}-
-
       - name: Setup vcpkg
         shell: pwsh
         run: |
@@ -57,13 +47,19 @@ jobs:
           }
           & "$env:VCPKG_ROOT\vcpkg.exe" integrate install
 
-      - name: Install dependencies
+      - name: Restore vcpkg cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.VCPKG_ROOT }}\downloads
+            ${{ env.VCPKG_ROOT }}\buildtrees
+            ~\AppData\Local\vcpkg\archives
+          key: vcpkg-${{ runner.os }}-${{ env.MSVC_TOOLSET }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-${{ env.MSVC_TOOLSET }}-
+
+      - name: Clean vcpkg install tree
         shell: pwsh
-        run: |
-          Push-Location $env:GITHUB_WORKSPACE
-          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows-static
-          if ($LASTEXITCODE -ne 0) { throw 'vcpkg install failed' }
-          Pop-Location
+        run: Remove-Item -Recurse -Force "$env:GITHUB_WORKSPACE\vcpkg_installed" -ErrorAction SilentlyContinue
 
       - name: Restore NuGet packages
         shell: pwsh
@@ -86,7 +82,8 @@ jobs:
               /p:PlatformToolset=$env:MSVC_TOOLSET `
               /p:WindowsTargetPlatformVersion=10.0 `
               /p:EnableClangTidyCodeAnalysis=false `
-              /p:RunCodeAnalysis=false
+              /p:RunCodeAnalysis=false `
+              /p:VcpkgManifestInstall=true
             if ($LASTEXITCODE -ne 0) { throw "$configuration build failed" }
           }
 

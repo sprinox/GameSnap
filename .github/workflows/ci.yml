@@ -30,15 +30,32 @@ jobs:
           & "$env:VCPKG_ROOT\vcpkg.exe" integrate install
           Remove-Item -Recurse -Force "$env:GITHUB_WORKSPACE\vcpkg_installed" -ErrorAction SilentlyContinue
 
-      - name: Restore vcpkg cache
+      - name: Restore vcpkg binaries cache
+        id: vcpkg-bins
         uses: actions/cache@v5
         with:
           path: |
             ${{ github.workspace }}\vcpkg-cache
             ${{ env.VCPKG_ROOT }}\downloads
-            ${{ github.workspace }}\vcpkg_installed
-          key: vcpkg-v2-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: vcpkg-v2-${{ runner.os }}-
+          key: vcpkg-bins-v3-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: vcpkg-bins-v3-${{ runner.os }}-
+
+      - name: Restore vcpkg installed cache
+        id: vcpkg-installed
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}\vcpkg_installed
+          key: vcpkg-installed-v3-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+
+      - name: Refresh vcpkg stamp on cache hit
+        shell: pwsh
+        run: |
+          Write-Host "binaries cache hit: ${{ steps.vcpkg-bins.outputs.cache-hit }}"
+          Write-Host "installed cache hit: ${{ steps.vcpkg-installed.outputs.cache-hit }}"
+          if ('${{ steps.vcpkg-installed.outputs.cache-hit }}' -eq 'true') {
+            Get-ChildItem "$env:GITHUB_WORKSPACE\vcpkg_installed" -Filter '.msbuildstamp-*' -Recurse -Force -ErrorAction SilentlyContinue |
+              ForEach-Object { $_.LastWriteTime = Get-Date }
+          }
 
       - name: Restore NuGet packages
         shell: pwsh

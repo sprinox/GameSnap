@@ -15,6 +15,7 @@ jobs:
     timeout-minutes: 30
     env:
       VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}\vcpkg-cache,readwrite'
 
     steps:
       - uses: actions/checkout@v5
@@ -33,11 +34,11 @@ jobs:
         uses: actions/cache@v5
         with:
           path: |
+            ${{ github.workspace }}\vcpkg-cache
             ${{ env.VCPKG_ROOT }}\downloads
-            ~\AppData\Local\vcpkg\archives
-          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: vcpkg-${{ runner.os }}-
-
+            ${{ github.workspace }}\vcpkg_installed
+          key: vcpkg-v2-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: vcpkg-v2-${{ runner.os }}-
 
       - name: Restore NuGet packages
         shell: pwsh
@@ -76,6 +77,8 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v5
+
       - uses: actions/download-artifact@v5
         with:
           name: GameSnap-x64
@@ -97,4 +100,4 @@ jobs:
         run: |
           $tag = "pre-${env:GITHUB_RUN_NUMBER}.${env:GITHUB_RUN_ATTEMPT}"
           $notes = "Commit: $env:GITHUB_SHA`nRun: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
-          gh release create $tag --prerelease --title "Pre-release #$env:GITHUB_RUN_NUMBER" --notes $notes GameSnap-x64-Debug.zip GameSnap-x64-Release.zip
+          gh release create $tag --prerelease --target $env:GITHUB_SHA --title "Pre-release #$env:GITHUB_RUN_NUMBER" --notes $notes GameSnap-x64-Debug.zip GameSnap-x64-Release.zip

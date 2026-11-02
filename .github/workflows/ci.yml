@@ -12,7 +12,9 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    permissions:
+      contents: write
     env:
       VCPKG_ROOT: ${{ github.workspace }}\vcpkg
       VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}\vcpkg-cache,readwrite'
@@ -75,45 +77,21 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "$cfg build failed" }
           }
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v5
-        with:
-          name: GameSnap-x64
-          path: |
-            GameSnap/x64/Debug/GameSnap.exe
-            GameSnap/x64/Debug/GameSnap.pdb
-            GameSnap/x64/Release/GameSnap.exe
-            GameSnap/x64/Release/GameSnap.pdb
-          if-no-files-found: error
-
-  release:
-    needs: build
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
-    runs-on: windows-latest
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: actions/download-artifact@v5
-        with:
-          name: GameSnap-x64
-          path: dist
-
       - name: Package
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
         shell: pwsh
         run: |
           $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
           if (-not (Test-Path $sevenZip)) { $sevenZip = '7z.exe' }
           foreach ($cfg in 'Debug', 'Release') {
-            $dir = Get-ChildItem dist -Recurse -Directory -Filter $cfg | Select-Object -First 1
-            if (-not $dir) { throw "$cfg artifacts missing" }
-            & $sevenZip a -t7z -mx=9 -m0=lzma2:d=256m -mfb=273 -ms=on "GameSnap-x64-$cfg.7z" "$($dir.FullName)\*"
+            $dir = "GameSnap\x64\$cfg"
+            if (-not (Test-Path "$dir\GameSnap.exe")) { throw "$cfg build output missing" }
+            & $sevenZip a -t7z -mx=9 -m0=lzma2:d=256m -mfb=273 -ms=on "GameSnap-x64-$cfg.7z" "$dir\*"
             if ($LASTEXITCODE -ne 0) { throw "7z $cfg failed" }
           }
 
       - name: Create pre-release
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

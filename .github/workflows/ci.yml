@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select MSBuild
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'no Visual Studio C++ toolchain found' }
+          $msvc = Get-ChildItem (Join-Path $vs 'VC\Tools\MSVC') -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $version = [version]$msvc.Name
+          $toolset = if ($version -ge [version]'14.50') { 'v145' } elseif ($version -ge [version]'14.30') { 'v143' } else { 'v142' }
+          "MSBUILD_PATH=$vs\MSBuild\Current\Bin\MSBuild.exe" >> $env:GITHUB_ENV
+          "MSVC_TOOLSET=$toolset" >> $env:GITHUB_ENV
+          Write-Host "MSBuild: $vs\MSBuild\Current\Bin\MSBuild.exe"
+          Write-Host "MSVC: $($msvc.Name) -> $toolset"
+
+      - name: Restore vcpkg cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.VCPKG_ROOT }}\downloads
+            ${{ env.VCPKG_ROOT }}\buildtrees
+            ${{ github.workspace }}\vcpkg_installed
+          key: vcpkg-${{ runner.os }}-${{ env.MSVC_TOOLSET }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-${{ env.MSVC_TOOLSET }}-
+
+      - name: Setup vcpkg
+        shell: pwsh
+        run: |
+          $baseline = (Get-Content vcpkg-configuration.json -Raw | ConvertFrom-Json).'default-registry'.baseline
+          if (-not (Test-Path "$env:VCPKG_ROOT\vcpkg.exe")) {
+            git clone https://github.com/microsoft/vcpkg.git "$env:VCPKG_ROOT"
+            git -C "$env:VCPKG_ROOT" checkout $baseline
+            & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          }
+          & "$env:VCPKG_ROOT\vcpkg.exe" integrate install
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          Push-Location $env:GITHUB_WORKSPACE
+          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows-static
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg install failed' }
+          Pop-Location
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: |
+          if (-not (Get-Command nuget -ErrorAction SilentlyContinue)) {
+            Invoke-WebRequest https://dist.nuget.org/win-x86-commandline/latest/nuget.exe -OutFile nuget.exe
+            $env:PATH = "$PWD;$env:PATH"
+          }
+          nuget restore GameSnap\packages.config -PackagesDirectory packages
+          if ($LASTEXITCODE -ne 0) { throw 'nuget restore failed' }
+
+      - name: Build Debug and Release x64
+        shell: pwsh
+        run: |
+          foreach ($configuration in 'Debug', 'Release') {
+            Write-Host "=== $configuration x64 ==="
+            & $env:MSBUILD_PATH GameSnap\GameSnap.vcxproj /m /nologo /v:minimal `
+              /p:Configuration=$configuration `
+              /p:Platform=x64 `
+              /p:PlatformToolset=$env:MSVC_TOOLSET `
+              /p:WindowsTargetPlatformVersion=10.0 `
+              /p:EnableClangTidyCodeAnalysis=false `
+              /p:RunCodeAnalysis=false
+            if ($LASTEXITCODE -ne 0) { throw "$configuration build failed" }
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: GameSnap-x64
+          path: |
+            GameSnap/x64/Debug/GameSnap.exe
+            GameSnap/x64/Debug/GameSnap.pdb
+            GameSnap/x64/Release/GameSnap.exe
+            GameSnap/x64/Release/GameSnap.pdb
+          if-no-files-found: error

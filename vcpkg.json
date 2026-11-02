@@ -1,7 +1,10 @@
 {
   "dependencies": [
     "concurrentqueue",
+    "cpptrace",
+    "cxxopts",
+    "fmt",
     "spdlog",
-    "cpptrace"
+    "yaml-cpp"
   ]
 }

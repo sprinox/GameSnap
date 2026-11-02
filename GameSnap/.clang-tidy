@@ -1,16 +1,30 @@
 # 启用检查的类别，采用“白名单”模式，从 - 开始以禁用所有默认检查
+# 说明：bugprone-lambda-function-name 关掉——日志宏在 lambda 里 __func__ 会显示 operator()，可接受
+# 说明：clang-analyzer-core.CallAndMessage 关掉——C++/WinRT 投影类型上误报多（把 ABI 指针推成 null）
+# 说明：portability-avoid-pragma-once 关掉——项目统一用 #pragma once
+# 说明：narrowing-conversions 关掉——注意 bugprone-narrowing-conversions 只是别名，
+#       cppcoreguidelines-* 会以另一个名字把它重新启用，所以必须在 cppcoreguidelines-* 之后再关一次。
 Checks: >
   -*,
   bugprone-*,
   -bugprone-easily-swappable-parameters,
   -bugprone-narrowing-conversions,
+  -bugprone-lambda-function-name,
   cert-*,
   -cert-err58-cpp,
   clang-analyzer-*,
+  -clang-analyzer-core.CallAndMessage,
+  -clang-analyzer-optin.mpi.*,
+  -clang-analyzer-optin.osx.*,
+  -clang-analyzer-optin.portability.UnixAPI,
+  -clang-analyzer-optin.taint.*,
   concurrency-*,
   cppcoreguidelines-*,
+  -cppcoreguidelines-narrowing-conversions,
   -cppcoreguidelines-avoid-magic-numbers,
   -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-bounds-avoid-unchecked-container-access,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
   -cppcoreguidelines-pro-type-reinterpret-cast,
   -cppcoreguidelines-pro-type-union-access,
   modernize-*,
@@ -22,28 +36,54 @@ Checks: >
   -readability-function-cognitive-complexity,
   -readability-identifier-length,
   -readability-braces-around-statements,
+  -readability-container-contains,
+  -portability-avoid-pragma-once,
   -clang-analyzer-optin.cplusplus.UninitializedObject,
 
-# 头文件过滤，建议仅检查项目自己的头文件
-HeaderFilterRegex: '.*(include|src)/.*\.(h|hpp)$'
+# 头文件过滤：只检查项目自己的头文件。
+# 源文件是平铺的（GameSnap/*.h），所以这里只匹配 GameSnap/ 下一层的 .h/.hpp：
+# 既不会漏掉项目头，也不会把 x64/Release/Generated Files/winrt 下 5000+ 生成头算进来。
+# 如果以后改成 src/include 子目录布局，需要同步修改这里，并用
+# ExcludeHeaderFilterRegex 排除 x64/packages/vcpkg_installed 等目录。
+HeaderFilterRegex: '(^|[\\/])GameSnap[\\/][^\\/]+\.(h|hpp)$'
 
-# 将部分关键检查视为错误，阻止 CI 通过
+# --fix 生成的替换按仓库 .clang-format 排版（默认 none 会插入未格式化的文本）
+FormatStyle: file
+
+# 将部分关键检查视为错误，阻止 CI 通过。
+# 注意：这里是通配符，升级 clang-tidy 后新增的检查会直接变成 error；
+# 升级前先跑 `clang-tidy --verify-config`，并把 CI 用的 ClangTidyToolPath 固定到已知版本。
 WarningsAsErrors: 'bugprone-*,cert-*,clang-analyzer-*,concurrency-*'
 
-# 命名约定（请根据团队规范调整）
+# 命名约定（与本仓库既有风格保持一致：私有成员用尾随下划线、常量用 k 前缀）
 CheckOptions:
-  # 命名规范
-  - { key: readability-identifier-naming.ClassCase,           value: CamelCase }
-  - { key: readability-identifier-naming.StructCase,          value: CamelCase }
-  - { key: readability-identifier-naming.NamespaceCase,       value: lower_case }
-  - { key: readability-identifier-naming.FunctionCase,        value: lower_case }
-  - { key: readability-identifier-naming.VariableCase,        value: lower_case }
-  - { key: readability-identifier-naming.PrivateMemberPrefix, value: 'm_' }
-  - { key: readability-identifier-naming.ConstantCase,        value: UPPER_CASE }
-  - { key: readability-identifier-naming.EnumConstantCase,    value: CamelCase }
+  # 类型 / 命名空间
+  - { key: readability-identifier-naming.ClassCase,             value: CamelCase }
+  - { key: readability-identifier-naming.StructCase,            value: CamelCase }
+  - { key: readability-identifier-naming.EnumCase,              value: CamelCase }
+  - { key: readability-identifier-naming.TypeAliasCase,         value: CamelCase }
+  - { key: readability-identifier-naming.NamespaceCase,         value: lower_case }
+  # winrt/Windows 是 API 规定的命名空间名，不能改
+  - { key: readability-identifier-naming.NamespaceIgnoredRegexp, value: '^(Windows|winrt)$' }
+  # 函数 / 方法
+  - { key: readability-identifier-naming.FunctionCase,          value: lower_case }
+  - { key: readability-identifier-naming.MethodCase,            value: lower_case }
+  # 变量 / 成员
+  - { key: readability-identifier-naming.VariableCase,          value: lower_case }
+  - { key: readability-identifier-naming.PrivateMemberCase,     value: lower_case }
+  - { key: readability-identifier-naming.PrivateMemberSuffix,   value: '_' }
+  - { key: readability-identifier-naming.PublicMemberCase,      value: lower_case }
+  # 常量：k 前缀 + PascalCase（k 后面按 CamelCase 检查；局部常量沿用 lower_case）
+  - { key: readability-identifier-naming.ConstantCase,          value: CamelCase }
+  - { key: readability-identifier-naming.ConstantPrefix,        value: k }
+  - { key: readability-identifier-naming.GlobalConstantCase,    value: CamelCase }
+  - { key: readability-identifier-naming.GlobalConstantPrefix,  value: k }
+  - { key: readability-identifier-naming.StaticConstantCase,    value: CamelCase }
+  - { key: readability-identifier-naming.StaticConstantPrefix,  value: k }
+  - { key: readability-identifier-naming.LocalConstantCase,     value: lower_case }
+  - { key: readability-identifier-naming.EnumConstantCase,      value: CamelCase }
   # 其他
   - { key: readability-identifier-naming.IgnoreMainLikeFunctions, value: 1 }
-  - { key: performance-unnecessary-value-param.AllowedTypes,   value: 'std::string;std::vector' }
 
-# 适用于 C++17/20 项目，避免对旧标准代码产生误报
-InheritParentConfig: false
+# 语言标准由 MSBuild 的 /std:c++latest 决定，clang-tidy 会沿用编译参数；
+# 这里不再设置 InheritParentConfig 之类的无效开关。

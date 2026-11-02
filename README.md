@@ -42,3 +42,8 @@ docs/                设计文档
 config.example.yaml  配置模板
 config.yaml          实际加载的配置
 ```
+
+## CI
+
+push / PR 自动构建 Debug + Release x64；push 到 master 或 main 时自动发布 pre-release
+（GitHub Releases，包含两个配置的 exe/pdb）。

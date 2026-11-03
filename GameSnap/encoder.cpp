@@ -33,8 +33,12 @@ namespace gamesnap {
                 title = title.substr(first, last - first + 1);
 
             constexpr std::size_t max_title_length = 80;
-            if (title.size() > max_title_length)
+            if (title.size() > max_title_length) {
                 title.resize(max_title_length);
+                // 不要把 UTF-16 代理对截成半个字符。
+                if (!title.empty() && title.back() >= 0xD800 && title.back() <= 0xDBFF)
+                    title.pop_back();
+            }
             if (title.empty())
                 title = L"GameSnap";
             return title;
@@ -151,7 +155,7 @@ namespace gamesnap {
         }
 
         // GPU→CPU：在编码线程里 Map staging、逐行拷到紧凑缓冲、再 Unmap。
-        // 锁只覆盖 Map/拷贝/Unmap，像素转换和写盘都在锁外。
+        // 锁只覆盖 Map/Unmap 两个 context 调用；读取映射内存是普通 CPU 访问，可以在锁外并行。
         bool map_to_cpu(D3DContext& d3d, ID3D11Texture2D* texture, RawCopy& raw, std::string& error) {
             D3D11_TEXTURE2D_DESC desc{};
             texture->GetDesc(&desc);
@@ -168,19 +172,24 @@ namespace gamesnap {
             raw.format = desc.Format;
             raw.bytes.resize(static_cast<std::size_t>(raw.stride) * raw.height);
 
-            std::scoped_lock lock(d3d.context_mutex());
             D3D11_MAPPED_SUBRESOURCE mapped{};
-            const HRESULT hr = d3d.context()->Map(texture, 0, D3D11_MAP_READ, 0, &mapped);
-            if (FAILED(hr)) {
-                error = fmt::format("Map staging 纹理失败: {}", describe_hresult(hr));
-                return false;
+            {
+                std::scoped_lock lock(d3d.context_mutex());
+                const HRESULT hr = d3d.context()->Map(texture, 0, D3D11_MAP_READ, 0, &mapped);
+                if (FAILED(hr)) {
+                    error = fmt::format("Map staging 纹理失败: {}", describe_hresult(hr));
+                    return false;
+                }
             }
             for (std::uint32_t y = 0; y < raw.height; ++y) {
                 std::memcpy(raw.bytes.data() + (static_cast<std::size_t>(y) * raw.stride),
                             static_cast<const std::uint8_t*>(mapped.pData) + (static_cast<std::size_t>(y) * mapped.RowPitch),
                             raw.stride);
             }
-            d3d.context()->Unmap(texture, 0);
+            {
+                std::scoped_lock lock(d3d.context_mutex());
+                d3d.context()->Unmap(texture, 0);
+            }
             return true;
         }
 
@@ -276,7 +285,8 @@ namespace gamesnap {
             BITMAPINFOHEADER info_header{};
             info_header.biSize = sizeof(BITMAPINFOHEADER);
             info_header.biWidth = static_cast<LONG>(image.width);
-            info_header.biHeight = static_cast<LONG>(image.height);
+            // 负高度 = Top-Down DIB，与内存中的行顺序一致，可整块写出。
+            info_header.biHeight = -static_cast<LONG>(image.height);
             info_header.biPlanes = 1;
             info_header.biBitCount = 32;
             info_header.biCompression = BI_RGB;
@@ -287,11 +297,7 @@ namespace gamesnap {
                 return false;
             file.write(reinterpret_cast<char const*>(&file_header), sizeof(file_header));
             file.write(reinterpret_cast<char const*>(&info_header), sizeof(info_header));
-            // BMP 是 bottom-up：从最后一行往上写。
-            for (std::uint32_t y = image.height; y-- > 0;) {
-                const auto offset = static_cast<std::size_t>(y) * row_bytes;
-                file.write(reinterpret_cast<char const*>(image.pixels.data() + offset), row_bytes);
-            }
+            file.write(reinterpret_cast<char const*>(image.pixels.data()), static_cast<std::streamsize>(image.pixels.size()));
             file.flush();
             return file.good();
         }
@@ -383,6 +389,23 @@ namespace gamesnap {
     }
 
     void EncodeWorkers::encode(EncodeJob& job) const {
+        // 主 staging 的占用标记由这里释放；提前返回/异常也会释放。
+        struct BusyGuard {
+            explicit BusyGuard(std::shared_ptr<std::atomic<bool>> busy_) : busy(std::move(busy_)) {}
+            std::shared_ptr<std::atomic<bool>> busy;
+            ~BusyGuard() {
+                if (busy)
+                    busy->store(false, std::memory_order_release);
+            }
+            BusyGuard(BusyGuard const&) = delete;
+            BusyGuard& operator=(BusyGuard const&) = delete;
+            BusyGuard(BusyGuard&&) = delete;
+            BusyGuard& operator=(BusyGuard&&) = delete;
+        } guard{job.staging_busy};
+        job.staging_busy.reset();
+
+        if (job.canceled && job.canceled->load(std::memory_order_acquire))
+            return;
         if (!job.d3d || !job.texture) {
             SPDLOG_WARN("[#{:04}] 非法的编码任务", job.sequence);
             return;
@@ -394,14 +417,22 @@ namespace gamesnap {
             SPDLOG_ERROR("[#{:04}] 取像素失败: {}", job.sequence, error);
             return;
         }
-        const auto mapped_at = Clock::now();
+        const auto mapped_at = SteadyClock::now();
+
+        // 已经读完 staging，可以立刻让下一张截图复用主纹理（转换/写盘继续并行）。
+        if (guard.busy) {
+            guard.busy->store(false, std::memory_order_release);
+            guard.busy.reset();
+        }
+        if (job.canceled && job.canceled->load(std::memory_order_acquire))
+            return;
 
         Image image;
         if (!convert_pixels(raw, job.color_space, job.sdr_white_nits, image)) {
             SPDLOG_ERROR("[#{:04}] 不支持的像素格式 {}", job.sequence, static_cast<int>(raw.format));
             return;
         }
-        const auto converted_at = Clock::now();
+        const auto converted_at = SteadyClock::now();
 
         const std::filesystem::path path =
             make_output_path(output_dir_, job.local_time, std::move(job.title), job.sequence);
@@ -409,7 +440,7 @@ namespace gamesnap {
             SPDLOG_ERROR("[#{:04}] 写文件失败: {}", job.sequence, wstring_to_utf8(path.wstring()));
             return;
         }
-        const auto encoded_at = Clock::now();
+        const auto encoded_at = SteadyClock::now();
 
         const auto& t = job.timings;
         const double key_to_start = duration_ms(t.start_capture - t.input);

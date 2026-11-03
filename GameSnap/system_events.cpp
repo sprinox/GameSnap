@@ -76,6 +76,9 @@ namespace gamesnap {
         }
 
         thread_id_.store(::GetCurrentThreadId(), std::memory_order_release);
+        // 确保线程消息队列已建立，stop() 的 WM_QUIT 不会丢。
+        MSG queue_probe{};
+        ::PeekMessageW(&queue_probe, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
         // stop() 可能在本线程拿到消息队列之前就已经被调用。
         if (stop_.load(std::memory_order_acquire))
             if (::PostThreadMessageW(thread_id_.load(std::memory_order_acquire), WM_QUIT, 0, 0) == 0)
@@ -99,7 +102,7 @@ namespace gamesnap {
         Command command;
         command.kind = kind;
         command.reason = reason;
-        command.enqueued = Clock::now();
+        command.enqueued = SteadyClock::now();
         commands_->enqueue(command_token_, command);
     }
 

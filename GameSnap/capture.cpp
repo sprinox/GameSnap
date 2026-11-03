@@ -11,6 +11,7 @@ namespace gamesnap {
 
         constexpr int kFramePoolBuffers = 2;
         constexpr auto kFrameWait = std::chrono::milliseconds(500);
+        constexpr auto kCallbackWait = std::chrono::seconds(2);
 
         winrt::GraphicsCaptureItem create_item_for_monitor(HMONITOR monitor) {
             auto interop = winrt::get_activation_factory<winrt::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
@@ -88,13 +89,31 @@ namespace gamesnap {
             return actual.Width == desc.Width && actual.Height == desc.Height && actual.Format == desc.Format;
         }
 
+        // 主 staging 占用标记的 RAII：成功交给 job 前，任何提前返回/异常都会释放。
+        struct BusyLease {
+            explicit BusyLease(std::shared_ptr<std::atomic<bool>> busy_) : busy(std::move(busy_)) {}
+            std::shared_ptr<std::atomic<bool>> busy;
+            ~BusyLease() {
+                if (busy)
+                    busy->store(false, std::memory_order_release);
+            }
+            BusyLease(BusyLease const&) = delete;
+            BusyLease& operator=(BusyLease const&) = delete;
+            BusyLease(BusyLease&&) = delete;
+            BusyLease& operator=(BusyLease&&) = delete;
+        };
+
         // FrameArrived 回调里只做 GPU 侧的事：取帧 → CopyResource 到 staging → 入队。
         // Map/Unmap（GPU→CPU）交给编码线程，回调线程不被整帧 memcpy 拖住。
         void handle_frame(winrt::Direct3D11CaptureFramePool const& pool, ShotContext& shot) {
             winrt::Direct3D11CaptureFrame frame = pool.TryGetNextFrame();
             if (!frame)
                 return;
-            const auto received = Clock::now();
+            if (shot.canceled->load(std::memory_order_acquire)) {
+                frame.Close();
+                return;
+            }
+            const auto received = SteadyClock::now();
 
             winrt::com_ptr<ID3D11Texture2D> source;
             try {
@@ -115,16 +134,14 @@ namespace gamesnap {
 
             const auto staging_desc = make_staging_desc_from(desc);
             std::shared_ptr<ID3D11Texture2D> texture;
-            // 主纹理空闲（capture 线程的 staging_ + 本次 shot 的副本，共 2 个引用）且尺寸/格式
-            // 匹配时复用；编码线程还占着（3 个引用）或分辨率变了，就临时建一块，随 job 析构释放。
-            // use_count() 在这里只当“有没有别的持有者”的探针用，不会误判：
-            //   - 只有本回调线程会新增引用（交给编码 job），其它线程只会释放（编码完成）；
-            //   - 本次 shot 的引用在 arm() 的 mutex 之前就已建立，之前 job 的引用也都
-            //     sequenced-before 本线程，所以读到的计数只会偏高、不会偏低；
-            //   - 读到偏高（job 刚释放）时最坏只是多建一块临时纹理，不影响正确性。
-            if (shot.staging && shot.staging.use_count() <= 2 && staging_matches(*shot.staging, staging_desc)) {
+            std::shared_ptr<std::atomic<bool>> busy;
+            // 用显式占用标记复用主纹理；编码线程 Map 完会立刻清标记，
+            // 不依赖 shared_ptr::use_count（标准不保证它可作为同步依据）。
+            if (shot.staging && shot.staging_busy && staging_matches(*shot.staging, staging_desc) &&
+                !shot.staging_busy->exchange(true, std::memory_order_acq_rel)) {
                 SPDLOG_DEBUG("复用旧纹理");
                 texture = shot.staging;
+                busy = shot.staging_busy;
             } else {
                 SPDLOG_DEBUG("创建新纹理");
                 texture = create_staging_texture(shot.d3d->device(), staging_desc);
@@ -135,13 +152,16 @@ namespace gamesnap {
                              desc.Width, desc.Height, static_cast<int>(desc.Format));
                 return;
             }
+            BusyLease lease{busy};
 
             {
                 std::scoped_lock lock(shot.d3d->context_mutex());
                 shot.d3d->context()->CopyResource(texture.get(), source.get());
             }
             frame.Close();
-            const auto copied = Clock::now();
+            const auto copied = SteadyClock::now();
+            if (shot.canceled->load(std::memory_order_acquire))
+                return;
 
             SPDLOG_DEBUG("[#{:04}] 采集 {}x{}: 命令排队 {:.2f}ms，StartCapture→首帧 {:.2f}ms，GPU 拷贝 {:.2f}ms",
                          shot.sequence, desc.Width, desc.Height,
@@ -152,6 +172,8 @@ namespace gamesnap {
             EncodeJob job;
             job.texture = std::move(texture);
             job.d3d = shot.d3d;
+            job.canceled = shot.canceled;
+            job.staging_busy = busy;
             job.color_space = shot.color_space;
             job.sdr_white_nits = shot.sdr_white_nits;
             job.sequence = shot.sequence;
@@ -162,8 +184,18 @@ namespace gamesnap {
             job.timings.frame_received = received;
             job.timings.copied = copied;
 
-            if (!shot.jobs->enqueue(std::move(job)))
+            // 从这里开始由 job 负责释放 busy 标记。
+            lease.busy.reset();
+            if (shot.canceled->load(std::memory_order_acquire)) {
+                if (busy)
+                    busy->store(false, std::memory_order_release);
+                return;
+            }
+            if (!shot.jobs->enqueue(std::move(job))) {
+                if (busy)
+                    busy->store(false, std::memory_order_release);
                 SPDLOG_WARN("编码队列入队失败，丢弃本次截图");
+            }
         }
 
         // 初始化结束时放开就绪闩锁（成功/失败/异常都走析构）。
@@ -220,7 +252,6 @@ namespace gamesnap {
                 return nullptr;
 
             auto resources = std::shared_ptr<CaptureResources>(new CaptureResources());
-            resources->sink_ = std::make_shared<FrameSink>();
 
             resources->item_ = create_item_for_monitor(monitor);
             resources->size_ = resources->item_.Size();
@@ -247,6 +278,8 @@ namespace gamesnap {
 
     void CaptureResources::create_pool() {
         pool_ = winrt::Direct3D11CaptureFramePool::CreateFreeThreaded(device_, format_, kFramePoolBuffers, size_);
+        // 每个 pool 一个独立 sink：旧 pool 的迟到回调不可能取走下一张截图的 shot。
+        sink_ = std::make_shared<FrameSink>();
         auto sink = sink_;
         frame_token_ = pool_.FrameArrived(
             [sink](auto const& sender, auto const&) {
@@ -265,45 +298,37 @@ namespace gamesnap {
         }
     }
 
-    void CaptureResources::start_capture() {
-        winrt::GraphicsCaptureSession session{nullptr};
-        {
-            std::scoped_lock lock(mutex_);
-            if (closed_ || !item_ || !device_)
-                throw winrt::hresult_error(RO_E_CLOSED, L"capture 资源已关闭");
-            if (running_)
-                return;
-            if (!pool_)
-                create_pool();
-            if (!session_)
-                create_session();
-            session = session_;
-            running_ = true;
-        }
+    void CaptureResources::prepare() {
+        if (closed_ || !item_ || !device_)
+            throw winrt::hresult_error(RO_E_CLOSED, L"capture 资源已关闭");
+        if (!pool_)
+            create_pool();
+        if (!session_)
+            create_session();
+    }
 
+    void CaptureResources::start_capture() {
+        if (closed_ || !session_)
+            throw winrt::hresult_error(RO_E_CLOSED, L"capture 资源已关闭");
+        if (running_)
+            return;
+        auto session = session_;
+        running_ = true;
         try {
             session.StartCapture();
         } catch (...) {
-            std::scoped_lock lock(mutex_);
             running_ = false;
             throw;
         }
     }
 
     void CaptureResources::stop_capture() noexcept {
-        winrt::GraphicsCaptureSession session{nullptr};
-        winrt::Direct3D11CaptureFramePool pool{nullptr};
-        winrt::event_token token{};
-        {
-            std::scoped_lock lock(mutex_);
-            running_ = false;
-            session = std::exchange(session_, nullptr);
-            pool = std::exchange(pool_, nullptr);
-            token = std::exchange(frame_token_, {});
-        }
+        running_ = false;
+        auto session = std::exchange(session_, nullptr);
+        auto pool = std::exchange(pool_, nullptr);
+        auto token = std::exchange(frame_token_, {});
 
-        // 帧在 done 之前已经处理完，pool 也不复用，所以这里直接关闭、不用等回调退栈：
-        // 注销 FrameArrived → 关会话 → 关 pool（下一张在 start_capture() 里建全新的）。
+        // 注销 FrameArrived → 关会话 → 关 pool；下一张由 prepare() 建全新的。
         if (pool && token) {
             try {
                 pool.FrameArrived(token);
@@ -325,47 +350,28 @@ namespace gamesnap {
     }
 
     void CaptureResources::close() {
-        winrt::Direct3D11CaptureFramePool pool{nullptr};
-        winrt::GraphicsCaptureSession session{nullptr};
-        winrt::GraphicsCaptureItem item{nullptr};
-        winrt::event_token token{};
-        {
-            std::scoped_lock lock(mutex_);
-            if (closed_)
-                return;
-            closed_ = true;
-            running_ = false;
-            pool = std::exchange(pool_, nullptr);
-            session = std::exchange(session_, nullptr);
-            item = std::exchange(item_, nullptr);
-            token = std::exchange(frame_token_, {});
-        }
-
-        // COM 调用全部放在锁外。
-        if (pool && token) {
-            try {
-                pool.FrameArrived(token);
-            } catch (winrt::hresult_error const& e) {
-                SPDLOG_DEBUG("注销 FrameArrived 失败: {}", describe_hresult(e.code()));
-            }
-        }
-        if (session) {
-            try {
-                session.Close();
-            } catch (winrt::hresult_error const& e) {
-                SPDLOG_DEBUG("关闭 session 失败: {}", describe_hresult(e.code()));
-            }
-        }
-        if (pool) {
-            try {
-                pool.Close();
-            } catch (winrt::hresult_error const& e) {
-                SPDLOG_DEBUG("关闭 frame pool 失败: {}", describe_hresult(e.code()));
-            }
-        }
-
-        if (sink_)
+        if (closed_)
+            return;
+        closed_ = true;
+        stop_capture();
+        item_ = nullptr;
+        if (sink_) {
             sink_->disarm();
+            sink_.reset();
+        }
+    }
+
+    void CaptureResources::abandon() noexcept {
+        closed_ = true;
+        running_ = false;
+        (void)std::exchange(pool_, nullptr);
+        (void)std::exchange(session_, nullptr);
+        (void)std::exchange(item_, nullptr);
+        (void)std::exchange(frame_token_, {});
+        if (auto sink = std::exchange(sink_, nullptr))
+            sink->disarm();
+        // 不调用 Close：回调可能仍持有 pool 的 sender 引用，强行关闭会违反 WGC 约束。
+        // 句柄引用在这里释放，等回调自己的引用结束后由 COM 回收。
     }
 
     // ── FrameSink ────────────────────────────────────────────────────────────
@@ -384,19 +390,31 @@ namespace gamesnap {
         std::shared_ptr<ShotContext> shot;
         {
             std::scoped_lock lock(mutex_);
+            ++in_flight_;
             shot = std::exchange(shot_, nullptr);
         }
-        if (!shot)
-            return;
 
-        try {
-            handle_frame(pool, *shot);
-        } catch (std::exception const& e) {
-            SPDLOG_ERROR("处理帧失败: {}", e.what());
-        } catch (...) {
-            SPDLOG_ERROR("处理帧失败");
+        if (shot) {
+            try {
+                handle_frame(pool, *shot);
+            } catch (std::exception const& e) {
+                SPDLOG_ERROR("处理帧失败: {}", e.what());
+            } catch (...) {
+                SPDLOG_ERROR("处理帧失败");
+            }
+            shot->done.release();
         }
-        shot->done.release();
+
+        {
+            std::scoped_lock lock(mutex_);
+            --in_flight_;
+        }
+        idle_cv_.notify_all();
+    }
+
+    bool FrameSink::wait_idle(std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mutex_);
+        return idle_cv_.wait_for(lock, timeout, [this] { return in_flight_ == 0; });
     }
 
     // ── CaptureWorker ────────────────────────────────────────────────────────
@@ -412,22 +430,21 @@ namespace gamesnap {
           command_token_(*commands_) {}
 
     void CaptureWorker::run() {
+        // COM apartment 必须覆盖整个 run()：之后还会创建 pool/会话并关闭 WinRT 对象。
+        ComApartment apartment;
+        if (!apartment.ok())
+            SPDLOG_WARN("capture 线程初始化 COM 失败: {}", describe_hresult(apartment.result()));
+
+        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        ::SetThreadDescription(::GetCurrentThread(), L"GameSnap.Capture");
+
         {
             // 就绪闩锁只覆盖启动初始化：初始化成功/失败/异常后主线程都应继续。
-            // 不能放在 run() 最外层，否则成功路径要等到线程退出才 release，
-            // 主线程会卡在 wait_ready()，连 Shutdown 都发不出去。
             const ReadyGuard ready_guard{ready_};
-
-            ComApartment apartment;
-            if (!apartment.ok())
-                SPDLOG_WARN("capture 线程初始化 COM 失败: {}", describe_hresult(apartment.result()));
-
-            ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-            ::SetThreadDescription(::GetCurrentThread(), L"GameSnap.Capture");
 
             // 启动时就把资源准备好，第一次热键不需要重建。
             // 如果这里就失败（典型是 E_ACCESSDENIED），继续跑也没有任何意义，直接通知主线程退出。
-            if (!ensure_ready()) {
+            if (!ensure_ready(ReloadReason::Startup)) {
                 SPDLOG_CRITICAL("捕获资源初始化失败，GameSnap 无法截图，退出");
                 fatal_error_.store(true, std::memory_order_relaxed);
                 stop_->request_stop();
@@ -458,7 +475,7 @@ namespace gamesnap {
             shot(command);
             break;
         case CommandKind::Validate:
-            ensure_ready();
+            ensure_ready(command.reason);
             break;
         case CommandKind::Reload:
             rebuild(command.reason);
@@ -468,7 +485,7 @@ namespace gamesnap {
         }
     }
 
-    bool CaptureWorker::ensure_ready() {
+    bool CaptureWorker::ensure_ready(ReloadReason reason) {
         if (!resources_ || !d3d_ || !staging_)
             return rebuild(ReloadReason::Startup);
 
@@ -485,6 +502,11 @@ namespace gamesnap {
             return rebuild(ReloadReason::DeviceChange);
         }
 
+        // WM_DEVICECHANGE 可能是任意 USB 设备，没必要每次枚举 DXGI 输出；
+        // 设备/显示器是否失效已由上面 device_removed / monitor_alive / factory 检查覆盖。
+        if (reason == ReloadReason::DeviceChange)
+            return true;
+
         // 分辨率 / 旋转 / HDR / 显示器变化才重建；单纯切全屏不应触发。
         const DisplayInfo current = describe_monitor(monitor_);
         if (current.monitor == nullptr) {
@@ -493,7 +515,9 @@ namespace gamesnap {
         }
         if (current.width != display_.width || current.height != display_.height ||
             current.rotation != display_.rotation || current.hdr != display_.hdr ||
-            current.color_space != display_.color_space || current.device_name != display_.device_name) {
+            current.color_space != display_.color_space ||
+            current.sdr_white_nits != display_.sdr_white_nits ||
+            current.device_name != display_.device_name) {
             SPDLOG_INFO("显示配置变化: {}x{} -> {}x{}，HDR {} -> {}，色域 {} -> {}",
                         display_.width, display_.height, current.width, current.height,
                         display_.hdr ? "是" : "否", current.hdr ? "是" : "否",
@@ -560,6 +584,7 @@ namespace gamesnap {
         d3d_ = std::move(d3d);
         resources_ = std::move(resources);
         staging_ = std::move(staging);
+        staging_busy_ = std::make_shared<std::atomic<bool>>(false);
         display_ = display;
         monitor_ = display.monitor;
         ++generation_;
@@ -581,28 +606,55 @@ namespace gamesnap {
         shot->d3d = d3d_;
         shot->jobs = jobs_;
         shot->staging = staging_;
+        shot->staging_busy = staging_busy_;
+        shot->canceled = std::make_shared<std::atomic<bool>>(false);
         shot->enqueued = command.enqueued;
-        shot->start_call = Clock::now();
+        shot->start_call = SteadyClock::now();
         shot->sequence = ++sequence_;
         shot->title = foreground_window_title();
         shot->color_space = display_.color_space;
         shot->sdr_white_nits = display_.sdr_white_nits;
 
-        resources_->sink()->arm(shot);
+        try {
+            resources_->prepare();
+        } catch (winrt::hresult_error const& e) {
+            SPDLOG_ERROR("准备捕获会话失败: {}", describe_hresult(e.code()));
+            // 会话已不可信；即使 rebuild 失败，也不要让下一张继续用坏资源。
+            resources_->close();
+            resources_.reset();
+            rebuild(ReloadReason::CaptureFailure);
+            return;
+        }
+
+        // 每个 pool 有自己的 sink；先 arm 再 StartCapture，避免漏掉首帧。
+        auto sink = resources_->sink();
+        sink->arm(shot);
         try {
             resources_->start_capture();
         } catch (winrt::hresult_error const& e) {
             SPDLOG_ERROR("StartCapture 失败: {}", describe_hresult(e.code()));
-            resources_->sink()->disarm();
+            sink->disarm();
+            resources_->close();
+            resources_.reset();
             rebuild(ReloadReason::CaptureFailure);
             return;
         }
 
         // 等回调把这张图处理完；静止画面下 WGC 可能不给帧，必须有上限。
-        if (!shot->done.try_acquire_for(kFrameWait))
-            SPDLOG_WARN("[#{:04}] {}ms 内没有等到帧，丢弃本次截图", shot->sequence, kFrameWait.count());
+        if (!shot->done.try_acquire_for(kFrameWait)) {
+            shot->canceled->store(true, std::memory_order_release);
+            SPDLOG_WARN("[#{:04}] {}ms 内没有等到帧，取消本次截图", shot->sequence, kFrameWait.count());
+        }
+        sink->disarm();
 
-        resources_->sink()->disarm();
+        // 等本次 pool 的回调真正退出；卡死时不能关闭它正在用的 pool，只能放弃本代。
+        if (!sink->wait_idle(kCallbackWait)) {
+            SPDLOG_ERROR("[#{:04}] FrameArrived 回调未退出，放弃当前资源代", shot->sequence);
+            resources_->abandon();
+            resources_.reset();
+            staging_.reset();
+            return;
+        }
         resources_->stop_capture();
     }
 

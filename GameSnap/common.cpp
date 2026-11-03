@@ -31,14 +31,18 @@ namespace gamesnap {
         constexpr std::size_t kLogFileCount = 2;
 
         std::filesystem::path executable_dir() {
-            // manifest 里声明了 longPathAware，Win32 API 可接受最长约 32767 字符的路径。
-            std::wstring buffer(0x8000, L'\0');
-            const DWORD length = ::GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-            if (length == 0 || length >= buffer.size())
-                return std::filesystem::current_path();
-            buffer.resize(length);
-            buffer.shrink_to_fit();
-            return std::filesystem::path(buffer).parent_path();
+            // exe 路径在进程生命周期内不变，只取一次；避免每次分配 64KB。
+            static const std::filesystem::path kDir = [] {
+                // manifest 里声明了 longPathAware，Win32 API 可接受最长约 32767 字符的路径。
+                std::wstring buffer(0x8000, L'\0');
+                const DWORD length = ::GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+                if (length == 0 || length >= buffer.size())
+                    return std::filesystem::current_path();
+                buffer.resize(length);
+                buffer.shrink_to_fit();
+                return std::filesystem::path(buffer).parent_path();
+            }();
+            return kDir;
         }
 
         // 日志放在 exe 旁边，和启动时的当前目录无关。
@@ -194,7 +198,7 @@ namespace gamesnap {
             return {};
 
         const int size = ::WideCharToMultiByte(
-            CP_UTF8, WC_ERR_INVALID_CHARS,
+            CP_UTF8, 0,
             str.data(), static_cast<int>(str.size()),
             nullptr, 0, nullptr, nullptr);
         if (size <= 0)
@@ -202,7 +206,7 @@ namespace gamesnap {
 
         std::string result(static_cast<std::size_t>(size), '\0');
         const int converted = ::WideCharToMultiByte(
-            CP_UTF8, WC_ERR_INVALID_CHARS,
+            CP_UTF8, 0,
             str.data(), static_cast<int>(str.size()),
             result.data(), size, nullptr, nullptr);
         if (converted <= 0)
@@ -217,7 +221,7 @@ namespace gamesnap {
             return {};
 
         const int size = ::MultiByteToWideChar(
-            CP_UTF8, MB_ERR_INVALID_CHARS,
+            CP_UTF8, 0,
             str.data(), static_cast<int>(str.size()),
             nullptr, 0);
         if (size <= 0)
@@ -225,7 +229,7 @@ namespace gamesnap {
 
         std::wstring result(static_cast<std::size_t>(size), L'\0');
         const int converted = ::MultiByteToWideChar(
-            CP_UTF8, MB_ERR_INVALID_CHARS,
+            CP_UTF8, 0,
             str.data(), static_cast<int>(str.size()),
             result.data(), size);
         if (converted <= 0)

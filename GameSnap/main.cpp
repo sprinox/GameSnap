@@ -56,7 +56,9 @@ namespace {
             return 1;
         }
 
-        auto stop = std::make_shared<gamesnap::StopSource>();
+        // 控制台处理函数在独立线程回调；让 StopSource 活到进程结束，避免
+        // handler 拿到指针后对象被析构的竞态（进程退出时由 OS 回收）。
+        auto stop = std::shared_ptr<gamesnap::StopSource>(new gamesnap::StopSource(), [](gamesnap::StopSource*) {});
         const StopSlot slot_guard{stop.get()};
         ::SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
 

@@ -62,6 +62,9 @@ namespace gamesnap {
         ::SetThreadDescription(::GetCurrentThread(), L"GameSnap.Input");
 
         thread_id_.store(::GetCurrentThreadId(), std::memory_order_release);
+        // 强制创建线程消息队列；否则 stop() 在 GetMessage 之前 PostThreadMessageW 会失败。
+        MSG queue_probe{};
+        ::PeekMessageW(&queue_probe, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 
         // 先初始化 GameInput：它偶尔会阻塞几秒（服务不可用时），
         // 放在安装键盘钩子之前，避免这几秒里全局键盘输入被卡住。
@@ -147,13 +150,13 @@ namespace gamesnap {
             if (key_down_)
                 return;
             key_down_ = true;
-            trigger(Clock::now());
+            trigger(SteadyClock::now());
         } else {
             key_down_ = false;
         }
     }
 
-    void InputThread::trigger(Clock::time_point when) {
+    void InputThread::trigger(SteadyClock::time_point when) {
         Command command;
         command.kind = CommandKind::Trigger;
         command.reason = ReloadReason::Manual;
@@ -171,7 +174,7 @@ namespace gamesnap {
         const bool combo = (state.buttons & kTriggerButtons) == kTriggerButtons;
         if (combo && !combo_latched_.exchange(true, std::memory_order_acq_rel)) {
             SPDLOG_DEBUG("手柄触发截图");
-            trigger(Clock::now());
+            trigger(SteadyClock::now());
         } else if (!combo) {
             combo_latched_.store(false, std::memory_order_release);
         }

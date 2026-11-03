@@ -30,7 +30,7 @@ flowchart LR
 - 消费端阻塞等待，不做超时轮询；capture 线程靠 `CommandKind::Shutdown` 退出，编码线程靠 `EncodeJob::stop` 哨兵退出；
 - 消息内的 `shared_ptr` 负责跨线程生命周期（`EncodeJob` 持有 staging 纹理与 D3D 设备）。
 
-时间基统一为 `std::chrono::system_clock`（`Clock` 别名）：文件名需要墙上时间，延迟区间都很短，不需要第二套时钟。
+文件名用 `std::chrono::system_clock`（`Clock`）；阶段耗时用 `std::chrono::steady_clock`（`SteadyClock`），系统时间校准不会让延迟出现负值。
 
 ## 一次截图
 
@@ -67,10 +67,11 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 关闭后不能重新启动。因此：
 
 - 启动或重建时创建：D3D 设备（优先目标显示器所属适配器）、`GraphicsCaptureItem`、主 staging 纹理、编码线程；
-- 每张截图新建一套 `Direct3D11CaptureFramePool` + `GraphicsCaptureSession`：
-  `CreateFreeThreaded` → 注册 `FrameArrived` → `CreateCaptureSession` → `StartCapture`；
-- 帧处理完（`done`）后，capture 线程直接关闭会话和 pool。帧在 `done` 之前已经消费完，pool 也不复用，
-  不需要等待回调退栈；官方 `CaptureSnapshot` 示例同样先关 pool 再使用已取出的帧；
+- 每张截图新建一套 `Direct3D11CaptureFramePool` + `GraphicsCaptureSession`，以及**只属于这个 pool 的 `FrameSink`**：
+  `CreateFreeThreaded` → 注册 `FrameArrived` → `CreateCaptureSession` → arm shot → `StartCapture`；
+- 每张图先等 `done`，再等该 pool 的回调真正退出（`wait_idle`），然后才关闭会话和 pool；
+  回调 2 秒内不退出说明驱动卡住，此时不调用 `Close()`，直接放弃这一代资源；
+- 每张图的 shot 只交给本 pool 的 sink，旧 pool 的迟到回调不可能取走下一张截图的 shot；
 - 不复用 pool：同一个 pool 在关闭会话后再次 `CreateCaptureSession`，部分驱动上会偶发 `0x8000FFFF`；
 - 连按热键时多出的 `Trigger` 在 `CommandQueue` 排队，逐张处理。
 
@@ -79,11 +80,11 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 ## 并发规则
 
 1. `CaptureResources`（item / pool / session）只在 capture 线程创建、使用、销毁。
-2. `FrameArrived` 在 frame pool 的工作线程上串行投递；`FrameSink` 用 `weak_ptr` 找到当前资源代，不和 `CaptureResources` 形成引用环。
-3. `ID3D11DeviceContext` 不是线程安全的：回调线程的 `CopyResource` 与编码线程的 `Map + memcpy + Unmap` 共用 `D3DContext::context_mutex()`，转换和写盘在锁外。
+2. `FrameArrived` 在 frame pool 的工作线程上串行投递；每个 pool 一个独立 `FrameSink`，回调只接触本 pool 的 sink 和 shot。
+3. `ID3D11DeviceContext` 不是线程安全的：回调线程的 `CopyResource` 与编码线程的 `Map` / `Unmap` 共用 `D3DContext::context_mutex()`；`Map` 返回后的逐行 `memcpy` 只是普通 CPU 读内存，在锁外并行执行，转换和写盘也在锁外。
 4. 资源按“代”整体替换：先建好新一代，全部成功后才替换，失败则旧代继续工作。
 5. 退出顺序：先停 input 和 system-events，再给 capture 投递 `Shutdown`，最后给编码线程投递 `stop`；生产者先停，消费者后停。
-6. staging 纹理只有一块：编码线程还占用（`use_count` 大于 worker + 本次 shot）时，截图线程临时新建一块，随 `EncodeJob` 析构释放。
+6. staging 纹理只有一块，用一个显式的 `atomic<bool>` 占用标记：编码线程 Map 完立刻释放，截图时标记已占用就临时新建一块，不依赖 `shared_ptr::use_count`。
 
 ## 显示器与设备变化
 
@@ -91,7 +92,7 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 | --- | --- |
 | `WM_DISPLAYCHANGE` | 廉价自检（分辨率 / 旋转 / HDR / 显示器真变了才重建） |
 | `WM_SETTINGCHANGE` | 廉价自检 |
-| `WM_DEVICECHANGE` | 廉价自检（显卡插拔 / 驱动重启） |
+| `WM_DEVICECHANGE` | 只检查设备/显示器句柄与 DXGI 工厂，不枚举输出（避免 USB 事件反复触发 DXGI 枚举） |
 | `WM_POWERBROADCAST` 恢复 | 强制重建 |
 | 每次截图前 | 设备是否移除、`HMONITOR` 是否有效、DXGI 工厂 `IsCurrent()` |
 

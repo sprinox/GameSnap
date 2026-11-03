@@ -13,6 +13,7 @@
 //   4. 资源以“代(generation)”为单位整体替换：先建好新一代，成功后才换掉旧的。
 // ─────────────────────────────────────────────────────────────────────────────
 
+#include <condition_variable>
 #include <latch>
 #include <semaphore>
 
@@ -31,26 +32,32 @@ namespace gamesnap {
         std::shared_ptr<D3DContext> d3d;
         std::shared_ptr<EncodeQueue> jobs;
         std::shared_ptr<ID3D11Texture2D> staging;
-        std::binary_semaphore done{0};  // 回调处理完（或失败）后 release
-        Clock::time_point enqueued;
-        Clock::time_point start_call;
+        std::binary_semaphore done{0};                    // 回调处理完（或失败）后 release
+        std::shared_ptr<std::atomic<bool>> canceled;      // 超时取消标记，和 EncodeJob 共享
+        std::shared_ptr<std::atomic<bool>> staging_busy;  // 主 staging 是否被编码线程占用
+        SteadyClock::time_point enqueued;
+        SteadyClock::time_point start_call;
         std::uint64_t sequence = 0;
         std::wstring title;
         DXGI_COLOR_SPACE_TYPE color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         std::uint32_t sdr_white_nits = 80;
     };
 
-    // FrameArrived 回调只碰这个对象：取走当前 shot，在回调里完成拷贝/入队，
-    // 最后 release done。回调对同一个 pool 是串行的，mutex_ 只用于和 capture 线程同步。
+    // FrameArrived 回调只碰这个对象：取走当前 shot，在回调里完成拷贝/入队。
+    // 每个 pool 一个独立 sink；mutex_ 用于 capture 线程 arm/disarm 与回调交接 shot。
     class FrameSink {
     public:
         void arm(std::shared_ptr<ShotContext> shot);
         void disarm();
         void on_frame(winrt::Direct3D11CaptureFramePool const& pool);
+        // 等待该 pool 的在途回调退出；false = 超时。
+        [[nodiscard]] bool wait_idle(std::chrono::milliseconds timeout);
 
     private:
         std::mutex mutex_;
+        std::condition_variable idle_cv_;
         std::shared_ptr<ShotContext> shot_;
+        int in_flight_ = 0;
     };
 
     class CaptureResources {
@@ -66,27 +73,25 @@ namespace gamesnap {
                                                         winrt::DirectXPixelFormat format,
                                                         std::string& error);
 
+        // 建好本张截图要用的 pool + 会话（不 StartCapture），以便先 arm 再启动。
+        void prepare();
         void start_capture();
         void stop_capture() noexcept;
         void close();
+        // 回调卡死时放弃本代：只释放引用，不调用任何 Close()。
+        void abandon() noexcept;
 
-        [[nodiscard]] bool running() const;
         [[nodiscard]] winrt::Windows::Graphics::SizeInt32 item_size() const noexcept { return size_; }
-        std::shared_ptr<FrameSink> const& sink() const noexcept { return sink_; }
-
-        // 只能由 FrameArrived 回调调用。
-        winrt::Direct3D11CaptureFrame try_get_frame();
+        [[nodiscard]] std::shared_ptr<FrameSink> const& sink() const noexcept { return sink_; }
 
     private:
         CaptureResources() = default;
 
-        // 调用方必须持有 mutex_（或对象尚未发布）。
         // 每次截图都换一个全新的 frame pool：同一个 pool 关闭会话后再建会话，
         // 在部分驱动上会偶发 0x8000FFFF（WGC 内部状态没收干净）。
+        // 这些方法只在 capture 线程调用，资源对象不需要锁。
         void create_pool();
         void create_session();
-
-        mutable std::mutex mutex_;
 
         winrt::IDirect3DDevice device_{nullptr};
         winrt::DirectXPixelFormat format_ = winrt::DirectXPixelFormat::B8G8R8A8UIntNormalized;
@@ -116,7 +121,7 @@ namespace gamesnap {
         void wait_ready() { ready_.wait(); }
 
     private:
-        bool ensure_ready();
+        bool ensure_ready(ReloadReason reason);
         bool rebuild(ReloadReason reason);
         void handle_command(Command const& command);
         void shot(Command const& command);
@@ -131,6 +136,8 @@ namespace gamesnap {
         std::shared_ptr<D3DContext> d3d_;
         std::shared_ptr<CaptureResources> resources_;
         std::shared_ptr<ID3D11Texture2D> staging_;  // 唯一的主 staging 纹理
+        std::shared_ptr<std::atomic<bool>> staging_busy_ =
+            std::make_shared<std::atomic<bool>>(false);  // 主纹理是否被编码线程占用
         DisplayInfo display_{};
         HMONITOR monitor_ = nullptr;
         std::uint64_t generation_ = 0;

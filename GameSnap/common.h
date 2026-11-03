@@ -74,9 +74,9 @@ namespace Windows {
 
 namespace gamesnap {
 
-    // 全项目统一用 system_clock：文件名要墙上时间，延迟分解也只是很短的区间，
-    // 不需要再维护第二套 steady_clock 时间点。
+    // 文件名用墙上时间；阶段耗时用单调时钟，避免系统时间校准/修改导致负值。
     using Clock = std::chrono::system_clock;
+    using SteadyClock = std::chrono::steady_clock;
 
     // ── 文本 ─────────────────────────────────────────────────────────────────
     std::string wstring_to_utf8(std::wstring_view str);
@@ -87,7 +87,8 @@ namespace gamesnap {
     void install_terminate_handler();
 
     // ── 时间 ─────────────────────────────────────────────────────────────────
-    inline double duration_ms(Clock::duration duration) {
+    template <typename Duration>
+    inline double duration_ms(Duration duration) {
         return std::chrono::duration<double, std::milli>(duration).count();
     }
 
@@ -96,10 +97,10 @@ namespace gamesnap {
 
     // 一次截图在各阶段的时刻，用来统计“按键 → 落盘”的端到端延迟。
     struct ShotTimings {
-        Clock::time_point input;           // 热键事件进入命令队列
-        Clock::time_point start_capture;   // 调用 StartCapture
-        Clock::time_point frame_received;  // 拿到帧的时刻
-        Clock::time_point copied;          // CopyResource 完成
+        SteadyClock::time_point input;           // 热键事件进入命令队列
+        SteadyClock::time_point start_capture;   // 调用 StartCapture
+        SteadyClock::time_point frame_received;  // 拿到帧的时刻
+        SteadyClock::time_point copied;          // CopyResource 完成
     };
 
     // ── COM 驻留 ─────────────────────────────────────────────────────────────

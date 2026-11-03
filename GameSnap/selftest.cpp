@@ -149,7 +149,7 @@ namespace gamesnap {
             job.sequence = 7777;
             job.title = L"GameSnap SelfTest";
             job.local_time = Clock::now();
-            job.timings.input = Clock::now();
+            job.timings.input = SteadyClock::now();
             job.timings.start_capture = job.timings.input;
             job.timings.frame_received = job.timings.input;
             job.timings.copied = job.timings.input;

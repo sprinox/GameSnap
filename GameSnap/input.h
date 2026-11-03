@@ -40,7 +40,7 @@ namespace gamesnap {
     private:
         void run();
         void on_hotkey(bool down);
-        void trigger(Clock::time_point when);
+        void trigger(SteadyClock::time_point when);
         void on_reading(gi::IGameInputReading& reading);
 
         static LRESULT CALLBACK keyboard_proc(int code, WPARAM wparam, LPARAM lparam);

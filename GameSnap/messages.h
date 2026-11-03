@@ -38,7 +38,7 @@ namespace gamesnap {
     struct Command {
         CommandKind kind = CommandKind::Validate;
         ReloadReason reason = ReloadReason::Manual;
-        Clock::time_point enqueued = Clock::now();
+        SteadyClock::time_point enqueued = SteadyClock::now();
     };
 
     // 截图线程 → 编码线程。GPU 拷贝（CopyResource）在回调里做；
@@ -46,7 +46,9 @@ namespace gamesnap {
     struct EncodeJob {
         bool stop = false;  // 编码线程的停止哨兵
         std::shared_ptr<ID3D11Texture2D> texture;
-        std::shared_ptr<D3DContext> d3d;  // 保活设备 + 提供 context 锁
+        std::shared_ptr<D3DContext> d3d;                  // 保活设备 + 提供 context 锁
+        std::shared_ptr<std::atomic<bool>> canceled;      // 超时取消标记
+        std::shared_ptr<std::atomic<bool>> staging_busy;  // 主 staging 占用标记，编码完成后释放
         DXGI_COLOR_SPACE_TYPE color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         std::uint32_t sdr_white_nits = 80;
         std::uint64_t sequence = 0;

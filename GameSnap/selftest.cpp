@@ -23,20 +23,20 @@ namespace gamesnap {
 
         // 左上红、右上绿、左下蓝、右下灰阶渐变：
         // 任何通道顺序错误或上下翻转都能一眼看出来。
-        void fill_bgra(std::uint8_t* data, std::uint32_t row_pitch) {
-            for (std::uint32_t y = 0; y < kHeight; ++y) {
-                for (std::uint32_t x = 0; x < kWidth; ++x) {
+        void fill_bgra(std::uint8_t* data, std::uint32_t row_pitch, std::uint32_t width, std::uint32_t height) {
+            for (std::uint32_t y = 0; y < height; ++y) {
+                for (std::uint32_t x = 0; x < width; ++x) {
                     std::uint8_t r = 0;
                     std::uint8_t g = 0;
                     std::uint8_t b = 0;
-                    if (y < kHeight / 2 && x < kWidth / 2) {
+                    if (y < height / 2 && x < width / 2) {
                         r = 255;
-                    } else if (y < kHeight / 2) {
+                    } else if (y < height / 2) {
                         g = 255;
-                    } else if (x < kWidth / 2) {
+                    } else if (x < width / 2) {
                         b = 255;
                     } else {
-                        const auto v = static_cast<std::uint8_t>(x * 255 / (kWidth - 1));
+                        const auto v = static_cast<std::uint8_t>(x * 255 / (width - 1));
                         r = g = b = v;
                     }
                     std::uint8_t* pixel = data + (static_cast<std::size_t>(y) * row_pitch) + (static_cast<std::size_t>(x) * 4);
@@ -66,11 +66,11 @@ namespace gamesnap {
         }
 
         // PQ 编码值 0..0.58 约等于 0..203 nit（SDR 白点），色调映射后应是完整灰阶。
-        void fill_pq(std::uint8_t* data, std::uint32_t row_pitch) {
-            for (std::uint32_t y = 0; y < kHeight; ++y) {
-                for (std::uint32_t x = 0; x < kWidth; ++x) {
-                    float pq = static_cast<float>(x) / static_cast<float>(kWidth - 1) * kMaxPq;
-                    if (y < kHeight / 3)
+        void fill_pq(std::uint8_t* data, std::uint32_t row_pitch, std::uint32_t width, std::uint32_t height) {
+            for (std::uint32_t y = 0; y < height; ++y) {
+                for (std::uint32_t x = 0; x < width; ++x) {
+                    float pq = static_cast<float>(x) / static_cast<float>(width - 1) * kMaxPq;
+                    if (y < height / 3)
                         pq = kMaxPq;  // 顶部一条纯白，确认高光裁切正常
                     auto* pixel = reinterpret_cast<std::uint16_t*>(
                         data + (static_cast<std::size_t>(y) * row_pitch) + (static_cast<std::size_t>(x) * 8));
@@ -83,18 +83,20 @@ namespace gamesnap {
         }
 
         struct Case {
-            DXGI_FORMAT format;
-            DXGI_COLOR_SPACE_TYPE color_space;
-            std::uint32_t sdr_white_nits;
-            char const* label;
+            DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            DXGI_COLOR_SPACE_TYPE color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+            std::uint32_t sdr_white_nits = 80;
+            char const* label = "";
+            std::uint32_t width = kWidth;
+            std::uint32_t height = kHeight;
         };
 
         bool run_case(Config const& config, std::shared_ptr<D3DContext> const& d3d, Case const& test_case) {
             SPDLOG_INFO("--- 自检用例: {} ---", test_case.label);
 
             D3D11_TEXTURE2D_DESC desc{};
-            desc.Width = kWidth;
-            desc.Height = kHeight;
+            desc.Width = test_case.width;
+            desc.Height = test_case.height;
             desc.MipLevels = 1;
             desc.ArraySize = 1;
             desc.Format = test_case.format;
@@ -125,9 +127,9 @@ namespace gamesnap {
                 }
                 auto* bytes = static_cast<std::uint8_t*>(mapped.pData);
                 if (test_case.format == DXGI_FORMAT_R16G16B16A16_FLOAT)
-                    fill_pq(bytes, mapped.RowPitch);
+                    fill_pq(bytes, mapped.RowPitch, test_case.width, test_case.height);
                 else
-                    fill_bgra(bytes, mapped.RowPitch);
+                    fill_bgra(bytes, mapped.RowPitch, test_case.width, test_case.height);
                 d3d->context()->Unmap(source.get(), 0);
                 d3d->context()->CopyResource(target.get(), source.get());
             }
@@ -146,6 +148,10 @@ namespace gamesnap {
             job.d3d = d3d;
             job.color_space = test_case.color_space;
             job.sdr_white_nits = test_case.sdr_white_nits;
+            job.hdr = config.hdr_capture && test_case.format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            job.hdr_format = config.hdr_format;
+            job.sdr_format = config.sdr_format;
+            job.tone_map = config.tone_map;
             job.sequence = 7777;
             job.title = L"GameSnap SelfTest";
             job.local_time = Clock::now();
@@ -154,6 +160,7 @@ namespace gamesnap {
             job.timings.frame_received = job.timings.input;
             job.timings.copied = job.timings.input;
 
+            const bool hdr_job = job.hdr;
             if (!jobs->enqueue(std::move(job))) {
                 SPDLOG_ERROR("自检失败: 编码队列入队失败");
                 return false;
@@ -161,23 +168,44 @@ namespace gamesnap {
             // stop() 会给编码线程投递停止哨兵，并等它把任务落盘。
             workers.stop();
 
-            std::filesystem::path produced;
+            std::vector<std::filesystem::path> produced;
             for (const auto& entry : std::filesystem::directory_iterator(config.output_dir, ec)) {
+                if (!entry.is_regular_file())
+                    continue;
                 if (std::ranges::find(before, entry.path()) == before.end())
-                    produced = entry.path();
+                    produced.push_back(entry.path());
             }
             if (produced.empty()) {
                 SPDLOG_ERROR("自检失败: 没有生成输出文件（检查输出目录与日志中的编码错误）");
                 return false;
             }
 
-            const auto size = std::filesystem::file_size(produced, ec);
-            if (ec || size == 0) {
-                SPDLOG_ERROR("自检失败: 输出文件为空: {}", wstring_to_utf8(produced.wstring()));
+            bool has_hdr = false;
+            bool has_sdr = false;
+            for (const auto& path : produced) {
+                const std::wstring name = path.filename().wstring();
+                if (name.find(L"_HDR.") != std::wstring::npos)
+                    has_hdr = true;
+                if (name.find(L"_SDR.") != std::wstring::npos)
+                    has_sdr = true;
+                const auto size = std::filesystem::file_size(path, ec);
+                if (ec || size == 0) {
+                    SPDLOG_ERROR("自检失败: 输出文件为空: {}", wstring_to_utf8(path.wstring()));
+                    return false;
+                }
+                SPDLOG_INFO("自检输出: {} ({} 字节)", wstring_to_utf8(path.wstring()), size);
+            }
+            if (hdr_job && (!has_hdr || !has_sdr || produced.size() != 2)) {
+                SPDLOG_ERROR("自检失败: HDR 用例应且只应生成 _HDR 与 _SDR 两个文件（实际 {} 个）",
+                             produced.size());
+                return false;
+            }
+            if (!hdr_job && produced.size() != 1) {
+                SPDLOG_ERROR("自检失败: SDR 用例应只生成一个文件（实际 {} 个）", produced.size());
                 return false;
             }
 
-            SPDLOG_INFO("自检用例通过: {} ({} 字节)", wstring_to_utf8(produced.wstring()), size);
+            SPDLOG_INFO("自检用例通过: {} 个文件", produced.size());
             return true;
         }
 
@@ -206,11 +234,13 @@ namespace gamesnap {
         }
 
         bool ok = true;
-        ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_B8G8R8A8_UNORM, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, .sdr_white_nits = 80, .label = "SDR BGRA → BMP"}) &&
+        ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_B8G8R8A8_UNORM, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, .sdr_white_nits = 80, .label = "SDR BGRA"}) &&
              ok;
-        ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R8G8B8A8_UNORM, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, .sdr_white_nits = 80, .label = "SDR RGBA → BMP"}) &&
+        ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R8G8B8A8_UNORM, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, .sdr_white_nits = 80, .label = "SDR RGBA"}) &&
              ok;
-        ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R16G16B16A16_FLOAT, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, .sdr_white_nits = 203, .label = "HDR10(PQ) FP16 → BMP"}) &&
+        ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R16G16B16A16_FLOAT, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, .sdr_white_nits = 203, .label = "HDR10(PQ) FP16"}) &&
+             ok;
+        ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R16G16B16A16_FLOAT, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, .sdr_white_nits = 203, .label = "HDR10(PQ) FP16 641x361", .width = 641, .height = 361}) &&
              ok;
 
         SPDLOG_INFO("=== 自检{}：输出目录 {} ===", ok ? "全部通过" : "失败",

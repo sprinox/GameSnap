@@ -75,4 +75,29 @@
   <ItemGroup>
     <None Include="packages.config" />
   </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="codecs.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="tonemap.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClInclude Include="codecs.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="image.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="tonemap.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <FxCompile Include="tonemap.hlsl">
+      <Filter>源文件</Filter>
+    </FxCompile>
+    <ClInclude Include="tonemap_cs.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+  </ItemGroup>
 </Project>

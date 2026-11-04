@@ -88,6 +88,8 @@
       <EnableParallelCodeGeneration>true</EnableParallelCodeGeneration>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
     <Link>
@@ -139,6 +141,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="capture.cpp" />
+    <ClCompile Include="codecs.cpp" />
     <ClCompile Include="common.cpp" />
     <ClCompile Include="d3d.cpp" />
     <ClCompile Include="display.cpp" />
@@ -150,21 +153,35 @@
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
     </ClCompile>
     <ClCompile Include="selftest.cpp" />
+    <ClCompile Include="simd.cpp" />
     <ClCompile Include="system_events.cpp" />
+    <ClCompile Include="tonemap.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="capture.h" />
+    <ClInclude Include="codecs.h" />
     <ClInclude Include="common.h" />
     <ClInclude Include="d3d.h" />
     <ClInclude Include="display.h" />
     <ClInclude Include="encoder.h" />
     <ClInclude Include="input.h" />
+    <ClInclude Include="image.h" />
     <ClInclude Include="messages.h" />
     <ClInclude Include="selftest.h" />
+    <ClInclude Include="simd.h" />
     <ClInclude Include="system_events.h" />
+    <ClInclude Include="tonemap.h" />
+    <ClInclude Include="tonemap_cs.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
+    <FxCompile Include="tonemap.hlsl">
+      <ShaderType>Compute</ShaderType>
+      <ShaderModel>5.0</ShaderModel>
+      <EntryPointName>main</EntryPointName>
+      <HeaderFileOutput>$(ProjectDir)tonemap_cs.h</HeaderFileOutput>
+      <VariableName>kTonemapCS</VariableName>
+    </FxCompile>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

@@ -4,23 +4,24 @@ Windows 上的整显示器截图工具，面向低延迟：按下热键时不做
 
 ## 特性
 
-- 键盘全局热键（默认 F12）与手柄 LB + RB，全屏游戏内可用
+- 键盘全局热键（默认 F12，支持 Ctrl/Shift/Alt/Win 组合）与手柄 Xbox Share 键，全屏游戏内可用
 - 每次截图新建 frame pool 与会话，D3D 设备、采集项、编码线程常驻
-- 每张图独立编码，多线程并行写盘，不依赖 WIC / 图像库
-- HDR 显示器以 FP16 捕获并色调映射到 SDR
+- 每张图独立编码，多线程并行写盘；不依赖 WIC，编码使用 libavif / libwebp / libheif / spng / libjpeg-turbo
+- HDR 显示器以 FP16 捕获，同时输出 HDR + SDR 两份
+- HDR→SDR 使用 D3D11 compute shader（spline / lilium 调试），可选其它算法
 - 显示器拓扑变化、显卡热插拔、TDR 后自动重建
-- 输出 32bpp BMP
+- 输出 AVIF / HEIC / WebP / PNG / JPEG / BMP；AVIF/HEIC 支持 HDR
 
 ## 运行
 
-要求 Windows 10 2004+ / Windows 11，x64。构建方式见 [docs/build.md](docs/build.md)。
+要求 Windows 10 2004+ / Windows 11，x64，CPU 需支持 AVX2。构建方式见 [docs/build.md](docs/build.md)。
 
 ```powershell
 GameSnap.exe                              # F12 截图，输出到 %USERPROFILE%\Pictures\GameSnap
 GameSnap.exe --key printscreen --out D:\shots
 ```
 
-手柄同时按下 LB + RB 截图，`Ctrl+C` 退出。截图不包含鼠标指针。
+手柄按 Xbox Share 键截图，`Ctrl+C` 退出。截图不包含鼠标指针。
 手柄热键需要 GameInput 运行时：Windows 11 自带，旧系统需安装随包分发的 `GameInputRedist.msi`。
 
 ## 配置

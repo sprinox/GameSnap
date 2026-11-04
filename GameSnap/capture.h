@@ -5,8 +5,8 @@
 //
 // 并发约定（这是整个项目最关键的约束）：
 //   1. CaptureResources / Direct3D11CaptureFramePool / GraphicsCaptureSession
-//      由 capture 线程创建、关闭；内部用 mutex 保护句柄。建 pool/会话在锁内完成
-//      （此时新 pool 还没有回调，不会阻塞 FrameArrived），其余 COM 调用在锁外。
+//      由 capture 线程创建、关闭；只在 capture 线程访问，不需要 mutex。
+//      建 pool/会话时新 pool 还没有回调，不会阻塞 FrameArrived。
 //   2. WGC 的 FrameArrived 回调运行在 frame pool 的工作线程上（同一 pool 串行投递），
 //      只做“取帧 → CopyResource 到 staging → 入队”；Map/Unmap 在编码线程。
 //   3. 每张截图新建一套 frame pool + 会话，帧处理完直接关闭，不复用 pool。
@@ -35,12 +35,17 @@ namespace gamesnap {
         std::binary_semaphore done{0};                    // 回调处理完（或失败）后 release
         std::shared_ptr<std::atomic<bool>> canceled;      // 超时取消标记，和 EncodeJob 共享
         std::shared_ptr<std::atomic<bool>> staging_busy;  // 主 staging 是否被编码线程占用
+        std::atomic<bool> failed{false};                  // CopyResource / 设备移除失败
         SteadyClock::time_point enqueued;
         SteadyClock::time_point start_call;
         std::uint64_t sequence = 0;
         std::wstring title;
         DXGI_COLOR_SPACE_TYPE color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         std::uint32_t sdr_white_nits = 80;
+        bool hdr = false;
+        ImageFormat hdr_format = ImageFormat::Avif;
+        ImageFormat sdr_format = ImageFormat::Webp;
+        ToneMapAlgorithm tone_map = ToneMapAlgorithm::Spline;
     };
 
     // FrameArrived 回调只碰这个对象：取走当前 shot，在回调里完成拷贝/入队。
@@ -50,7 +55,8 @@ namespace gamesnap {
         void arm(std::shared_ptr<ShotContext> shot);
         void disarm();
         void on_frame(winrt::Direct3D11CaptureFramePool const& pool);
-        // 等待该 pool 的在途回调退出；false = 超时。
+        // 停止接收新 shot，并等待在途回调退出；false = 超时。
+        [[nodiscard]] bool close_and_wait(std::chrono::milliseconds timeout);
         [[nodiscard]] bool wait_idle(std::chrono::milliseconds timeout);
 
     private:
@@ -58,6 +64,7 @@ namespace gamesnap {
         std::condition_variable idle_cv_;
         std::shared_ptr<ShotContext> shot_;
         int in_flight_ = 0;
+        bool accepting_ = false;
     };
 
     class CaptureResources {
@@ -77,6 +84,8 @@ namespace gamesnap {
         void prepare();
         void start_capture();
         void stop_capture() noexcept;
+        // 先注销 FrameArrived，阻止新回调投递；随后由 sink 等待在途回调退出。
+        void unregister_frame_arrived() noexcept;
         void close();
         // 回调卡死时放弃本代：只释放引用，不调用任何 Close()。
         void abandon() noexcept;

@@ -142,7 +142,6 @@ namespace gamesnap {
 
                 DxgiOutputInfo info;
                 info.adapter = adapter;
-                info.desc = desc;
                 info.output6 = output.try_as<IDXGIOutput6>();
                 if (info.output6 && SUCCEEDED(info.output6->GetDesc1(&info.desc1))) {
                     info.has_desc1 = true;

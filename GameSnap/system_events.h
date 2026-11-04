@@ -6,6 +6,7 @@
 //   WM_SETTINGCHANGE  → 廉价自检
 //   WM_DEVICECHANGE   → 廉价自检（显卡插拔 / 驱动重启）
 //   WM_POWERBROADCAST → 强制重建（睡眠唤醒后设备常常已经失效）
+//   EVENT_SYSTEM_FOREGROUND → monitor=foreground 时目标屏变化才自检
 // 转换成命令投递到截图线程。注意必须用 top-level 窗口而不是 HWND_MESSAGE，
 // 否则收不到这些广播消息。
 // ─────────────────────────────────────────────────────────────────────────────
@@ -17,7 +18,7 @@ namespace gamesnap {
 
     class SystemEventThread {
     public:
-        explicit SystemEventThread(std::shared_ptr<CommandQueue> commands);
+        SystemEventThread(std::shared_ptr<CommandQueue> commands, MonitorChoice monitor);
         ~SystemEventThread();
 
         SystemEventThread(const SystemEventThread&) = delete;
@@ -34,13 +35,17 @@ namespace gamesnap {
         void post(CommandKind kind, ReloadReason reason);
 
         static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
+        static void CALLBACK win_event_proc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
+                                            LONG id_object, LONG id_child, DWORD thread_id, DWORD time);
 
         std::shared_ptr<CommandQueue> commands_;
-        moodycamel::ProducerToken command_token_;
         std::thread thread_;
         std::atomic<DWORD> thread_id_{0};
         std::atomic<bool> stop_{false};
+        MonitorChoice monitor_;
         HWND window_ = nullptr;
+        HWINEVENTHOOK foreground_hook_ = nullptr;
+        HMONITOR foreground_monitor_ = nullptr;
     };
 
 }  // namespace gamesnap

@@ -15,10 +15,13 @@ YAML 先加载，命令行参数随后覆盖。仓库根的 [config.example.yaml
 | --- | --- | --- | --- |
 | `output_dir` | 字符串 | `%USERPROFILE%\Pictures\GameSnap` | 截图目录，不存在时自动创建 |
 | `encode_threads` | 整数 1–8 | `2` | 编码线程数，决定并行写盘能力 |
-| `hotkey` | 字符串 | `F12` | `F1..F24`、`printscreen`、`scrolllock`、`insert`、`home`、`end`、`0x7B` |
+| `hotkey` | 字符串 | `F12` | `F1..F24`、字母/数字、`printscreen`、`scrolllock`、`insert`、`home`、`end`、`space`、`0x7B`；可加 `ctrl+` / `shift+` / `alt+` / `win+` |
 | `swallow` | 布尔 | `false` | 是否吞掉热键，`true` 时游戏收不到 |
 | `monitor` | 字符串 | `primary` | `primary`：主显示器；`foreground`：前台窗口所在显示器 |
-| `hdr` | 布尔 | `false` | HDR 显示器以 FP16 捕获并色调映射到 SDR |
+| `hdr` | 布尔 | `false` | HDR 显示器以 FP16 捕获；保存 HDR + SDR 两份 |
+| `format_hdr` | 字符串 | `avif` | HDR 容器，仅 `avif` / `heic` |
+| `format_sdr` | 字符串 | `webp` | SDR 格式：`bmp` / `png` / `jpeg` / `webp` / `avif` / `heic` |
+| `tone_map` | 字符串 | `spline` | HDR→SDR 算法：`spline` / `lilium` |
 | `verbose` | 布尔 | `false` | 输出 debug 级别日志 |
 
 布尔值使用 yaml-cpp 的规则：`true/false`、`yes/no`、`on/off`、`y/n`（不区分大小写），不接受 `1/0`。
@@ -33,7 +36,10 @@ YAML 先加载，命令行参数随后覆盖。仓库根的 [config.example.yaml
 | `--threads <1-8>` | 编码线程数 |
 | `--monitor <primary\|foreground>` | 截主显示器 / 前台窗口所在显示器 |
 | `--swallow` | 吞掉热键 |
-| `--hdr` | HDR 捕获并色调映射 |
+| `--hdr` | HDR 捕获并保存 HDR + SDR 两份 |
+| `--format-hdr <avif\|heic>` | HDR 输出容器 |
+| `--format-sdr <格式>` | SDR 输出格式 |
+| `--tone-map <spline\|lilium>` | 色调映射算法 |
 | `--verbose` | 调试日志 |
 | `--selftest` | 合成纹理自检编码链路，不经过 WGC |
 | `--help` | 显示帮助 |
@@ -54,3 +60,9 @@ YAML 先加载，命令行参数随后覆盖。仓库根的 [config.example.yaml
 ```
 
 `verbose: true` 时包含每张图的排队、取帧、拷贝、转换、写盘耗时。
+
+## 输出格式
+HDR 截图固定写两份：`<名字>_HDR.<format_hdr>` 与 `<名字>_SDR.<format_sdr>`；非 HDR 只写 SDR。
+当 SDR 格式为 AVIF 时，SDR 文件内嵌 gain map（由 SDR 基图与 GPU 产出的 HDR PQ 帧计算）；HEIC 当前不写 gain map。
+BMP / PNG / WebP / AVIF 无损，JPEG quality=100；HEIC 为最高质量有损。
+HDR 输出为 10-bit PQ / BT.2020（AVIF）；HEIC 在 x265 只有 8-bit 时自动退化为 8-bit PQ。

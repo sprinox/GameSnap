@@ -8,7 +8,10 @@
 #include <cstring>
 #include <fstream>
 
+#include "codecs.h"
 #include "d3d.h"
+#include "simd.h"
+#include "tonemap.h"
 
 namespace gamesnap {
     namespace {
@@ -44,9 +47,10 @@ namespace gamesnap {
             return title;
         }
 
-        // 文件名：<前台窗口标题>_YYYYMMDD_HHMMSS_mmm_序号.bmp（本地时间，std::chrono 格式化）
+        // 文件名：<标题>_YYYYMMDD_HHMMSS_mmm_序号[_HDR|_SDR].<ext>
         std::filesystem::path make_output_path(std::filesystem::path const& dir, Clock::time_point time,
-                                               std::wstring title, std::uint64_t sequence) {
+                                               std::wstring title, std::uint64_t sequence,
+                                               std::string_view extension, std::string_view suffix) {
             // fmt 没有 zoned_time 的 formatter，用 C++20 chrono 拆出本地日期/时间再格式化。
             const auto local = std::chrono::zoned_time(std::chrono::current_zone(), time).get_local_time();
             const auto days = std::chrono::floor<std::chrono::days>(local);
@@ -59,37 +63,17 @@ namespace gamesnap {
                 static_cast<int>(date.year()), static_cast<unsigned>(date.month()), static_cast<unsigned>(date.day()),
                 clock.hours().count(), clock.minutes().count(), clock.seconds().count(),
                 millis, static_cast<unsigned>(sequence % 10000U));
-            return dir / (sanitize_filename(std::move(title)) + L"_" + utf8_to_wstring(stamp) + L".bmp");
-        }
-
-        // ── 半精度浮点 → float（避免引入 DirectXMath 依赖） ──────────────────
-        inline float half_to_float(std::uint16_t value) {
-            const std::uint32_t sign = static_cast<std::uint32_t>(value & 0x8000U) << 16;
-            std::uint32_t exponent = (value >> 10) & 0x1FU;
-            std::uint32_t mantissa = value & 0x3FFU;
-            std::uint32_t bits = 0;
-
-            if (exponent == 0x1F) {  // Inf / NaN
-                bits = sign | 0x7F800000U | (mantissa << 13);
-            } else if (exponent != 0) {
-                bits = sign | ((exponent - 15 + 127) << 23) | (mantissa << 13);
-            } else if (mantissa == 0) {
-                bits = sign;
-            } else {  // 次正规数
-                exponent = 127 - 15 + 1;
-                while ((mantissa & 0x400U) == 0) {
-                    mantissa <<= 1;
-                    --exponent;
-                }
-                mantissa &= 0x3FFU;
-                bits = sign | (exponent << 23) | (mantissa << 13);
+            std::wstring name = sanitize_filename(std::move(title)) + L"_" + utf8_to_wstring(stamp);
+            if (!suffix.empty()) {
+                name += L"_";
+                name += utf8_to_wstring(suffix);
             }
-
-            float result = 0.0F;
-            std::memcpy(&result, &bits, sizeof(result));
-            return result;
+            name += L".";
+            name += utf8_to_wstring(extension);
+            return dir / name;
         }
 
+        // ── PQ ───────────────────────────────────────────────────────────────
         // ST 2084 (PQ) EOTF：PQ 编码值 → 绝对亮度(nit)
         inline float pq_to_nits(float pq) {
             if (!(pq > 0.0F))  // 同时拦掉 NaN
@@ -130,15 +114,27 @@ namespace gamesnap {
             std::uint32_t height = 0;
             std::uint32_t stride = 0;
             DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+            bool alpha_normalized = false;
         };
 
-        // 统一成 32bpp BGRA，BMP 直接按这个顺序写盘。
-        struct Image {
-            std::vector<std::uint8_t> pixels;
-            std::uint32_t width = 0;
-            std::uint32_t height = 0;
-            std::uint32_t stride = 0;
+        // 全进程只保留一份大缓冲；编码线程 try_lock，拿不到就临时分配并在本张图结束后释放。
+        struct EncodeScratch {
+            RawCopy raw;
+            Image sdr;
+            std::vector<std::uint16_t> hdr10;
         };
+
+        struct ScratchPool {
+            std::mutex mutex;
+            EncodeScratch scratch;
+        };
+
+        ScratchPool& scratch_pool() {
+            static ScratchPool pool;
+            return pool;
+        }
+
+        // 统一成 32bpp BGRA（Image 定义在 image.h）。
 
         std::uint32_t bytes_per_pixel(DXGI_FORMAT format) {
             switch (format) {
@@ -170,21 +166,38 @@ namespace gamesnap {
             raw.height = desc.Height;
             raw.stride = desc.Width * bpp;
             raw.format = desc.Format;
+            raw.alpha_normalized = desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                                   desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
             raw.bytes.resize(static_cast<std::size_t>(raw.stride) * raw.height);
 
             D3D11_MAPPED_SUBRESOURCE mapped{};
-            {
-                std::scoped_lock lock(d3d.context_mutex());
-                const HRESULT hr = d3d.context()->Map(texture, 0, D3D11_MAP_READ, 0, &mapped);
-                if (FAILED(hr)) {
+            const auto map_deadline = SteadyClock::now() + std::chrono::seconds(5);
+            for (;;) {
+                HRESULT hr = E_FAIL;
+                {
+                    std::scoped_lock lock(d3d.context_mutex());
+                    hr = d3d.context()->Map(texture, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+                }
+                if (hr == S_OK)
+                    break;
+                if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
                     error = fmt::format("Map staging 纹理失败: {}", describe_hresult(hr));
                     return false;
                 }
+                if (SteadyClock::now() >= map_deadline) {
+                    error = "Map staging 纹理超时";
+                    return false;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             for (std::uint32_t y = 0; y < raw.height; ++y) {
-                std::memcpy(raw.bytes.data() + (static_cast<std::size_t>(y) * raw.stride),
-                            static_cast<const std::uint8_t*>(mapped.pData) + (static_cast<std::size_t>(y) * mapped.RowPitch),
-                            raw.stride);
+                auto const* src = static_cast<const std::uint8_t*>(mapped.pData) +
+                                  (static_cast<std::size_t>(y) * mapped.RowPitch);
+                auto* dst = raw.bytes.data() + (static_cast<std::size_t>(y) * raw.stride);
+                if (raw.alpha_normalized)
+                    bgra_copy_set_alpha_row(src, dst, raw.width);
+                else
+                    std::memcpy(dst, src, raw.stride);
             }
             {
                 std::scoped_lock lock(d3d.context_mutex());
@@ -205,9 +218,15 @@ namespace gamesnap {
             out.height = raw.height;
             out.stride = raw.width * 4;
 
-            // SDR + BGRA：完全不需要转换，直接把缓冲搬过去。
+            // SDR + BGRA：直接搬缓冲，但统一 alpha 为 255（截图不需要窗口 alpha）。
             if (is_bgra) {
-                out.pixels = std::move(raw.bytes);
+                out.pixels.swap(raw.bytes);
+                if (!raw.alpha_normalized) {
+                    for (std::uint32_t y = 0; y < out.height; ++y) {
+                        auto* row = out.pixels.data() + static_cast<std::size_t>(y) * out.stride;
+                        bgra_set_alpha_row(row, out.width);
+                    }
+                }
                 return true;
             }
 
@@ -236,16 +255,30 @@ namespace gamesnap {
                                color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020;
             const float sdr_white = static_cast<float>(std::max<std::uint32_t>(sdr_white_nits, 1));
 
-            // PQ 的输入域是 [0,1]；scRGB 中 SDR 白点在 80 nit 单位下可到 ~2.5，
-            // 高光更大，统一按 [0,4] 采样，超出部分直接当作白色。
+            // PQ 的输入域是 [0,1]；scRGB 统一按 [0,4] 采样，超出部分当作白色。
             const float domain = is_pq ? 1.0F : 4.0F;
-            std::array<std::uint8_t, kToneLutSize> lut{};
-            for (std::size_t i = 0; i < kToneLutSize; ++i) {
-                const float value = static_cast<float>(i) / static_cast<float>(kToneLutSize - 1) * domain;
-                const float linear = is_pq ? (pq_to_nits(value) / sdr_white)
-                                           : (value * 80.0F / sdr_white);
-                lut[i] = linear_to_srgb8(linear);
+
+            // LUT 只依赖 (PQ/scRGB, SDR 白点)；编码线程复用，避免每张回退图重算 32K 次 pow。
+            struct LutCache {
+                bool valid = false;
+                bool pq = false;
+                std::uint32_t white = 0;
+                std::array<std::uint8_t, kToneLutSize> lut{};
+            };
+            thread_local LutCache cache;
+            const std::uint32_t white_key = std::max<std::uint32_t>(sdr_white_nits, 1);
+            if (!cache.valid || cache.pq != is_pq || cache.white != white_key) {
+                for (std::size_t i = 0; i < kToneLutSize; ++i) {
+                    const float value = static_cast<float>(i) / static_cast<float>(kToneLutSize - 1) * domain;
+                    const float linear = is_pq ? (pq_to_nits(value) / sdr_white)
+                                               : (value * 80.0F / sdr_white);
+                    cache.lut[i] = linear_to_srgb8(linear);
+                }
+                cache.valid = true;
+                cache.pq = is_pq;
+                cache.white = white_key;
             }
+            const auto& lut = cache.lut;
             const auto sample = [&lut, domain](float value) -> std::uint8_t {
                 if (!(value > 0.0F))  // 同时拦掉 NaN
                     return 0;
@@ -255,51 +288,20 @@ namespace gamesnap {
                 return lut[index];
             };
 
+            std::vector<float> row_floats(static_cast<std::size_t>(raw.width) * 4);
             for (std::uint32_t y = 0; y < raw.height; ++y) {
                 const auto* src = reinterpret_cast<const std::uint16_t*>(raw.bytes.data() + (static_cast<std::size_t>(y) * raw.stride));
+                half_to_float_row(src, row_floats.data(), static_cast<std::size_t>(raw.width) * 4);
                 std::uint8_t* dst = out.pixels.data() + (static_cast<std::size_t>(y) * out.stride);
                 for (std::uint32_t x = 0; x < raw.width; ++x) {
-                    const std::uint16_t* p = src + (static_cast<std::size_t>(x) * 4);
                     std::uint8_t* q = dst + (static_cast<std::size_t>(x) * 4);
-                    q[0] = sample(half_to_float(p[2]));
-                    q[1] = sample(half_to_float(p[1]));
-                    q[2] = sample(half_to_float(p[0]));
+                    q[0] = sample(row_floats[static_cast<std::size_t>(x) * 4 + 2]);
+                    q[1] = sample(row_floats[static_cast<std::size_t>(x) * 4 + 1]);
+                    q[2] = sample(row_floats[static_cast<std::size_t>(x) * 4 + 0]);
                     q[3] = 255;
                 }
             }
             return true;
-        }
-
-        // 写 32bpp BMP（BITMAPFILEHEADER + BITMAPINFOHEADER，bottom-up）。
-        // TODO: 以后要 PNG / JPEG 的话在这里加对应的编码分支。
-        bool write_bmp(std::filesystem::path const& path, Image const& image) {
-            if (image.pixels.empty() || image.width == 0 || image.height == 0)
-                return false;
-
-            const std::uint32_t row_bytes = image.width * 4;  // 32bpp，天然 4 字节对齐
-            BITMAPFILEHEADER file_header{};
-            file_header.bfType = 0x4D42;  // 'BM'
-            file_header.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
-            file_header.bfSize = file_header.bfOffBits + (row_bytes * image.height);
-
-            BITMAPINFOHEADER info_header{};
-            info_header.biSize = sizeof(BITMAPINFOHEADER);
-            info_header.biWidth = static_cast<LONG>(image.width);
-            // 负高度 = Top-Down DIB，与内存中的行顺序一致，可整块写出。
-            info_header.biHeight = -static_cast<LONG>(image.height);
-            info_header.biPlanes = 1;
-            info_header.biBitCount = 32;
-            info_header.biCompression = BI_RGB;
-            info_header.biSizeImage = row_bytes * image.height;
-
-            std::ofstream file(path, std::ios::binary | std::ios::trunc);
-            if (!file)
-                return false;
-            file.write(reinterpret_cast<char const*>(&file_header), sizeof(file_header));
-            file.write(reinterpret_cast<char const*>(&info_header), sizeof(info_header));
-            file.write(reinterpret_cast<char const*>(image.pixels.data()), static_cast<std::streamsize>(image.pixels.size()));
-            file.flush();
-            return file.good();
         }
 
     }  // namespace
@@ -388,15 +390,18 @@ namespace gamesnap {
         SPDLOG_INFO("编码线程 {} 退出", index);
     }
 
-    void EncodeWorkers::encode(EncodeJob& job) const {
+    void EncodeWorkers::encode(EncodeJob& job) {
         // 主 staging 的占用标记由这里释放；提前返回/异常也会释放。
         struct BusyGuard {
             explicit BusyGuard(std::shared_ptr<std::atomic<bool>> busy_) : busy(std::move(busy_)) {}
             std::shared_ptr<std::atomic<bool>> busy;
-            ~BusyGuard() {
-                if (busy)
+            void release() {
+                if (busy) {
                     busy->store(false, std::memory_order_release);
+                    busy.reset();
+                }
             }
+            ~BusyGuard() { release(); }
             BusyGuard(BusyGuard const&) = delete;
             BusyGuard& operator=(BusyGuard const&) = delete;
             BusyGuard(BusyGuard&&) = delete;
@@ -411,51 +416,140 @@ namespace gamesnap {
             return;
         }
 
-        RawCopy raw;
+        // 全进程一份大缓冲；争用不到时本张图临时分配，结束后立刻销毁。
+        ScratchPool& pool = scratch_pool();
+        std::unique_lock<std::mutex> scratch_lock(pool.mutex, std::try_to_lock);
+        EncodeScratch local;
+        EncodeScratch& scratch = scratch_lock.owns_lock() ? pool.scratch : local;
+        RawCopy& raw = scratch.raw;
+        Image& sdr = scratch.sdr;
+        std::vector<std::uint16_t>& hdr10 = scratch.hdr10;
+        raw.bytes.clear();
+        sdr.pixels.clear();
+        hdr10.clear();
         std::string error;
-        if (!map_to_cpu(*job.d3d, job.texture.get(), raw, error)) {
-            SPDLOG_ERROR("[#{:04}] 取像素失败: {}", job.sequence, error);
-            return;
+        D3D11_TEXTURE2D_DESC texture_desc{};
+        job.texture->GetDesc(&texture_desc);
+
+        // HDR 优先走 GPU：mapper 内部先 CopyResource，再 dispatch/readback。
+        // 只有它失败时才需要把 staging 读完再走 CPU 回退。
+        bool gpu_ok = false;
+        if (job.hdr) {
+            std::scoped_lock mapper_lock(mapper_mutex_);
+            if (!mapper_ || mapper_owner_ != job.d3d.get()) {
+                mapper_ = std::make_unique<ToneMapper>(job.d3d);
+                mapper_owner_ = job.d3d.get();
+                if (!mapper_->ok())
+                    SPDLOG_WARN("tone mapper 初始化失败: {}", mapper_->init_error());
+            }
+            if (mapper_->ok()) {
+                gpu_ok = mapper_->map(job.texture.get(), job.color_space, job.sdr_white_nits,
+                                      job.tone_map, sdr, hdr10, error);
+                if (!gpu_ok)
+                    SPDLOG_WARN("[#{:04}] compute tone map 失败，回退 CPU: {}", job.sequence, error);
+            }
+        }
+
+        if (!gpu_ok) {
+            if (!map_to_cpu(*job.d3d, job.texture.get(), raw, error)) {
+                SPDLOG_ERROR("[#{:04}] 取像素失败: {}", job.sequence, error);
+                return;
+            }
         }
         const auto mapped_at = SteadyClock::now();
 
-        // 已经读完 staging，可以立刻让下一张截图复用主纹理（转换/写盘继续并行）。
-        if (guard.busy) {
-            guard.busy->store(false, std::memory_order_release);
-            guard.busy.reset();
-        }
+        // staging 的所有 GPU/CPU 读取都已完成，允许下一张截图复用主纹理。
+        guard.release();
         if (job.canceled && job.canceled->load(std::memory_order_acquire))
             return;
 
-        Image image;
-        if (!convert_pixels(raw, job.color_space, job.sdr_white_nits, image)) {
-            SPDLOG_ERROR("[#{:04}] 不支持的像素格式 {}", job.sequence, static_cast<int>(raw.format));
-            return;
-        }
-        const auto converted_at = SteadyClock::now();
+        const bool is_pq = job.color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+                           job.color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020;
+        std::vector<std::filesystem::path> written;
+        int width = static_cast<int>(texture_desc.Width);
+        int height = static_cast<int>(texture_desc.Height);
 
-        const std::filesystem::path path =
-            make_output_path(output_dir_, job.local_time, std::move(job.title), job.sequence);
-        if (!write_bmp(path, image)) {
-            SPDLOG_ERROR("[#{:04}] 写文件失败: {}", job.sequence, wstring_to_utf8(path.wstring()));
-            return;
+        if (job.hdr) {
+            ImageFormat hdr_format = format_supports_hdr(job.hdr_format) ? job.hdr_format : ImageFormat::Avif;
+            const auto hdr_path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
+                                                   image_extension(hdr_format), "HDR");
+            bool hdr_ok = false;
+            if (gpu_ok) {
+                hdr_ok = write_hdr10(hdr_path, hdr_format, hdr10.data(), texture_desc.Width,
+                                     texture_desc.Height, error);
+            } else {
+                const HdrFrame frame{.bytes = raw.bytes.data(),
+                                     .width = raw.width,
+                                     .height = raw.height,
+                                     .stride = raw.stride,
+                                     .pq = is_pq,
+                                     .sdr_white_nits = job.sdr_white_nits};
+                hdr_ok = write_hdr(hdr_path, hdr_format, frame, error);
+            }
+            if (!hdr_ok) {
+                SPDLOG_ERROR("[#{:04}] HDR 编码失败 ({}): {}", job.sequence, to_string(hdr_format), error);
+            } else {
+                written.push_back(hdr_path);
+            }
+
+            if (!gpu_ok && !convert_pixels(raw, job.color_space, job.sdr_white_nits, sdr)) {
+                SPDLOG_ERROR("[#{:04}] 不支持的像素格式 {}", job.sequence, static_cast<int>(raw.format));
+                return;
+            }
+            if (job.sdr_format == ImageFormat::Heic)
+                SPDLOG_WARN("[#{:04}] libheif 不支持 gain map，HEIC SDR 不包含 HDR 重建信息", job.sequence);
+            const auto sdr_path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
+                                                   image_extension(job.sdr_format), "SDR");
+            const bool sdr_ok =
+                (!hdr10.empty() && job.sdr_format == ImageFormat::Avif)
+                    ? encode_avif_gainmap(sdr_path, sdr, hdr10.data(), sdr.width, sdr.height, error)
+                    : write_sdr(sdr_path, job.sdr_format, sdr, error);
+            if (!sdr_ok) {
+                SPDLOG_ERROR("[#{:04}] SDR 编码失败 ({}): {}", job.sequence, to_string(job.sdr_format), error);
+            } else {
+                written.push_back(sdr_path);
+            }
+        } else {
+            Image image;
+            if (!convert_pixels(raw, job.color_space, job.sdr_white_nits, image)) {
+                SPDLOG_ERROR("[#{:04}] 不支持的像素格式 {}", job.sequence, static_cast<int>(raw.format));
+                return;
+            }
+            const auto path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
+                                               image_extension(job.sdr_format), {});
+            if (!write_sdr(path, job.sdr_format, image, error)) {
+                SPDLOG_ERROR("[#{:04}] 编码失败 ({}): {}", job.sequence, to_string(job.sdr_format), error);
+                return;
+            }
+            written.push_back(path);
+            width = static_cast<int>(image.width);
+            height = static_cast<int>(image.height);
         }
+
         const auto encoded_at = SteadyClock::now();
+        if (written.empty())
+            return;
+
+        std::string paths;
+        for (auto const& path : written) {
+            if (!paths.empty())
+                paths += ", ";
+            paths += wstring_to_utf8(path.filename().wstring());
+        }
 
         const auto& t = job.timings;
         const double key_to_start = duration_ms(t.start_capture - t.input);
         const double start_to_frame = duration_ms(t.frame_received - t.start_capture);
         const double copy = duration_ms(t.copied - t.frame_received);
         const double pixel = duration_ms(mapped_at - t.copied);
-        const double convert = duration_ms(converted_at - mapped_at);
-        const double write = duration_ms(encoded_at - converted_at);
+        const double convert = duration_ms(encoded_at - mapped_at);
         const double total = duration_ms(encoded_at - t.input);
 
         SPDLOG_INFO(
-            "[#{:04}] {} {}x{} bmp | 按键→StartCapture {:.2f}ms | StartCapture→首帧 {:.2f}ms | "
-            "GPU 拷贝 {:.2f}ms | 取像素 {:.2f}ms | 转换 {:.2f}ms | 写盘 {:.2f}ms | 按键→落盘 {:.2f}ms",
-            job.sequence, wstring_to_utf8(path.wstring()), image.width, image.height,
-            key_to_start, start_to_frame, copy, pixel, convert, write, total);
+            "[#{:04}] {} {}x{} {} | 按键→StartCapture {:.2f}ms | StartCapture→首帧 {:.2f}ms | "
+            "GPU 拷贝 {:.2f}ms | 取像素 {:.2f}ms | 编码/写盘 {:.2f}ms | 按键→落盘 {:.2f}ms",
+            job.sequence, paths, width, height, job.hdr ? "HDR+SDR" : "SDR",
+            key_to_start, start_to_frame, copy, pixel, convert, total);
     }
 
 }  // namespace gamesnap

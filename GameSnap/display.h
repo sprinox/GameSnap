@@ -11,7 +11,6 @@ namespace gamesnap {
     struct DxgiOutputInfo {
         winrt::com_ptr<IDXGIAdapter1> adapter;
         winrt::com_ptr<IDXGIOutput6> output6;  // 老系统/驱动上可能为空
-        DXGI_OUTPUT_DESC desc{};
         DXGI_OUTPUT_DESC1 desc1{};
         bool has_desc1 = false;
     };

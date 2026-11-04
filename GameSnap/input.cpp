@@ -5,7 +5,18 @@
 namespace gamesnap {
     namespace {
 
-        constexpr gi::GameInputGamepadButtons kTriggerButtons = gi::GameInputGamepadLeftShoulder | gi::GameInputGamepadRightShoulder;
+        bool hotkey_modifiers_match(UINT required) {
+            UINT current = 0;
+            if ((::GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0)
+                current |= MOD_CONTROL;
+            if ((::GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0)
+                current |= MOD_SHIFT;
+            if ((::GetAsyncKeyState(VK_MENU) & 0x8000) != 0)
+                current |= MOD_ALT;
+            if ((::GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 || (::GetAsyncKeyState(VK_RWIN) & 0x8000) != 0)
+                current |= MOD_WIN;
+            return current == required;
+        }
 
         // 低层钩子的回调是静态函数，通过这个指针找到当前实例。
         // 同一时刻只会有一个 InputThread（进程级单例）。
@@ -74,7 +85,7 @@ namespace gamesnap {
         } else {
             // 手柄用 GameInput 读数回调；回调在 GameInput 的派发线程上执行，context 传 this。
             const HRESULT register_hr = game_input_->RegisterReadingCallback(
-                nullptr, gi::GameInputKindGamepad, this, &InputThread::reading_callback, &reading_token_);
+                nullptr, gi::GameInputKindSystemButton, this, &InputThread::reading_callback, &reading_token_);
             if (FAILED(register_hr)) {
                 SPDLOG_WARN("注册手柄读数回调失败: {}", describe_hresult(register_hr));
                 reading_token_ = 0;
@@ -124,17 +135,24 @@ namespace gamesnap {
                 if (down || up) {
                     const auto* info = reinterpret_cast<KBDLLHOOKSTRUCT const*>(lparam);  // NOLINT(performance-no-int-to-ptr): Win32 的 LPARAM 约定
                     if (info != nullptr && info->vkCode == self->config_.hotkey_vk) {
+                        bool handled = false;
                         // 钩子回调里绝不能抛异常：抛出去会直接终止进程，
                         // 而且会卡住整台机器的键盘输入。
                         try {
-                            self->on_hotkey(down);
+                            if (up) {
+                                const bool was_down = self->key_down_;
+                                self->on_hotkey(false);
+                                handled = self->config_.hotkey_swallow && was_down;
+                            } else if (down && hotkey_modifiers_match(self->config_.hotkey_modifiers)) {
+                                self->on_hotkey(true);
+                                handled = self->config_.hotkey_swallow;
+                            }
                         } catch (std::exception const& e) {
                             SPDLOG_ERROR("处理热键时异常: {}", e.what());
                         } catch (...) {
                             SPDLOG_ERROR("处理热键时异常");
                         }
-                        // 默认不吞热键：游戏仍然能收到这个按键。
-                        if (down && self->config_.hotkey_swallow)
+                        if (handled)
                             return 1;
                     }
                 }
@@ -167,16 +185,16 @@ namespace gamesnap {
     }
 
     void InputThread::on_reading(gi::IGameInputReading& reading) {
-        gi::GameInputGamepadState state{};
-        if (!reading.GetGamepadState(&state))
+        gi::GameInputSystemButtons buttons{};
+        if (!reading.GetSystemButtonState(&buttons))
             return;
 
-        const bool combo = (state.buttons & kTriggerButtons) == kTriggerButtons;
-        if (combo && !combo_latched_.exchange(true, std::memory_order_acq_rel)) {
-            SPDLOG_DEBUG("手柄触发截图");
+        const bool share = (buttons & gi::GameInputSystemButtonShare) != 0;
+        if (share && !share_latched_.exchange(true, std::memory_order_acq_rel)) {
+            SPDLOG_DEBUG("手柄 Share 键触发截图");
             trigger(SteadyClock::now());
-        } else if (!combo) {
-            combo_latched_.store(false, std::memory_order_release);
+        } else if (!share) {
+            share_latched_.store(false, std::memory_order_release);
         }
     }
 

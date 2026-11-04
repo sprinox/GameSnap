@@ -3,8 +3,7 @@
 # 用法：复制本文件为 config.yaml，按需修改（config.yaml 才是程序实际加载的文件）。
 # 查找顺序：--config <路径> → exe 目录\config.yaml → 当前目录\config.yaml。
 # 命令行参数优先于配置文件；所有项都可省略，省略即使用默认值。
-# 值非法（未知热键、类型不对等）会整体忽略本文件并回退默认值，日志里有一条 error；
-# 值非法或 YAML 语法错误会记录 error 并回退默认值。
+# 值非法（未知热键、类型不对等）会记录 error 并回退默认值。
 
 # ── 输出 ────────────────────────────────────────────────────────────────────
 # 截图目录；不存在会自动创建。省略 = %USERPROFILE%\Pictures\GameSnap
@@ -14,19 +13,29 @@
 # 编码线程数（1..8）。截图在 capture 线程串行，转换/写盘按线程并行。
 encode_threads: 2
 
+# HDR 截图保存两份：HDR 容器 + SDR 格式；非 HDR 只保存 SDR。
+# format_hdr 仅支持 avif / heic；format_sdr 支持 bmp / png / jpeg / webp / avif / heic。
+# bmp / png / webp 无损，jpeg 为 quality=100；avif 无损，heic 为最高质量有损。
+format_hdr: avif
+format_sdr: webp
+
+# HDR→SDR 色调映射算法：spline（默认，Hermite shoulder）或 lilium（调试 false color）。
+tone_map: spline
+
 # ── 采集 ────────────────────────────────────────────────────────────────────
-# 键盘热键：F1..F24 / printscreen / scrolllock / insert / home / end / 0x7B
+# 键盘热键：F1..F24 / A-Z / 0-9 / printscreen / scrolllock / insert / home / end / space / 0x7B
+# 可加修饰键：ctrl / shift / alt / win，例如 ctrl+shift+F12
 hotkey: F12
 
-# true = 吞掉热键（游戏收不到这个按键）；false = 游戏仍能收到
+# true = 吞掉热键（游戏收不到这个键）；false = 游戏仍能收到
 swallow: false
 
 # 截哪块屏：primary = 主显示器；foreground = 前台窗口所在显示器
 monitor: primary
 
-# HDR 显示器以 FP16 捕获并色调映射到 SDR；非 HDR 显示器开启会回退 SDR 捕获
+# HDR 显示器以 FP16 捕获；非 HDR 显示器开启会回退 SDR 捕获
 hdr: false
 
 # ── 日志 ────────────────────────────────────────────────────────────────────
-# true = debug 级别日志（含每张图的排队 / 取帧 / 拷贝 / 转换 / 写盘耗时）
+# true = debug 级别日志（含每张图的排队 / 取帧 / 复制 / 转换 / 写盘耗时）
 verbose: false

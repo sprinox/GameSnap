@@ -1,10 +1,23 @@
 {
   "dependencies": [
+    "aom",
     "concurrentqueue",
     "cpptrace",
     "cxxopts",
     "fmt",
+    {
+      "name": "libavif",
+      "features": [
+        "aom"
+      ]
+    },
+    "libheif",
+    "libjpeg-turbo",
+    "libspng",
+    "libwebp",
     "spdlog",
-    "yaml-cpp"
+    "x265",
+    "yaml-cpp",
+    "cpu-features"
   ]
 }

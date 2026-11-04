@@ -9,6 +9,7 @@
 #include <concurrentqueue/moodycamel/blockingconcurrentqueue.h>
 
 #include "common.h"
+#include "image.h"
 
 namespace gamesnap {
 
@@ -49,6 +50,10 @@ namespace gamesnap {
         std::shared_ptr<D3DContext> d3d;                  // 保活设备 + 提供 context 锁
         std::shared_ptr<std::atomic<bool>> canceled;      // 超时取消标记
         std::shared_ptr<std::atomic<bool>> staging_busy;  // 主 staging 占用标记，编码完成后释放
+        bool hdr = false;
+        ImageFormat hdr_format = ImageFormat::Avif;
+        ImageFormat sdr_format = ImageFormat::Webp;
+        ToneMapAlgorithm tone_map = ToneMapAlgorithm::Spline;
         DXGI_COLOR_SPACE_TYPE color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         std::uint32_t sdr_white_nits = 80;
         std::uint64_t sequence = 0;

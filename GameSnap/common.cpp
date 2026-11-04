@@ -2,6 +2,8 @@
 
 #include "common.h"
 
+#include "tonemap.h"
+
 #include <roapi.h>
 #include <shlobj.h>
 
@@ -15,6 +17,7 @@
 #include <iterator>
 #include <stdexcept>
 
+#include <cpu_features/cpuinfo_x86.h>
 #include <yaml-cpp/yaml.h>
 
 #include <cxxopts.hpp>
@@ -71,14 +74,9 @@ namespace gamesnap {
             return static_cast<int>(value);
         }
 
-        std::optional<UINT> parse_hotkey(std::wstring_view text) {
-            std::wstring lowered(text);
-            std::ranges::transform(lowered, lowered.begin(), [](wchar_t c) {
-                return static_cast<wchar_t>(std::towlower(c));
-            });
-
+        std::optional<UINT> parse_key_name(std::wstring_view lowered) {
             if (lowered.size() >= 2 && lowered[0] == L'f') {
-                if (auto number = parse_int(std::wstring_view(lowered).substr(1)); number && *number >= 1 && *number <= 24)
+                if (auto number = parse_int(lowered.substr(1)); number && *number >= 1 && *number <= 24)
                     return static_cast<UINT>(VK_F1 + *number - 1);
             }
             if (lowered == L"printscreen" || lowered == L"prtsc" || lowered == L"snapshot")
@@ -93,14 +91,94 @@ namespace gamesnap {
                 return static_cast<UINT>(VK_HOME);
             if (lowered == L"end")
                 return static_cast<UINT>(VK_END);
+            if (lowered == L"space")
+                return static_cast<UINT>(VK_SPACE);
+            if (lowered == L"tab")
+                return static_cast<UINT>(VK_TAB);
+            if (lowered == L"enter" || lowered == L"return")
+                return static_cast<UINT>(VK_RETURN);
+            if (lowered == L"esc" || lowered == L"escape")
+                return static_cast<UINT>(VK_ESCAPE);
+            if (lowered == L"backspace")
+                return static_cast<UINT>(VK_BACK);
+            if (lowered == L"delete" || lowered == L"del")
+                return static_cast<UINT>(VK_DELETE);
+            if (lowered == L"up")
+                return static_cast<UINT>(VK_UP);
+            if (lowered == L"down")
+                return static_cast<UINT>(VK_DOWN);
+            if (lowered == L"left")
+                return static_cast<UINT>(VK_LEFT);
+            if (lowered == L"right")
+                return static_cast<UINT>(VK_RIGHT);
+            if (lowered == L"pageup" || lowered == L"pgup")
+                return static_cast<UINT>(VK_PRIOR);
+            if (lowered == L"pagedown" || lowered == L"pgdn")
+                return static_cast<UINT>(VK_NEXT);
+
+            // 单字母 / 单数字：a-z、0-9
+            if (lowered.size() == 1) {
+                if (lowered[0] >= L'a' && lowered[0] <= L'z')
+                    return static_cast<UINT>('A') + static_cast<UINT>(lowered[0] - L'a');
+                if (lowered[0] >= L'0' && lowered[0] <= L'9')
+                    return static_cast<UINT>('0') + static_cast<UINT>(lowered[0] - L'0');
+            }
 
             // 0x7B 或 123 这种数字写法
+            const std::wstring copy(lowered);
             wchar_t* end = nullptr;
-            const wchar_t* begin = lowered.c_str();
+            const wchar_t* begin = copy.c_str();
             const unsigned long value = std::wcstoul(begin, &end, 0);
             if (end != begin && *end == L'\0' && value > 0 && value < 0x100)
                 return static_cast<UINT>(value);
             return std::nullopt;
+        }
+
+        std::optional<Hotkey> parse_hotkey(std::wstring_view text) {
+            std::wstring lowered(text);
+            std::ranges::transform(lowered, lowered.begin(), [](wchar_t c) {
+                return static_cast<wchar_t>(std::towlower(c));
+            });
+
+            Hotkey result;
+            bool have_key = false;
+            std::size_t start = 0;
+            while (start <= lowered.size()) {
+                const std::size_t plus = lowered.find(L'+', start);
+                std::wstring_view token = std::wstring_view(lowered).substr(
+                    start, plus == std::wstring::npos ? std::wstring::npos : plus - start);
+                while (!token.empty() && std::iswspace(token.front()))
+                    token.remove_prefix(1);
+                while (!token.empty() && std::iswspace(token.back()))
+                    token.remove_suffix(1);
+                if (token.empty())
+                    return std::nullopt;
+
+                if (token == L"ctrl" || token == L"control") {
+                    result.modifiers |= MOD_CONTROL;
+                } else if (token == L"shift") {
+                    result.modifiers |= MOD_SHIFT;
+                } else if (token == L"alt") {
+                    result.modifiers |= MOD_ALT;
+                } else if (token == L"win" || token == L"windows" || token == L"meta") {
+                    result.modifiers |= MOD_WIN;
+                } else {
+                    if (have_key)
+                        return std::nullopt;
+                    const auto key = parse_key_name(token);
+                    if (!key)
+                        return std::nullopt;
+                    result.vk = *key;
+                    have_key = true;
+                }
+
+                if (plus == std::wstring::npos)
+                    break;
+                start = plus + 1;
+            }
+            if (!have_key)
+                return std::nullopt;
+            return result;
         }
 
         // ── YAML 配置 ────────────────────────────────────────────────────────
@@ -123,8 +201,9 @@ namespace gamesnap {
         }
 
         bool is_known_config_key(std::string_view key) {
-            constexpr std::array<std::string_view, 7> keys{
-                "output_dir", "encode_threads", "hotkey", "swallow", "monitor", "hdr", "verbose"};
+            constexpr std::array<std::string_view, 10> keys{
+                "output_dir", "encode_threads", "hotkey", "swallow", "monitor", "hdr",
+                "format_hdr", "format_sdr", "tone_map", "verbose"};
             return std::ranges::find(keys, key) != keys.end();
         }
 
@@ -153,15 +232,35 @@ namespace gamesnap {
                     if (const auto value = read_key<int>(root, "encode_threads"); value)
                         parsed.encode_threads = *value;
                     if (const auto text = read_key<std::string>(root, "hotkey"); text) {
-                        if (auto vk = parse_hotkey(utf8_to_wstring(*text)); vk)
-                            parsed.hotkey_vk = *vk;
-                        else
+                        if (auto hotkey = parse_hotkey(utf8_to_wstring(*text)); hotkey) {
+                            parsed.hotkey_vk = hotkey->vk;
+                            parsed.hotkey_modifiers = hotkey->modifiers;
+                        } else {
                             throw ConfigError(fmt::format("无法识别的热键: {}", *text));
+                        }
                     }
                     if (const auto value = read_key<bool>(root, "swallow"); value)
                         parsed.hotkey_swallow = *value;
                     if (const auto value = read_key<bool>(root, "hdr"); value)
                         parsed.hdr_capture = *value;
+                    if (const auto text = read_key<std::string>(root, "format_hdr"); text) {
+                        const auto format = parse_image_format(*text);
+                        if (!format || !format_supports_hdr(*format))
+                            throw ConfigError(fmt::format("format_hdr 只支持 avif / heic，实际为 {}", *text));
+                        parsed.hdr_format = *format;
+                    }
+                    if (const auto text = read_key<std::string>(root, "format_sdr"); text) {
+                        const auto format = parse_image_format(*text);
+                        if (!format)
+                            throw ConfigError(fmt::format("无法识别的 format_sdr: {}", *text));
+                        parsed.sdr_format = *format;
+                    }
+                    if (const auto text = read_key<std::string>(root, "tone_map"); text) {
+                        const auto algorithm = parse_tone_map_algorithm(*text);
+                        if (!algorithm)
+                            throw ConfigError(fmt::format("无法识别的 tone_map: {}", *text));
+                        parsed.tone_map = *algorithm;
+                    }
                     if (const auto value = read_key<bool>(root, "verbose"); value)
                         parsed.verbose = *value;
                     if (const auto text = read_key<std::string>(root, "monitor"); text) {
@@ -318,6 +417,44 @@ namespace gamesnap {
         spdlog::flush_every(std::chrono::seconds(2));
     }
 
+    bool check_cpu_features() {
+        const cpu_features::X86Info info = cpu_features::GetX86Info();
+        bool ok = true;
+        if (info.features.avx2 == 0) {
+            SPDLOG_CRITICAL("CPU 不支持 AVX2，GameSnap 无法运行");
+            ok = false;
+        }
+        if (info.features.f16c == 0) {
+            SPDLOG_CRITICAL("CPU 不支持 F16C，GameSnap 无法运行");
+            ok = false;
+        }
+        return ok;
+    }
+
+    void install_new_handler() {
+        // 项目不逐处处理 bad_alloc：分配失败打印调用栈后终止，避免留下 mapped 纹理等半状态。
+        std::set_new_handler([]() noexcept {
+            // 先摘掉处理器：打印栈时再次 OOM 不再递归进入本函数。
+            std::set_new_handler(nullptr);
+
+            constexpr std::string_view message = "GameSnap: out of memory\n";
+            (void)std::fwrite(message.data(), 1, message.size(), stderr);
+            (void)std::fflush(stderr);
+
+            try {
+                SPDLOG_CRITICAL("std::bad_alloc: 内存分配失败");
+                if (auto logger = spdlog::default_logger())
+                    logger->flush();
+            } catch (...) {  // NOLINT(bugprone-empty-catch): 新处理器里不能再次抛出
+            }
+            try {
+                cpptrace::generate_trace().print_with_snippets();
+            } catch (...) {  // NOLINT(bugprone-empty-catch): 新处理器里不能再次抛出
+            }
+            std::abort();
+        });
+    }
+
     void install_terminate_handler() {
         std::set_terminate([] {
             if (auto exception = std::current_exception()) {
@@ -352,31 +489,96 @@ namespace gamesnap {
         return choice == MonitorChoice::Foreground ? "foreground" : "primary";
     }
 
-    std::string_view hotkey_name(UINT vk) {
+    std::string hotkey_name(Hotkey const& hotkey) {
+        std::string name;
+        const auto append = [&name](std::string_view part) {
+            if (!name.empty())
+                name += '+';
+            name += part;
+        };
+        if ((hotkey.modifiers & MOD_CONTROL) != 0)
+            append("Ctrl");
+        if ((hotkey.modifiers & MOD_SHIFT) != 0)
+            append("Shift");
+        if ((hotkey.modifiers & MOD_ALT) != 0)
+            append("Alt");
+        if ((hotkey.modifiers & MOD_WIN) != 0)
+            append("Win");
+
+        const UINT vk = hotkey.vk;
         if (vk >= VK_F1 && vk <= VK_F24) {
             static constexpr std::array<const char*, 24> kNames{
                 "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8",
                 "F9", "F10", "F11", "F12", "F13", "F14", "F15", "F16",
                 "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24"};
-            // vk 已限定在 VK_F1..VK_F24，不需要运行时边界检查。
-            return kNames[vk - VK_F1];
+            append(kNames[vk - VK_F1]);
+        } else {
+            switch (vk) {
+            case VK_SPACE:
+                append("Space");
+                break;
+            case VK_TAB:
+                append("Tab");
+                break;
+            case VK_RETURN:
+                append("Enter");
+                break;
+            case VK_ESCAPE:
+                append("Esc");
+                break;
+            case VK_BACK:
+                append("Backspace");
+                break;
+            case VK_DELETE:
+                append("Delete");
+                break;
+            case VK_UP:
+                append("Up");
+                break;
+            case VK_DOWN:
+                append("Down");
+                break;
+            case VK_LEFT:
+                append("Left");
+                break;
+            case VK_RIGHT:
+                append("Right");
+                break;
+            case VK_PRIOR:
+                append("PageUp");
+                break;
+            case VK_NEXT:
+                append("PageDown");
+                break;
+            case VK_SNAPSHOT:
+                append("PrintScreen");
+                break;
+            case VK_SCROLL:
+                append("ScrollLock");
+                break;
+            case VK_PAUSE:
+                append("Pause");
+                break;
+            case VK_INSERT:
+                append("Insert");
+                break;
+            case VK_HOME:
+                append("Home");
+                break;
+            case VK_END:
+                append("End");
+                break;
+            default:
+                if (vk >= static_cast<UINT>('A') && vk <= static_cast<UINT>('Z'))
+                    append(std::string(1, static_cast<char>('A' + vk - static_cast<UINT>('A'))));
+                else if (vk >= static_cast<UINT>('0') && vk <= static_cast<UINT>('9'))
+                    append(std::string(1, static_cast<char>('0' + vk - static_cast<UINT>('0'))));
+                else
+                    append(fmt::format("VK 0x{:02X}", vk));
+                break;
+            }
         }
-        switch (vk) {
-        case VK_SNAPSHOT:
-            return "PrintScreen";
-        case VK_SCROLL:
-            return "ScrollLock";
-        case VK_PAUSE:
-            return "Pause";
-        case VK_INSERT:
-            return "Insert";
-        case VK_HOME:
-            return "Home";
-        case VK_END:
-            return "End";
-        default:
-            return "自定义按键";
-        }
+        return name;
     }
 
     std::filesystem::path default_output_dir() {
@@ -415,12 +617,15 @@ namespace gamesnap {
         // clang-format off
         options.add_options()
             ("config", "配置文件（默认 exe 目录 / 当前目录的 config.yaml）", cxxopts::value<std::string>())
-            ("key", "截图热键：F1..F24 / printscreen / scrolllock / 0x7B", cxxopts::value<std::string>())
+            ("key", "截图热键：F1..F24 / printscreen / scrolllock / 0x7B，可加 ctrl+shift+alt+win", cxxopts::value<std::string>())
             ("out", "输出目录", cxxopts::value<std::string>())
             ("threads", "编码线程数 1..8", cxxopts::value<int>())
             ("monitor", "primary / foreground", cxxopts::value<std::string>())
             ("swallow", "吞掉热键（游戏收不到）")
-            ("hdr", "HDR 显示器以 FP16 捕获并色调映射到 SDR")
+            ("hdr", "HDR 显示器以 FP16 捕获并输出 HDR + SDR 两份")
+            ("format-hdr", "HDR 容器 avif / heic", cxxopts::value<std::string>())
+            ("format-sdr", "SDR 格式 bmp/png/jpeg/webp/avif/heic", cxxopts::value<std::string>())
+            ("tone-map", "色调映射 spline / lilium", cxxopts::value<std::string>())
             ("verbose", "输出调试日志")
             ("selftest", "用合成纹理跑编码链路自检")
             ("h,help", "显示帮助");
@@ -428,7 +633,7 @@ namespace gamesnap {
 
         const auto print_help = [&options] {
             std::string help = options.help();
-            help += "\n手柄：同时按下 LB + RB 触发截图。\n退出：Ctrl+C。日志位于 exe 目录下的 logs\\GameSnap.log。\n";
+            help += "\n手柄：按 Xbox Share 键触发截图。\n退出：Ctrl+C。日志位于 exe 目录下的 logs\\GameSnap.log。\n";
             (void)std::fwrite(help.data(), 1, help.size(), stdout);
             (void)std::fflush(stdout);
         };
@@ -464,18 +669,22 @@ namespace gamesnap {
                     config_path = cwd_config;
             }
         }
-        if (!config_path.empty())
-            load_config_file(config_path, config);
+        const bool explicit_config = result.count("config") != 0;
+        if (!config_path.empty() && !load_config_file(config_path, config) && explicit_config) {
+            SPDLOG_ERROR("配置文件不存在: {}", wstring_to_utf8(config_path.wstring()));
+            return std::nullopt;
+        }
 
         // 命令行覆盖 YAML。
         if (result.count("key") != 0) {
             const auto text = utf8_to_wstring(result["key"].as<std::string>());
-            const auto vk = parse_hotkey(text);
-            if (!vk) {
+            const auto hotkey = parse_hotkey(text);
+            if (!hotkey) {
                 SPDLOG_ERROR("无法识别的热键: {}", wstring_to_utf8(text));
                 return std::nullopt;
             }
-            config.hotkey_vk = *vk;
+            config.hotkey_vk = hotkey->vk;
+            config.hotkey_modifiers = hotkey->modifiers;
         }
         if (result.count("out") != 0)
             config.output_dir = utf8_to_wstring(result["out"].as<std::string>());
@@ -496,6 +705,30 @@ namespace gamesnap {
             config.hotkey_swallow = true;
         if (result.count("hdr") != 0)
             config.hdr_capture = true;
+        if (result.count("format-hdr") != 0) {
+            const auto format = parse_image_format(result["format-hdr"].as<std::string>());
+            if (!format || !format_supports_hdr(*format)) {
+                SPDLOG_ERROR("--format-hdr 只支持 avif / heic");
+                return std::nullopt;
+            }
+            config.hdr_format = *format;
+        }
+        if (result.count("format-sdr") != 0) {
+            const auto format = parse_image_format(result["format-sdr"].as<std::string>());
+            if (!format) {
+                SPDLOG_ERROR("--format-sdr 无法识别");
+                return std::nullopt;
+            }
+            config.sdr_format = *format;
+        }
+        if (result.count("tone-map") != 0) {
+            const auto algorithm = parse_tone_map_algorithm(result["tone-map"].as<std::string>());
+            if (!algorithm) {
+                SPDLOG_ERROR("--tone-map 只支持 spline / lilium");
+                return std::nullopt;
+            }
+            config.tone_map = *algorithm;
+        }
         if (result.count("verbose") != 0)
             config.verbose = true;
         if (result.count("selftest") != 0)
@@ -507,8 +740,11 @@ namespace gamesnap {
 
     void log_config(Config const& config) {
         SPDLOG_INFO("输出目录: {}", wstring_to_utf8(config.output_dir.wstring()));
-        SPDLOG_INFO("输出格式: bmp");
-        SPDLOG_INFO("截图热键: {} ({}吞掉)", hotkey_name(config.hotkey_vk), config.hotkey_swallow ? "" : "不");
+        SPDLOG_INFO("输出格式: HDR={} SDR={}，色调映射={}",
+                    to_string(config.hdr_format), to_string(config.sdr_format), to_string(config.tone_map));
+        SPDLOG_INFO("截图热键: {} ({}吞掉)",
+                    hotkey_name({config.hotkey_vk, config.hotkey_modifiers}),
+                    config.hotkey_swallow ? "" : "不");
         SPDLOG_INFO("目标显示器: {}", to_string(config.monitor));
         SPDLOG_INFO("编码线程: {}", config.encode_threads);
         SPDLOG_INFO("采集模式: 按需(热键时 StartCapture){}", config.hdr_capture ? " + HDR" : "");

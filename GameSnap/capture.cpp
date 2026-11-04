@@ -107,8 +107,10 @@ namespace gamesnap {
         // Map/Unmap（GPU→CPU）交给编码线程，回调线程不被整帧 memcpy 拖住。
         void handle_frame(winrt::Direct3D11CaptureFramePool const& pool, ShotContext& shot) {
             winrt::Direct3D11CaptureFrame frame = pool.TryGetNextFrame();
-            if (!frame)
+            if (!frame) {
+                shot.failed.store(true, std::memory_order_release);
                 return;
+            }
             if (shot.canceled->load(std::memory_order_acquire)) {
                 frame.Close();
                 return;
@@ -119,11 +121,13 @@ namespace gamesnap {
             try {
                 auto access = frame.Surface().as<Windows::IDirect3DDxgiInterfaceAccess>();
                 if (FAILED(access->GetInterface(__uuidof(ID3D11Texture2D), source.put_void()))) {
+                    shot.failed.store(true, std::memory_order_release);
                     frame.Close();
                     SPDLOG_ERROR("获取帧纹理失败");
                     return;
                 }
             } catch (winrt::hresult_error const& e) {
+                shot.failed.store(true, std::memory_order_release);
                 frame.Close();
                 SPDLOG_ERROR("获取帧纹理失败: {}", describe_hresult(e.code()));
                 return;
@@ -147,6 +151,7 @@ namespace gamesnap {
                 texture = create_staging_texture(shot.d3d->device(), staging_desc);
             }
             if (!texture) {
+                shot.failed.store(true, std::memory_order_release);
                 frame.Close();
                 SPDLOG_ERROR("创建 staging 纹理失败 ({}x{}, fmt={})",
                              desc.Width, desc.Height, static_cast<int>(desc.Format));
@@ -159,6 +164,12 @@ namespace gamesnap {
                 shot.d3d->context()->CopyResource(texture.get(), source.get());
             }
             frame.Close();
+            // CopyResource 没有 HRESULT；TDR/拔卡时可能静默失败。GetDeviceRemovedReason 是
+            // 唯一廉价的事后反馈，避免把旧内容或垃圾帧交给编码线程。
+            if (FAILED(shot.d3d->device()->GetDeviceRemovedReason())) {
+                shot.failed.store(true, std::memory_order_release);
+                return;
+            }
             const auto copied = SteadyClock::now();
             if (shot.canceled->load(std::memory_order_acquire))
                 return;
@@ -174,6 +185,10 @@ namespace gamesnap {
             job.d3d = shot.d3d;
             job.canceled = shot.canceled;
             job.staging_busy = busy;
+            job.hdr = shot.hdr;
+            job.hdr_format = shot.hdr_format;
+            job.sdr_format = shot.sdr_format;
+            job.tone_map = shot.tone_map;
             job.color_space = shot.color_space;
             job.sdr_white_nits = shot.sdr_white_nits;
             job.sequence = shot.sequence;
@@ -322,6 +337,17 @@ namespace gamesnap {
         }
     }
 
+    void CaptureResources::unregister_frame_arrived() noexcept {
+        auto token = std::exchange(frame_token_, {});
+        auto pool = pool_;
+        if (pool && token) {
+            try {
+                pool.FrameArrived(token);
+            } catch (...) {  // NOLINT(bugprone-empty-catch): noexcept 收尾路径不能记日志
+            }
+        }
+    }
+
     void CaptureResources::stop_capture() noexcept {
         running_ = false;
         auto session = std::exchange(session_, nullptr);
@@ -378,6 +404,7 @@ namespace gamesnap {
 
     void FrameSink::arm(std::shared_ptr<ShotContext> shot) {
         std::scoped_lock lock(mutex_);
+        accepting_ = true;
         shot_ = std::move(shot);
     }
 
@@ -390,6 +417,8 @@ namespace gamesnap {
         std::shared_ptr<ShotContext> shot;
         {
             std::scoped_lock lock(mutex_);
+            if (!accepting_)
+                return;
             ++in_flight_;
             shot = std::exchange(shot_, nullptr);
         }
@@ -398,8 +427,10 @@ namespace gamesnap {
             try {
                 handle_frame(pool, *shot);
             } catch (std::exception const& e) {
+                shot->failed.store(true, std::memory_order_release);
                 SPDLOG_ERROR("处理帧失败: {}", e.what());
             } catch (...) {
+                shot->failed.store(true, std::memory_order_release);
                 SPDLOG_ERROR("处理帧失败");
             }
             shot->done.release();
@@ -410,6 +441,16 @@ namespace gamesnap {
             --in_flight_;
         }
         idle_cv_.notify_all();
+    }
+
+    bool FrameSink::close_and_wait(std::chrono::milliseconds timeout) {
+        {
+            std::scoped_lock lock(mutex_);
+            accepting_ = false;
+            shot_.reset();
+        }
+        idle_cv_.notify_all();
+        return wait_idle(timeout);
     }
 
     bool FrameSink::wait_idle(std::chrono::milliseconds timeout) {
@@ -430,6 +471,9 @@ namespace gamesnap {
           command_token_(*commands_) {}
 
     void CaptureWorker::run() {
+        // 放在第一行：任何早退/异常路径都必须放行主线程的 ready_.wait()。
+        const ReadyGuard ready_guard{ready_};
+
         // COM apartment 必须覆盖整个 run()：之后还会创建 pool/会话并关闭 WinRT 对象。
         ComApartment apartment;
         if (!apartment.ok())
@@ -438,18 +482,13 @@ namespace gamesnap {
         ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
         ::SetThreadDescription(::GetCurrentThread(), L"GameSnap.Capture");
 
-        {
-            // 就绪闩锁只覆盖启动初始化：初始化成功/失败/异常后主线程都应继续。
-            const ReadyGuard ready_guard{ready_};
-
-            // 启动时就把资源准备好，第一次热键不需要重建。
-            // 如果这里就失败（典型是 E_ACCESSDENIED），继续跑也没有任何意义，直接通知主线程退出。
-            if (!ensure_ready(ReloadReason::Startup)) {
-                SPDLOG_CRITICAL("捕获资源初始化失败，GameSnap 无法截图，退出");
-                fatal_error_.store(true, std::memory_order_relaxed);
-                stop_->request_stop();
-                return;
-            }
+        // 启动时就把资源准备好，第一次热键不需要重建。
+        // 如果这里就失败（典型是 E_ACCESSDENIED），继续跑也没有任何意义，直接通知主线程退出。
+        if (!ensure_ready(ReloadReason::Startup)) {
+            SPDLOG_CRITICAL("捕获资源初始化失败，GameSnap 无法截图，退出");
+            fatal_error_.store(true, std::memory_order_relaxed);
+            stop_->request_stop();
+            return;
         }
 
         for (;;) {
@@ -457,6 +496,9 @@ namespace gamesnap {
             commands_->wait_dequeue(command_token_, command);
             if (command.kind == CommandKind::Shutdown)
                 break;
+            // 已收到停止信号：只消费队列，不再启动新的截图/重建。
+            if (stop_->stop_requested())
+                continue;
             handle_command(command);
         }
 
@@ -507,11 +549,16 @@ namespace gamesnap {
         if (reason == ReloadReason::DeviceChange)
             return true;
 
-        // 分辨率 / 旋转 / HDR / 显示器变化才重建；单纯切全屏不应触发。
-        const DisplayInfo current = describe_monitor(monitor_);
+        // 目标显示器可能已经变化（主屏切换 / 前台窗口换屏），每次自检重新选择。
+        const DisplayInfo current = select_monitor(config_.monitor);
         if (current.monitor == nullptr) {
             SPDLOG_WARN("无法读取目标显示器信息");
             return rebuild(ReloadReason::MonitorLost);
+        }
+        if (current.monitor != monitor_) {
+            SPDLOG_INFO("目标显示器变化: {} -> {}",
+                        wstring_to_utf8(display_.device_name), wstring_to_utf8(current.device_name));
+            return rebuild(ReloadReason::DisplayChange);
         }
         if (current.width != display_.width || current.height != display_.height ||
             current.rotation != display_.rotation || current.hdr != display_.hdr ||
@@ -602,6 +649,12 @@ namespace gamesnap {
                 return;
         }
 
+        if (d3d_->device_removed()) {
+            SPDLOG_WARN("截图前检测到 D3D 设备已移除，重建资源");
+            if (!rebuild(ReloadReason::DeviceRemoved))
+                return;
+        }
+
         auto shot = std::make_shared<ShotContext>();
         shot->d3d = d3d_;
         shot->jobs = jobs_;
@@ -609,11 +662,14 @@ namespace gamesnap {
         shot->staging_busy = staging_busy_;
         shot->canceled = std::make_shared<std::atomic<bool>>(false);
         shot->enqueued = command.enqueued;
-        shot->start_call = SteadyClock::now();
         shot->sequence = ++sequence_;
         shot->title = foreground_window_title();
         shot->color_space = display_.color_space;
         shot->sdr_white_nits = display_.sdr_white_nits;
+        shot->hdr = config_.hdr_capture && display_.hdr;
+        shot->hdr_format = config_.hdr_format;
+        shot->sdr_format = config_.sdr_format;
+        shot->tone_map = config_.tone_map;
 
         try {
             resources_->prepare();
@@ -626,8 +682,9 @@ namespace gamesnap {
             return;
         }
 
-        // 每个 pool 有自己的 sink；先 arm 再 StartCapture，避免漏掉首帧。
+        // 每个 pool 有自己的 sink；先记录时间再 arm，避免回调线程读到未发布的 start_call。
         auto sink = resources_->sink();
+        shot->start_call = SteadyClock::now();
         sink->arm(shot);
         try {
             resources_->start_capture();
@@ -645,14 +702,21 @@ namespace gamesnap {
             shot->canceled->store(true, std::memory_order_release);
             SPDLOG_WARN("[#{:04}] {}ms 内没有等到帧，取消本次截图", shot->sequence, kFrameWait.count());
         }
-        sink->disarm();
-
-        // 等本次 pool 的回调真正退出；卡死时不能关闭它正在用的 pool，只能放弃本代。
-        if (!sink->wait_idle(kCallbackWait)) {
+        // 先注销 token 阻止新回调，再由 sink 停止接收并等在途回调退出。
+        resources_->unregister_frame_arrived();
+        if (!sink->close_and_wait(kCallbackWait)) {
             SPDLOG_ERROR("[#{:04}] FrameArrived 回调未退出，放弃当前资源代", shot->sequence);
             resources_->abandon();
             resources_.reset();
             staging_.reset();
+            return;
+        }
+        if (shot->failed.load(std::memory_order_acquire)) {
+            SPDLOG_WARN("[#{:04}] 帧拷贝失败（设备移除/TDR），重建资源", shot->sequence);
+            resources_->close();
+            resources_.reset();
+            staging_.reset();
+            rebuild(ReloadReason::DeviceRemoved);
             return;
         }
         resources_->stop_capture();

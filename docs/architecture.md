@@ -72,6 +72,9 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 - 每张图先等 `done`，再等该 pool 的回调真正退出（`wait_idle`），然后才关闭会话和 pool；
   回调 2 秒内不退出说明驱动卡住，此时不调用 `Close()`，直接放弃这一代资源；
 - 每张图的 shot 只交给本 pool 的 sink，旧 pool 的迟到回调不可能取走下一张截图的 shot；
+- `Direct3D11CaptureFrame` 一旦从 `TryGetNextFrame()` 取出，就持有自己的 D3D 纹理引用；`GraphicsCaptureSession` /
+  `Direct3D11CaptureFramePool` 关闭后，这个 frame 仍然可以安全 `Map` / `CopyResource`。当前仍然先等回调退出再关闭，
+  是为了避开池/会话的驱动生命周期竞态，而不是 frame 的数据依赖 pool；官方 `CaptureSnapshot` 示例也是先关 pool 再消费已取出的帧；
 - 不复用 pool：同一个 pool 在关闭会话后再次 `CreateCaptureSession`，部分驱动上会偶发 `0x8000FFFF`；
 - 连按热键时多出的 `Trigger` 在 `CommandQueue` 排队，逐张处理。
 
@@ -81,7 +84,7 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 
 1. `CaptureResources`（item / pool / session）只在 capture 线程创建、使用、销毁。
 2. `FrameArrived` 在 frame pool 的工作线程上串行投递；每个 pool 一个独立 `FrameSink`，回调只接触本 pool 的 sink 和 shot。
-3. `ID3D11DeviceContext` 不是线程安全的：回调线程的 `CopyResource` 与编码线程的 `Map` / `Unmap` 共用 `D3DContext::context_mutex()`；`Map` 返回后的逐行 `memcpy` 只是普通 CPU 读内存，在锁外并行执行，转换和写盘也在锁外。
+3. `ID3D11DeviceContext` 不是线程安全的：回调线程的 `CopyResource` 与编码线程的 `Map` / `Unmap` 共用 `D3DContext::context_mutex()`；`Map` 使用 `D3D11_MAP_FLAG_DO_NOT_WAIT`，GPU 未完成时在锁外 sleep 重试，锁只覆盖单次 `Map` / `Unmap`。`Map` 返回后的逐行 `memcpy` 只是普通 CPU 读内存，在锁外并行执行，转换和写盘也在锁外。ToneMapper 用 `D3D11_QUERY_EVENT` 在锁外等待 GPU 完成。
 4. 资源按“代”整体替换：先建好新一代，全部成功后才替换，失败则旧代继续工作。
 5. 退出顺序：先停 input 和 system-events，再给 capture 投递 `Shutdown`，最后给编码线程投递 `stop`；生产者先停，消费者后停。
 6. staging 纹理只有一块，用一个显式的 `atomic<bool>` 占用标记：编码线程 Map 完立刻释放，截图时标记已占用就临时新建一块，不依赖 `shared_ptr::use_count`。
@@ -94,23 +97,30 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 | `WM_SETTINGCHANGE` | 廉价自检 |
 | `WM_DEVICECHANGE` | 只检查设备/显示器句柄与 DXGI 工厂，不枚举输出（避免 USB 事件反复触发 DXGI 枚举） |
 | `WM_POWERBROADCAST` 恢复 | 强制重建 |
-| 每次截图前 | 设备是否移除、`HMONITOR` 是否有效、DXGI 工厂 `IsCurrent()` |
+| `EVENT_SYSTEM_FOREGROUND` | `monitor=foreground` 时，前台窗口所在屏变化才触发自检 |
+| 每次截图前 | 只检查 D3D 设备是否移除 |
 
 自检失败时重建：重新选显示器 → 新 D3D 设备 → 新 item / pool / 会话 → 新主 staging 纹理。
 旧设备仍被在途编码任务持有时不会释放，只是不再使用。
 
-## 编码
+## 编码与 HDR 输出
 
-- 只写 BMP：`BITMAPFILEHEADER + BITMAPINFOHEADER + 32bpp BGRA`，`std::ofstream` 落盘，不用 WIC / libpng / libjpeg；PNG / JPEG 留作 TODO。
-- 像素统一转成 32bpp BGRA；HDR 的 FP16 在这一步色调映射。
-- HDR（`--hdr` 且显示器为 HDR）：以 `R16G16B16A16Float` 捕获，按显示器色彩空间做 PQ / scRGB → sRGB 转换，SDR 白点来自 `DisplayConfigGetDeviceInfo`；用 16K 项 LUT 避免逐像素 `pow`。
-- 文件名：`<前台窗口标题>_YYYYMMDD_HHMMSS_mmm_序号.bmp`；标题在触发热键时取，非法字符替换为 `_`，空标题回退 `GameSnap`。
+- 非 HDR：捕获纹理转 BGRA8，按 `format_sdr` 编码 BMP / PNG / JPEG / WebP / AVIF / HEIC。
+- HDR：同一帧写 `_HDR.<format_hdr>`（10-bit PQ/BT.2020 AVIF 或 HEIC）和 `_SDR.<format_sdr>`。
+- HDR 的 PQ OETF 与 SDR 色调映射在同一个 D3D11 compute dispatch 完成：FP16 → BT.2020 nit → PQ（HDR）；
+  同一 texel → BT.709 亮度 → Hermite shoulder（spline）→ sRGB（SDR）。`lilium` 是 false color 调试算法。
+- ToneMapper 每个代只保留一份（编码线程共享，由 mapper mutex 串行）；GPU 用 `D3D11_QUERY_EVENT` 等待，
+  等待期间不持 `context_mutex`，避免阻塞 capture 回调。
+- 编码大缓冲全进程只保留一份：编码线程 `try_lock` 取得，拿不到时本张图临时分配，任务结束立即释放。
+- SDR AVIF 内嵌 ISO 21496-1 gain map；HEIC 的 libheif 1.23 没有 gain map 写入 API，只输出 SDR 基图。
+- 文件名：`<前台窗口标题>_YYYYMMDD_HHMMSS_mmm_序号[_HDR|_SDR].<扩展名>`；标题在命令出队时取，非法字符替换为 `_`。
 
-## 已知限制
+## 内存分配失败
 
-- 必须在交互式桌面、中等完整性级别运行；沙盒 / AppContainer / 服务会话里 WGC 会返回 `E_ACCESSDENIED`。
-- 全局键盘钩子受 UIPI 限制：管理员权限的游戏里，非管理员的本工具可能收不到按键。
-- Win10 不支持 `IsBorderRequired(false)`，截图瞬间会闪一下黄色捕获边框。
-- 只支持整显示器，不支持窗口 / 区域 / 多显示器拼接。
-- HDR 输出是映射到 SDR 的 8bit BMP，不是 HDR 原图。
-- 手柄热键依赖 GameInput 运行时；Windows 11 自带，旧系统需安装 `GameInputRedist.msi`。
+项目不逐处处理 `std::bad_alloc`。启动时通过 `std::set_new_handler` 安装处理器：向 stderr 写固定消息，
+记录 critical 日志并调用 `cpptrace::generate_trace().print_with_snippets()` 打印调用栈，然后 `std::abort()`。
+处理器进入后先执行 `std::set_new_handler(nullptr)`，打印栈时再次 OOM 不会再递归进入处理器。因此分配失败
+不会沿调用栈传播，也不会留下 mapped 纹理、半初始化 pool 等中间状态。
+
+显式 `new` 保持原来的 `std::shared_ptr<T>(new T(...))` 写法，不使用 `std::nothrow`，也不在构造处判空；
+分配失败统一由上面的处理器终止。

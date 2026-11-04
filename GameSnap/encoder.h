@@ -1,7 +1,7 @@
 #pragma once
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 编码侧：多线程 BMP 写盘（目前只支持 BMP，PNG/JPEG 留作 TODO）。
+// 编码侧：多线程编码 AVIF / HEIC / WebP / PNG / JPEG / BMP。
 //
 // GPU 拷贝（CopyResource）在回调里做；Map/Unmap 这种 GPU→CPU 传输在编码线程里做。
 // ─────────────────────────────────────────────────────────────────────────────
@@ -13,6 +13,9 @@
 #include "messages.h"
 
 namespace gamesnap {
+
+    class D3DContext;
+    class ToneMapper;
 
     // 创建一块 CPU 可读的 staging 纹理（失败返回空）。
     std::shared_ptr<ID3D11Texture2D> create_staging_texture(ID3D11Device* device, D3D11_TEXTURE2D_DESC const& desc);
@@ -33,11 +36,14 @@ namespace gamesnap {
 
     private:
         void worker_main(std::size_t index);
-        void encode(EncodeJob& job) const;
+        void encode(EncodeJob& job);
 
         std::filesystem::path output_dir_;
         std::shared_ptr<EncodeQueue> jobs_;
         std::vector<std::thread> threads_;
+        std::mutex mapper_mutex_;
+        std::unique_ptr<ToneMapper> mapper_;
+        D3DContext* mapper_owner_ = nullptr;
     };
 
 }  // namespace gamesnap

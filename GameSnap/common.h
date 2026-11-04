@@ -1,5 +1,7 @@
 #pragma once
 
+#include "image.h"
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 公共基础设施：Windows / D3D / WinRT 头文件、日志、COM 驻留、时间工具、配置。
 // ─────────────────────────────────────────────────────────────────────────────
@@ -27,6 +29,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -85,6 +88,9 @@ namespace gamesnap {
     // ── 日志 / 崩溃 ──────────────────────────────────────────────────────────
     void init_logging(bool verbose);
     void install_terminate_handler();
+    void install_new_handler();
+    // 启动时检查 AVX2 / F16C；不满足时记录原因并返回 false。
+    bool check_cpu_features();
 
     // ── 时间 ─────────────────────────────────────────────────────────────────
     template <typename Duration>
@@ -161,13 +167,22 @@ namespace gamesnap {
 
     std::string_view to_string(MonitorChoice choice);
 
+    struct Hotkey {
+        UINT vk = VK_F12;
+        UINT modifiers = 0;  // MOD_CONTROL / MOD_SHIFT / MOD_ALT / MOD_WIN
+    };
+
     struct Config {
         std::filesystem::path output_dir;
         int encode_threads = 2;       // 编码线程数（同时决定并行落盘能力）
         UINT hotkey_vk = VK_F12;      // 键盘热键
+        UINT hotkey_modifiers = 0;    // 修饰键组合
         bool hotkey_swallow = false;  // 是否吞掉热键（默认不吞，游戏仍能收到）
         MonitorChoice monitor = MonitorChoice::Primary;
-        bool hdr_capture = false;  // HDR 显示器以 FP16 捕获，再色调映射到 SDR 输出
+        bool hdr_capture = false;                    // HDR 显示器以 FP16 捕获，再色调映射到 SDR 输出
+        ImageFormat hdr_format = ImageFormat::Avif;  // HDR 输出容器（仅 avif/heic）
+        ImageFormat sdr_format = ImageFormat::Webp;  // SDR 输出格式
+        ToneMapAlgorithm tone_map = ToneMapAlgorithm::Spline;
         bool verbose = false;
         bool selftest = false;  // 不经过 WGC，用合成纹理验证编码链路
     };
@@ -175,6 +190,6 @@ namespace gamesnap {
     std::filesystem::path default_output_dir();
     std::optional<Config> parse_command_line(int argc, wchar_t const* const* argv);
     void log_config(Config const& config);
-    std::string_view hotkey_name(UINT vk);
+    std::string hotkey_name(Hotkey const& hotkey);
 
 }  // namespace gamesnap

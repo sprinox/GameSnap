@@ -11,6 +11,7 @@ Checks: >
   -bugprone-narrowing-conversions,
   -bugprone-lambda-function-name,
   cert-*,
+  -cert-err52-cpp,
   -cert-err58-cpp,
   clang-analyzer-*,
   -clang-analyzer-core.CallAndMessage,
@@ -28,11 +29,15 @@ Checks: >
   -cppcoreguidelines-pro-type-reinterpret-cast,
   -cppcoreguidelines-pro-type-union-access,
   modernize-*,
+  -modernize-avoid-setjmp-longjmp,
   -modernize-use-trailing-return-type,
   performance-*,
   portability-*,
   readability-*,
   -readability-magic-numbers,
+  -readability-math-missing-parentheses,
+  -readability-implicit-bool-conversion,
+  -readability-avoid-nested-conditional-operator,
   -readability-function-cognitive-complexity,
   -readability-identifier-length,
   -readability-braces-around-statements,
@@ -46,6 +51,7 @@ Checks: >
 # 如果以后改成 src/include 子目录布局，需要同步修改这里，并用
 # ExcludeHeaderFilterRegex 排除 x64/packages/vcpkg_installed 等目录。
 HeaderFilterRegex: '(^|[\\/])GameSnap[\\/][^\\/]+\.(h|hpp)$'
+ExcludeHeaderFilterRegex: 'tonemap_cs\.h$'
 
 # --fix 生成的替换按仓库 .clang-format 排版（默认 none 会插入未格式化的文本）
 FormatStyle: file

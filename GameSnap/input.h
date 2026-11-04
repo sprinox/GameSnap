@@ -6,7 +6,7 @@
 //   * 键盘：WH_KEYBOARD_LL 低层钩子，可捕获全屏游戏里的按键。
 //     注意低层钩子的回调是在本线程的消息泵里执行的，所以这个线程必须保持
 //     纯消息循环（这里用 GetMessage），否则会拖慢整台机器的键盘输入。
-//   * 手柄：GameInput 读数回调（LB + RB 组合键）；系统没装 GameInput 时只影响手柄。
+//   * 手柄：GameInput 读数回调（Xbox Share 键）；系统没装 GameInput 时只影响手柄。
 //
 // 本线程只负责把 Command::Trigger 丢进命令队列，不做任何截图工作。
 // ─────────────────────────────────────────────────────────────────────────────
@@ -58,7 +58,7 @@ namespace gamesnap {
 
         winrt::com_ptr<gi::IGameInput> game_input_;
         gi::GameInputCallbackToken reading_token_ = 0;  // 0 表示未注册
-        std::atomic<bool> combo_latched_{false};        // GameInput 派发线程可能并发进来
+        std::atomic<bool> share_latched_{false};        // GameInput 派发线程可能并发进来
     };
 
 }  // namespace gamesnap

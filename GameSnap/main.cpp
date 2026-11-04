@@ -72,19 +72,23 @@ namespace {
         gamesnap::InputThread input(config, commands);
         input.start();
 
-        gamesnap::SystemEventThread system_events(commands);
+        gamesnap::SystemEventThread system_events(commands, config.monitor);
         system_events.start();
 
         gamesnap::CaptureWorker capture(config, commands, jobs, stop);
-        std::jthread capture_thread([&capture, &stop] {
+        std::atomic<bool> capture_crashed{false};
+        std::jthread capture_thread([&capture, &stop, &capture_crashed] {
             // 线程入口不能抛：逃逸的异常会直接 std::terminate。
             try {
                 capture.run();
             } catch (winrt::hresult_error const& e) {
+                capture_crashed.store(true, std::memory_order_relaxed);
                 SPDLOG_CRITICAL("capture 线程异常退出: {}", gamesnap::describe_hresult(e.code()));
             } catch (std::exception const& e) {
+                capture_crashed.store(true, std::memory_order_relaxed);
                 SPDLOG_CRITICAL("capture 线程异常退出: {}", e.what());
             } catch (...) {
+                capture_crashed.store(true, std::memory_order_relaxed);
                 SPDLOG_CRITICAL("capture 线程异常退出（未知异常）");
             }
             stop->request_stop();  // 捕获线程没了就整体退出，避免半死状态
@@ -93,8 +97,8 @@ namespace {
         // 等启动阶段的捕获资源初始化结束，避免先打印“就绪”再报失败。
         capture.wait_ready();
         if (!capture.fatal_error()) {
-            SPDLOG_INFO("GameSnap {} 就绪：按 {} 截图（手柄 LB+RB），Ctrl+C 退出。",
-                        kVersion, gamesnap::hotkey_name(config.hotkey_vk));
+            SPDLOG_INFO("GameSnap {} 就绪：按 {} 截图（手柄 Share 键），Ctrl+C 退出。",
+                        kVersion, gamesnap::hotkey_name({config.hotkey_vk, config.hotkey_modifiers}));
         }
 
         // 等到 Ctrl+C 等停止信号；StopSource 是事件，不需要轮询。
@@ -107,7 +111,10 @@ namespace {
         system_events.stop();
         system_events.join();
 
-        commands->enqueue(gamesnap::Command{.kind = gamesnap::CommandKind::Shutdown});
+        if (!commands->enqueue(gamesnap::Command{.kind = gamesnap::CommandKind::Shutdown})) {
+            SPDLOG_CRITICAL("无法投递 Shutdown 命令，强制退出");
+            std::abort();
+        }
         capture_thread.join();
 
         // 给每个编码线程投递停止哨兵，等它们把在途任务全部落盘。
@@ -115,7 +122,7 @@ namespace {
 
         ::SetConsoleCtrlHandler(console_ctrl_handler, FALSE);
         SPDLOG_INFO("已退出");
-        return capture.fatal_error() ? 1 : 0;
+        return (capture.fatal_error() || capture_crashed.load(std::memory_order_relaxed)) ? 1 : 0;
     }
 
 }  // namespace
@@ -125,7 +132,12 @@ int wmain(int argc, wchar_t** argv) {
     ::SetConsoleOutputCP(CP_UTF8);
 
     gamesnap::install_terminate_handler();
+    gamesnap::install_new_handler();
     gamesnap::init_logging(false);
+    if (!gamesnap::check_cpu_features()) {
+        spdlog::shutdown();
+        return 1;
+    }
 
     auto config = gamesnap::parse_command_line(argc, argv);
     if (!config) {

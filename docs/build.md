@@ -3,7 +3,13 @@
 ## 工具链
 
 - Visual Studio 2026 BuildTools（v145）、Windows SDK `10.0.28000.0`、C++23（`/std:c++latest`）、x64
-- 依赖由 vcpkg manifest 管理（`vcpkg.json`）：spdlog、fmt、cpptrace、concurrentqueue、yaml-cpp、cxxopts
+- 依赖由 vcpkg manifest 管理（`vcpkg.json`）：spdlog、fmt、cpptrace、concurrentqueue、yaml-cpp、cxxopts、
+  libavif（启用 `aom` feature）、libwebp、libheif、x265、spng、libjpeg-turbo、cpu-features
+- Debug/Release 全局按 `/arch:AVX2` 编译；启动时仍用 `cpu-features` 检查 AVX2 / F16C。
+- `tonemap.hlsl` 作为项目的 `FxCompile` 项，由 MSBuild 直接调用 Windows SDK 的 `fxc` 预编译成 `tonemap_cs.h`；
+  运行时只 `CreateComputeShader`，不再链接 `d3dcompiler`。
+- 不使用 AVX-512，避免在消费级 CPU 上的兼容性问题。
+- 修改 `vcpkg.json` 后执行 `vcpkg install --triplet x64-windows-static`，确保 libavif 带 AV1 编码器
 - spdlog 通过 `SPDLOG_FMT_EXTERNAL` 链接 vcpkg 的 fmt，不使用 bundled fmt；代码统一 `fmt::format`
 - 手柄使用 NuGet 包 `Microsoft.GameInput` 4.0.306，直接链接 `GameInput.lib`
 

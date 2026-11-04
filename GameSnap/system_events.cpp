@@ -9,10 +9,15 @@ namespace gamesnap {
         constexpr wchar_t const* kWindowClassName = L"GameSnap.SystemEvents";
         constexpr wchar_t const* kWindowTitle = L"GameSnap";
 
+        std::atomic<SystemEventThread*>& win_event_target() {
+            static std::atomic<SystemEventThread*> target{nullptr};
+            return target;
+        }
+
     }  // namespace
 
-    SystemEventThread::SystemEventThread(std::shared_ptr<CommandQueue> commands)
-        : commands_(std::move(commands)), command_token_(*commands_) {}
+    SystemEventThread::SystemEventThread(std::shared_ptr<CommandQueue> commands, MonitorChoice monitor)
+        : commands_(std::move(commands)), monitor_(monitor) {}
 
     SystemEventThread::~SystemEventThread() {
         try {
@@ -79,6 +84,14 @@ namespace gamesnap {
         // 确保线程消息队列已建立，stop() 的 WM_QUIT 不会丢。
         MSG queue_probe{};
         ::PeekMessageW(&queue_probe, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+
+        win_event_target().store(this, std::memory_order_release);
+        foreground_hook_ = ::SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
+            &SystemEventThread::win_event_proc, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        if (foreground_hook_ == nullptr)
+            SPDLOG_DEBUG("SetWinEventHook(EVENT_SYSTEM_FOREGROUND) 失败: {}", ::GetLastError());
         // stop() 可能在本线程拿到消息队列之前就已经被调用。
         if (stop_.load(std::memory_order_acquire))
             if (::PostThreadMessageW(thread_id_.load(std::memory_order_acquire), WM_QUIT, 0, 0) == 0)
@@ -89,6 +102,12 @@ namespace gamesnap {
             ::TranslateMessage(&message);
             ::DispatchMessageW(&message);
         }
+
+        if (foreground_hook_ != nullptr) {
+            ::UnhookWinEvent(foreground_hook_);
+            foreground_hook_ = nullptr;
+        }
+        win_event_target().store(nullptr, std::memory_order_release);
 
         if (window_ != nullptr) {
             ::DestroyWindow(window_);
@@ -103,7 +122,27 @@ namespace gamesnap {
         command.kind = kind;
         command.reason = reason;
         command.enqueued = SteadyClock::now();
-        commands_->enqueue(command_token_, command);
+        commands_->enqueue(command);
+    }
+
+    void CALLBACK SystemEventThread::win_event_proc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
+                                                    LONG id_object, LONG id_child, DWORD thread_id, DWORD time) {
+        (void)hook;
+        (void)id_object;
+        (void)id_child;
+        (void)thread_id;
+        (void)time;
+        if (event != EVENT_SYSTEM_FOREGROUND || hwnd == nullptr)
+            return;
+        auto* self = win_event_target().load(std::memory_order_acquire);
+        if (self == nullptr || self->monitor_ != MonitorChoice::Foreground)
+            return;
+
+        HMONITOR monitor = ::MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+        if (monitor == nullptr || monitor == self->foreground_monitor_)
+            return;
+        self->foreground_monitor_ = monitor;
+        self->post(CommandKind::Validate, ReloadReason::DisplayChange);
     }
 
     LRESULT CALLBACK SystemEventThread::window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -126,19 +165,19 @@ namespace gamesnap {
                 return 0;
 
             case WM_SETTINGCHANGE:
-                SPDLOG_INFO("收到 WM_SETTINGCHANGE");
+                SPDLOG_DEBUG("收到 WM_SETTINGCHANGE");
                 // HDR 开关等设置变化可能只走这里，做一次廉价自检即可。
                 self->post(CommandKind::Validate, ReloadReason::DisplayChange);
                 return 0;
 
             case WM_DEVICECHANGE:
-                SPDLOG_INFO("收到 WM_DEVICECHANGE");
+                SPDLOG_DEBUG("收到 WM_DEVICECHANGE");
                 // 显卡插拔 / 驱动重启：先自检，确认失效才重建，避免误重建。
                 self->post(CommandKind::Validate, ReloadReason::DeviceChange);
                 return TRUE;
 
             case WM_POWERBROADCAST:
-                SPDLOG_INFO("收到 WM_POWERBROADCAST");
+                SPDLOG_DEBUG("收到 WM_POWERBROADCAST");
                 if (wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND) {
                     SPDLOG_INFO("从睡眠恢复，准备重建捕获资源");
                     self->post(CommandKind::Reload, ReloadReason::PowerResume);

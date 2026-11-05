@@ -19,13 +19,14 @@
 #include "messages.h"
 
 namespace gamesnap {
+    class UiBridge;
 
     // Microsoft.GameInput 的 API 在 GameInput::v4 命名空间里。
     namespace gi = GameInput::v4;
 
     class InputThread {
     public:
-        InputThread(Config config, std::shared_ptr<CommandQueue> commands);
+        InputThread(Config config, std::shared_ptr<CommandQueue> commands, std::shared_ptr<UiBridge> ui);
         ~InputThread();
 
         InputThread(const InputThread&) = delete;
@@ -49,6 +50,7 @@ namespace gamesnap {
 
         Config config_;
         std::shared_ptr<CommandQueue> commands_;
+        std::shared_ptr<UiBridge> ui_;
 
         std::thread thread_;
         std::atomic<DWORD> thread_id_{0};

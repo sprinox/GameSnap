@@ -1,0 +1,3 @@
+#include "resource.h"
+
+IDR_SCREENSHOT_MP3 RCDATA "screenshot.mp3"

@@ -135,7 +135,7 @@ namespace gamesnap {
             }
 
             auto jobs = std::make_shared<EncodeQueue>();
-            EncodeWorkers workers(config.output_dir, jobs);
+            EncodeWorkers workers(config.output_dir, jobs, {});
             workers.start(1);
 
             std::error_code ec;

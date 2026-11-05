@@ -13,6 +13,24 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <ClCompile Include="overlay.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="ui_bridge.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClInclude Include="overlay.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="ui_bridge.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="resource.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ResourceCompile Include="GameSnap.rc">
+      <Filter>源文件</Filter>
+    </ResourceCompile>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="capture.cpp">

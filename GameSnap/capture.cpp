@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include "capture.h"
+#include "ui_bridge.h"
 
 #include <windows.graphics.capture.interop.h>
 
@@ -203,7 +204,11 @@ namespace gamesnap {
             job.staging_busy = busy;
             if (shot.canceled->load(std::memory_order_acquire))
                 return;  // lease 析构时释放 busy
+            if (shot.ui)
+                shot.ui->job_enqueued();  // 先计数，避免极快 job 先 finished 再 enqueued
             if (!shot.jobs->enqueue(std::move(job))) {
+                if (shot.ui)
+                    shot.ui->job_finished();
                 SPDLOG_WARN("编码队列入队失败，丢弃本次截图");
                 return;  // lease 析构时释放 busy
             }
@@ -213,13 +218,20 @@ namespace gamesnap {
         // 初始化结束时放开就绪闩锁（成功/失败/异常都走析构）。
         struct ReadyGuard {
             explicit ReadyGuard(std::latch& latch_) : latch(latch_) {}
-            ~ReadyGuard() { latch.count_down(); }
+            ~ReadyGuard() { release(); }
+            void release() {
+                if (!released) {
+                    released = true;
+                    latch.count_down();
+                }
+            }
             ReadyGuard(ReadyGuard const&) = delete;
             ReadyGuard& operator=(ReadyGuard const&) = delete;
             ReadyGuard(ReadyGuard&&) = delete;
             ReadyGuard& operator=(ReadyGuard&&) = delete;
 
             std::latch& latch;
+            bool released = false;
         };
 
     }  // namespace
@@ -460,16 +472,19 @@ namespace gamesnap {
     CaptureWorker::CaptureWorker(Config config,
                                  std::shared_ptr<CommandQueue> commands,
                                  std::shared_ptr<EncodeQueue> jobs,
-                                 std::shared_ptr<StopSource> stop)
+                                 std::shared_ptr<StopSource> stop,
+                                 std::shared_ptr<UiBridge> ui)
         : config_(std::move(config)),
           commands_(std::move(commands)),
           jobs_(std::move(jobs)),
           stop_(std::move(stop)),
+          ui_(std::move(ui)),
           command_token_(*commands_) {}
 
     void CaptureWorker::run() {
-        // 放在第一行：任何早退/异常路径都必须放行主线程的 ready_.wait()。
-        const ReadyGuard ready_guard{ready_};
+        // 第一行建立，覆盖所有早退/异常；初始化完成或失败后显式 release，
+        // 不能等到线程退出才 count_down，否则 main 的 wait_ready() 永远等不到。
+        ReadyGuard ready_guard{ready_};
 
         // COM apartment 必须覆盖整个 run()：之后还会创建 pool/会话并关闭 WinRT 对象。
         ComApartment apartment;
@@ -487,6 +502,7 @@ namespace gamesnap {
             stop_->request_stop();
             return;
         }
+        ready_guard.release();
 
         for (;;) {
             Command command;
@@ -655,6 +671,7 @@ namespace gamesnap {
         auto shot = std::make_shared<ShotContext>();
         shot->d3d = d3d_;
         shot->jobs = jobs_;
+        shot->ui = ui_;
         shot->staging = staging_;
         shot->staging_busy = staging_busy_;
         shot->canceled = std::make_shared<std::atomic<bool>>(false);

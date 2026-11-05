@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include "encoder.h"
+#include "ui_bridge.h"
 
 #include <algorithm>
 #include <array>
@@ -326,8 +327,9 @@ namespace gamesnap {
 
     // ── EncodeWorkers ────────────────────────────────────────────────────────
 
-    EncodeWorkers::EncodeWorkers(std::filesystem::path output_dir, std::shared_ptr<EncodeQueue> jobs)
-        : output_dir_(std::move(output_dir)), jobs_(std::move(jobs)) {}
+    EncodeWorkers::EncodeWorkers(std::filesystem::path output_dir, std::shared_ptr<EncodeQueue> jobs,
+                                 std::shared_ptr<UiBridge> ui)
+        : output_dir_(std::move(output_dir)), jobs_(std::move(jobs)), ui_(std::move(ui)) {}
 
     EncodeWorkers::~EncodeWorkers() {
         stop();
@@ -391,6 +393,21 @@ namespace gamesnap {
     }
 
     void EncodeWorkers::encode(EncodeJob& job) {
+        // 每个真实 job 只减一次；异常/提前返回也一样。
+        struct UiJobGuard {
+            explicit UiJobGuard(UiBridge* bridge) : ui(bridge) {}
+            UiBridge* ui;
+            UiJobGuard(UiJobGuard const&) = delete;
+            UiJobGuard& operator=(UiJobGuard const&) = delete;
+            UiJobGuard(UiJobGuard&&) = delete;
+            UiJobGuard& operator=(UiJobGuard&&) = delete;
+            ~UiJobGuard() {
+                if (ui != nullptr)
+                    ui->job_finished();
+            }
+        };
+        const UiJobGuard ui_job_guard{ui_.get()};
+
         // 主 staging 的占用标记由这里释放；提前返回/异常也会释放。
         struct BusyGuard {
             explicit BusyGuard(std::shared_ptr<std::atomic<bool>> busy_) : busy(std::move(busy_)) {}
@@ -500,6 +517,8 @@ namespace gamesnap {
                 SPDLOG_WARN("[#{:04}] libheif 不支持 gain map，HEIC SDR 不包含 HDR 重建信息", job.sequence);
             const auto sdr_path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
                                                    image_extension(job.sdr_format), "SDR");
+            if (ui_ && !sdr.pixels.empty())
+                ui_->publish(hdr_path.filename().wstring(), sdr);
             const bool sdr_ok =
                 (!hdr10.empty() && job.sdr_format == ImageFormat::Avif)
                     ? encode_avif_gainmap(sdr_path, sdr, hdr10.data(), sdr.width, sdr.height, error)
@@ -517,6 +536,8 @@ namespace gamesnap {
             }
             const auto path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
                                                image_extension(job.sdr_format), {});
+            if (ui_ && !image.pixels.empty())
+                ui_->publish(path.filename().wstring(), image);
             if (!write_sdr(path, job.sdr_format, image, error)) {
                 SPDLOG_ERROR("[#{:04}] 编码失败 ({}): {}", job.sequence, to_string(job.sdr_format), error);
                 return;

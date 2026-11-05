@@ -4,6 +4,8 @@
 #include <exception>
 
 #include "capture.h"
+#include "overlay.h"
+#include "ui_bridge.h"
 #include "common.h"
 #include "encoder.h"
 #include "input.h"
@@ -34,10 +36,21 @@ namespace {
         StopSlot& operator=(StopSlot&&) = delete;
     };
 
+    std::atomic<int>& ctrl_c_count() {
+        static std::atomic<int> count{0};
+        return count;
+    }
+
     BOOL WINAPI console_ctrl_handler(DWORD type) {
         switch (type) {
         case CTRL_C_EVENT:
         case CTRL_BREAK_EVENT:
+            if (auto* source = stop_source_slot().load(std::memory_order_acquire))
+                source->request_stop();
+            // 第一次正常收尾；再按一次说明收尾卡住，直接强制结束。
+            if (ctrl_c_count().fetch_add(1, std::memory_order_acq_rel) >= 1)
+                std::terminate();
+            return TRUE;
         case CTRL_CLOSE_EVENT:
         case CTRL_LOGOFF_EVENT:
         case CTRL_SHUTDOWN_EVENT:
@@ -50,6 +63,7 @@ namespace {
     }
 
     int run(gamesnap::Config const& config) {
+
         gamesnap::ComApartment apartment;
         if (!apartment.ok()) {
             SPDLOG_CRITICAL("初始化 COM apartment 失败: {}", gamesnap::describe_hresult(apartment.result()));
@@ -65,17 +79,20 @@ namespace {
         // 输入线程 / 系统事件线程 → 截图线程；截图线程 → 编码线程。
         auto commands = std::make_shared<gamesnap::CommandQueue>();
         auto jobs = std::make_shared<gamesnap::EncodeQueue>();
+        auto ui = std::make_shared<gamesnap::UiBridge>();
+        gamesnap::OverlayThread overlay(ui);
+        overlay.start();
 
-        gamesnap::EncodeWorkers encoders(config.output_dir, jobs);
+        gamesnap::EncodeWorkers encoders(config.output_dir, jobs, ui);
         encoders.start(config.encode_threads);
 
-        gamesnap::InputThread input(config, commands);
+        gamesnap::InputThread input(config, commands, ui);
         input.start();
 
         gamesnap::SystemEventThread system_events(commands, config.monitor);
         system_events.start();
 
-        gamesnap::CaptureWorker capture(config, commands, jobs, stop);
+        gamesnap::CaptureWorker capture(config, commands, jobs, stop, ui);
         std::atomic<bool> capture_crashed{false};
         std::jthread capture_thread([&capture, &stop, &capture_crashed] {
             // 线程入口不能抛：逃逸的异常会直接 std::terminate。
@@ -116,9 +133,14 @@ namespace {
             std::abort();
         }
         capture_thread.join();
+        SPDLOG_INFO("capture 线程已退出");
 
         // 给每个编码线程投递停止哨兵，等它们把在途任务全部落盘。
         encoders.stop();
+        SPDLOG_INFO("编码线程已全部退出");
+        overlay.stop();
+        overlay.join();
+        SPDLOG_INFO("overlay 线程已退出");
 
         ::SetConsoleCtrlHandler(console_ctrl_handler, FALSE);
         SPDLOG_INFO("已退出");

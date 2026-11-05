@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include "input.h"
+#include "ui_bridge.h"
 
 namespace gamesnap {
     namespace {
@@ -28,8 +29,8 @@ namespace gamesnap {
 
     }  // namespace
 
-    InputThread::InputThread(Config config, std::shared_ptr<CommandQueue> commands)
-        : config_(std::move(config)), commands_(std::move(commands)) {}
+    InputThread::InputThread(Config config, std::shared_ptr<CommandQueue> commands, std::shared_ptr<UiBridge> ui)
+        : config_(std::move(config)), commands_(std::move(commands)), ui_(std::move(ui)) {}
 
     InputThread::~InputThread() {
         try {
@@ -182,6 +183,8 @@ namespace gamesnap {
         // 键盘钩子线程和 GameInput 回调线程都会调用；一次按键只入队一次，
         // 用不带 token 的 enqueue，避免两个线程共享同一个 ProducerToken。
         commands_->enqueue(command);
+        if (ui_)
+            ui_->on_trigger();
     }
 
     void InputThread::on_reading(gi::IGameInputReading& reading) {

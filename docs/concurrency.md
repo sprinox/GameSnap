@@ -43,6 +43,7 @@
 | input 线程 | `InputThread::start()` | `InputThread::run()` | `input.start()` 到 `input.join()` | 低层键盘钩子消息泵；初始化 GameInput；投递 Trigger |
 | system-events 线程 | `SystemEventThread::start()` | `SystemEventThread::run()` | `system_events.start()` 到 `join()` | 隐藏窗口 + WinEvent hook；投递 Validate/Reload |
 | 编码线程 × N | `EncodeWorkers::start()` | `EncodeWorkers::worker_main()` | `encoders.start()` 到 `encoders.stop()` | 消费 `EncodeQueue`；Map staging、转换、GPU/CPU tone map、编码、写盘 |
+| overlay 线程 | `main.cpp` 的 `OverlayThread` | `OverlayThread::run()` | `overlay.start()` 到 `overlay.join()` | DirectComposition 透明窗口、ImGui 面板、内嵌 MP3、滑入/滑出 |
 | WGC FrameArrived 回调线程 | 每个 frame pool 内部（FreeThreaded 可能并发） | `FrameSink::on_frame()` | pool 存活期间 | 取帧、CopyResource 到 staging、入队、release `done` |
 | GameInput 回调线程 | GameInput 内部 | `InputThread::reading_callback()` → `on_reading()` | 注册到反注册 | 读取 Xbox Share 系统键，投递 Trigger |
 | 控制台 Ctrl+C 处理线程 | Windows 控制台 | `console_ctrl_handler()` | 进程全程 | 只对 `StopSource` 调 `request_stop()` |
@@ -637,3 +638,15 @@ encoders.stop()   // 每线程 stop 哨兵 + join
 - **in-flight 回调**：已经进入 `FrameSink::on_frame`、尚未退出的 WGC 回调。
 - **job**：一个 `EncodeJob`，包含一帧的纹理、设备、格式和计时。
 - **scratch**：编码线程用于 raw/sdr/hdr10 的大缓冲。
+
+
+## 12. Overlay / UI 线程（ImGui、DirectComposition、音频）
+
+- `UiBridge` 是 input/capture/encoder → overlay 的唯一跨线程通道：
+  - `trigger_serial_`：`on_trigger()` 原子自增；UI 线程只读并比较。
+  - `remaining_`：capture 在 enqueue 前 `job_enqueued()`，encoder 的 `UiJobGuard` 在离开 job 时 `job_finished()`；先计数再入队，避免极快 job 先 finished 再 enqueued。
+  - `filename` / `thumbnail`：`publish()` 在 mutex 内复制，UI 线程 `snapshot()` 复制后释放，不把 `Image` 指针交给 UI。
+- overlay 线程拥有自己的 D3D11 device/context、swap chain、DirectComposition 对象、ImGui context 和 MediaPlayer；这些对象不与 capture/encoder 共享。
+- 窗口使用 `WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP`，`WM_NCHITTEST` 返回 `HTTRANSPARENT`，因此面板不可点击、不抢焦点。
+- 内嵌 `screenshot.mp3` 通过 `.rc` 的 `RCDATA` 编进 exe；MediaPlayer 在 overlay 线程创建，播放只在同一线程触发。
+- 面板位置由 overlay 线程计算；capture/encoder 线程不直接碰窗口句柄。

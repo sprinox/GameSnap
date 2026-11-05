@@ -110,7 +110,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float3 hdr = Hdr.Load(int3(tid.xy, 0)).rgb;
     float3 nits2020;
-    uint3 pq_code;
+    uint3 pq_code = uint3(0, 0, 0);
     if (Pq)
     {
         // PQ 输入：HDR 文件直接复用原始 10-bit 码值，避免 nits→PQ 的恒等往返。

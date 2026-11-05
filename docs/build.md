@@ -6,7 +6,8 @@
 - 依赖由 vcpkg manifest 管理（`vcpkg.json`）：spdlog、fmt、cpptrace、concurrentqueue、yaml-cpp、cxxopts、
   libavif（启用 `aom` feature）、libwebp、libheif、x265、spng、libjpeg-turbo、cpu-features
 - Debug/Release 全局按 `/arch:AVX2` 编译；启动时仍用 `cpu-features` 检查 AVX2 / F16C。
-- `tonemap.hlsl` 作为项目的 `FxCompile` 项，由 MSBuild 直接调用 Windows SDK 的 `fxc` 预编译成 `tonemap_cs.h`；
+- `tonemap.hlsl` 作为项目的 `FxCompile` 项，由 MSBuild 直接调用 Windows SDK 的 `fxc` 预编译成
+  `$(TargetDir)tonemap_cs.h`（例如 `x64\Release\tonemap_cs.h`），不写入源码目录；
   运行时只 `CreateComputeShader`，不再链接 `d3dcompiler`。
 - 不使用 AVX-512，避免在消费级 CPU 上的兼容性问题。
 - 修改 `vcpkg.json` 后执行 `vcpkg install --triplet x64-windows-static`，确保 libavif 带 AV1 编码器

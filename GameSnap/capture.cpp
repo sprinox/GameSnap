@@ -199,18 +199,15 @@ namespace gamesnap {
             job.timings.frame_received = received;
             job.timings.copied = copied;
 
-            // 从这里开始由 job 负责释放 busy 标记。
-            lease.busy.reset();
-            if (shot.canceled->load(std::memory_order_acquire)) {
-                if (busy)
-                    busy->store(false, std::memory_order_release);
-                return;
-            }
+            // 先让 job 持有占用标记；只有真正入队成功后才把 lease 的所有权交出去。
+            job.staging_busy = busy;
+            if (shot.canceled->load(std::memory_order_acquire))
+                return;  // lease 析构时释放 busy
             if (!shot.jobs->enqueue(std::move(job))) {
-                if (busy)
-                    busy->store(false, std::memory_order_release);
                 SPDLOG_WARN("编码队列入队失败，丢弃本次截图");
+                return;  // lease 析构时释放 busy
             }
+            lease.busy.reset();
         }
 
         // 初始化结束时放开就绪闩锁（成功/失败/异常都走析构）。

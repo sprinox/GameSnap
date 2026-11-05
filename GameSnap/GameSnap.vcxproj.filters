@@ -96,8 +96,5 @@
     <FxCompile Include="tonemap.hlsl">
       <Filter>源文件</Filter>
     </FxCompile>
-    <ClInclude Include="tonemap_cs.h">
-      <Filter>头文件</Filter>
-    </ClInclude>
   </ItemGroup>
 </Project>

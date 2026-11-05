@@ -76,6 +76,7 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
+      <AdditionalIncludeDirectories>$(TargetDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpplatest</LanguageStandard>
@@ -109,6 +110,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
+      <AdditionalIncludeDirectories>$(TargetDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpplatest</LanguageStandard>
@@ -171,7 +173,6 @@
     <ClInclude Include="simd.h" />
     <ClInclude Include="system_events.h" />
     <ClInclude Include="tonemap.h" />
-    <ClInclude Include="tonemap_cs.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
@@ -179,7 +180,7 @@
       <ShaderType>Compute</ShaderType>
       <ShaderModel>5.0</ShaderModel>
       <EntryPointName>main</EntryPointName>
-      <HeaderFileOutput>$(ProjectDir)tonemap_cs.h</HeaderFileOutput>
+      <HeaderFileOutput>$(TargetDir)tonemap_cs.h</HeaderFileOutput>
       <VariableName>kTonemapCS</VariableName>
     </FxCompile>
   </ItemGroup>

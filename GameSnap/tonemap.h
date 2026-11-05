@@ -4,6 +4,7 @@
 #include <string>
 
 #include "common.h"
+#include <d3d11_4.h>
 #include "image.h"
 
 namespace gamesnap {
@@ -41,9 +42,10 @@ namespace gamesnap {
         std::shared_ptr<D3DContext> d3d_;
         winrt::com_ptr<ID3D11ComputeShader> shader_;
         winrt::com_ptr<ID3D11Buffer> constants_;
-        winrt::com_ptr<ID3D11Query> event_query_;
-        winrt::com_ptr<ID3D11Texture2D> input_;
-        winrt::com_ptr<ID3D11ShaderResourceView> input_view_;
+        winrt::com_ptr<ID3D11Fence> fence_;
+        winrt::com_ptr<ID3D11DeviceContext4> context4_;
+        HANDLE fence_event_ = nullptr;
+        std::uint64_t fence_value_ = 0;
         winrt::com_ptr<ID3D11Texture2D> output_;
         winrt::com_ptr<ID3D11UnorderedAccessView> output_view_;
         winrt::com_ptr<ID3D11Texture2D> readback_;

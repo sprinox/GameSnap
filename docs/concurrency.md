@@ -646,7 +646,7 @@ encoders.stop()   // 每线程 stop 哨兵 + join
   - `trigger_serial_`：`on_trigger()` 原子自增；UI 线程只读并比较。
   - `remaining_`：capture 在 enqueue 前 `job_enqueued()`，encoder 的 `UiJobGuard` 在离开 job 时 `job_finished()`；先计数再入队，避免极快 job 先 finished 再 enqueued。
   - `filename` / `thumbnail`：`publish()` 在 mutex 内复制，UI 线程 `snapshot()` 复制后释放，不把 `Image` 指针交给 UI。
-- overlay 线程拥有自己的 D3D11 device/context、swap chain、DirectComposition 对象、ImGui context 和 MediaPlayer；这些对象不与 capture/encoder 共享。
+- overlay 线程拥有自己的 D3D11 device/context、swap chain、DirectComposition 对象、ImGui context 和 MediaPlayer；这些对象不与 capture/encoder 共享。每次 trigger 创建一整套 overlay 资源，滑出动画结束后全部销毁；因此下次会重新获取目标显示器、DPI 和位置。
 - 窗口使用 `WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP`，`WM_NCHITTEST` 返回 `HTTRANSPARENT`，因此面板不可点击、不抢焦点。
 - 内嵌 `screenshot.mp3` 通过 `.rc` 的 `RCDATA` 编进 exe；MediaPlayer 在 overlay 线程创建，播放只在同一线程触发。
 - 面板位置由 overlay 线程计算；capture/encoder 线程不直接碰窗口句柄。

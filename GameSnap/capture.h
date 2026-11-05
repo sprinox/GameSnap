@@ -8,7 +8,8 @@
 //      由 capture 线程创建、关闭；只在 capture 线程访问，不需要 mutex。
 //      建 pool/会话时新 pool 还没有回调，不会阻塞 FrameArrived。
 //   2. WGC 的 FrameArrived 回调运行在 frame pool 的工作线程上（FreeThreaded 可能并发）；
-//      FrameSink 用 mutex 交接 shot，只做“取帧 → CopyResource 到 staging → 入队”；Map/Unmap 在编码线程。
+//      FrameSink 用 mutex 交接 shot，只做“取帧 → 拷贝到目标纹理 → 入队”；HDR 目标是
+//      DEFAULT+SRV，SDR 目标是可 Map 的 staging，Map/Unmap 在编码线程。
 //   3. 每张截图新建一套 frame pool + 会话，帧处理完直接关闭，不复用 pool。
 //   4. 资源以“代(generation)”为单位整体替换：先建好新一代，成功后才换掉旧的。
 // ─────────────────────────────────────────────────────────────────────────────
@@ -28,18 +29,26 @@ namespace gamesnap {
     class CaptureResources;
     class UiBridge;
 
+    // 一张可复用的采集目标纹理；纹理与 busy 绑定在 TextureSlot 里，不会错配。
+    struct TextureCache {
+        std::shared_ptr<TextureSlot> slot;
+    };
+
     // 一次截图的上下文，由 FrameSink 持有当前 shot。
     struct ShotContext {
         std::shared_ptr<D3DContext> d3d;
         std::shared_ptr<EncodeQueue> jobs;
         std::shared_ptr<UiBridge> ui;
-        std::shared_ptr<ID3D11Texture2D> staging;
+        TextureCache cache;
         std::binary_semaphore done{0};                    // 回调处理完（或失败）后 release
         std::shared_ptr<std::atomic<bool>> canceled;      // 超时取消标记，和 EncodeJob 共享
-        std::shared_ptr<std::atomic<bool>> staging_busy;  // 主 staging 是否被编码线程占用
         std::atomic<bool> failed{false};                  // CopyResource / 设备移除失败
         SteadyClock::time_point enqueued;
+        SteadyClock::time_point dequeued;
+        SteadyClock::time_point title_done;
+        SteadyClock::time_point prepared;
         SteadyClock::time_point start_call;
+        SteadyClock::time_point start_capture_done;
         std::uint64_t sequence = 0;
         std::wstring title;
         DXGI_COLOR_SPACE_TYPE color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
@@ -148,9 +157,7 @@ namespace gamesnap {
         // 当前“资源代”，只由 capture 线程读写。
         std::shared_ptr<D3DContext> d3d_;
         std::shared_ptr<CaptureResources> resources_;
-        std::shared_ptr<ID3D11Texture2D> staging_;  // 唯一的主 staging 纹理
-        std::shared_ptr<std::atomic<bool>> staging_busy_ =
-            std::make_shared<std::atomic<bool>>(false);  // 主纹理是否被编码线程占用
+        TextureCache texture_cache_;
         DisplayInfo display_{};
         HMONITOR monitor_ = nullptr;
         std::uint64_t generation_ = 0;

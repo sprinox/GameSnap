@@ -66,9 +66,9 @@ namespace gamesnap {
         std::optional<int> parse_int(std::wstring_view text) {
             if (text.empty())
                 return std::nullopt;
-            wchar_t* end = nullptr;
             const std::wstring copy(text);
-            const long value = std::wcstol(copy.c_str(), &end, 10);
+            wchar_t* end = nullptr;
+            const long value = std::wcstol(copy.c_str(), &end, 0);
             if (end == copy.c_str() || *end != L'\0')
                 return std::nullopt;
             return static_cast<int>(value);
@@ -124,13 +124,9 @@ namespace gamesnap {
                     return static_cast<UINT>('0') + static_cast<UINT>(lowered[0] - L'0');
             }
 
-            // 0x7B 或 123 这种数字写法
-            const std::wstring copy(lowered);
-            wchar_t* end = nullptr;
-            const wchar_t* begin = copy.c_str();
-            const unsigned long value = std::wcstoul(begin, &end, 0);
-            if (end != begin && *end == L'\0' && value > 0 && value < 0x100)
-                return static_cast<UINT>(value);
+            // 123 / 0x7B 这种数字写法
+            if (auto value = parse_int(lowered); value && *value > 0 && *value < 0x100)
+                return static_cast<UINT>(*value);
             return std::nullopt;
         }
 
@@ -140,10 +136,13 @@ namespace gamesnap {
                 return static_cast<wchar_t>(std::towlower(c));
             });
 
+            if (!lowered.empty() && lowered.back() == L'+')
+                return std::nullopt;
+
             Hotkey result;
             bool have_key = false;
             std::size_t start = 0;
-            while (start <= lowered.size()) {
+            while (start < lowered.size()) {
                 const std::size_t plus = lowered.find(L'+', start);
                 std::wstring_view token = std::wstring_view(lowered).substr(
                     start, plus == std::wstring::npos ? std::wstring::npos : plus - start);
@@ -201,9 +200,13 @@ namespace gamesnap {
         }
 
         bool is_known_config_key(std::string_view key) {
-            constexpr std::array<std::string_view, 10> keys{
-                "output_dir", "encode_threads", "hotkey", "swallow", "monitor", "hdr",
-                "format_hdr", "format_sdr", "tone_map", "verbose"};
+            constexpr std::array<std::string_view, 20> keys{
+                "output_dir", "encode_threads", "hotkey", "swallow", "monitor",
+                "format_hdr", "format_sdr", "tone_map", "verbose",
+                "png_compression", "jpeg_quality",
+                "webp_quality", "webp_lossless", "webp_method",
+                "avif_quality", "avif_lossless", "avif_speed",
+                "heic_quality", "heic_lossless", "heic_preset"};
             return std::ranges::find(keys, key) != keys.end();
         }
 
@@ -241,8 +244,6 @@ namespace gamesnap {
                     }
                     if (const auto value = read_key<bool>(root, "swallow"); value)
                         parsed.hotkey_swallow = *value;
-                    if (const auto value = read_key<bool>(root, "hdr"); value)
-                        parsed.hdr_capture = *value;
                     if (const auto text = read_key<std::string>(root, "format_hdr"); text) {
                         const auto format = parse_image_format(*text);
                         if (!format || !format_supports_hdr(*format))
@@ -260,6 +261,35 @@ namespace gamesnap {
                         if (!algorithm)
                             throw ConfigError(fmt::format("无法识别的 tone_map: {}", *text));
                         parsed.tone_map = *algorithm;
+                    }
+                    const auto read_range = [&](char const* key, int min_value, int max_value,
+                                                int& target) {
+                        if (const auto value = read_key<int>(root, key); value) {
+                            if (*value < min_value || *value > max_value)
+                                throw ConfigError(fmt::format("{} 必须在 {}..{} 之间", key, min_value, max_value));
+                            target = *value;
+                        }
+                    };
+                    read_range("png_compression", 0, 9, parsed.codec.png_compression);
+                    read_range("jpeg_quality", 1, 100, parsed.codec.jpeg_quality);
+                    read_range("webp_quality", 0, 100, parsed.codec.webp_quality);
+                    read_range("webp_method", 0, 6, parsed.codec.webp_method);
+                    read_range("avif_quality", 0, 100, parsed.codec.avif_quality);
+                    read_range("avif_speed", 0, 10, parsed.codec.avif_speed);
+                    read_range("heic_quality", 0, 100, parsed.codec.heic_quality);
+                    if (const auto value = read_key<bool>(root, "webp_lossless"); value)
+                        parsed.codec.webp_lossless = *value;
+                    if (const auto value = read_key<bool>(root, "avif_lossless"); value)
+                        parsed.codec.avif_lossless = *value;
+                    if (const auto value = read_key<bool>(root, "heic_lossless"); value)
+                        parsed.codec.heic_lossless = *value;
+                    if (const auto text = read_key<std::string>(root, "heic_preset"); text) {
+                        constexpr std::array<std::string_view, 9> presets{
+                            "ultrafast", "superfast", "veryfast", "faster", "fast",
+                            "medium", "slow", "slower", "veryslow"};
+                        if (std::ranges::find(presets, *text) == presets.end())
+                            throw ConfigError(fmt::format("无法识别的 heic_preset: {}", *text));
+                        parsed.codec.heic_preset = *std::ranges::find(presets, *text);
                     }
                     if (const auto value = read_key<bool>(root, "verbose"); value)
                         parsed.verbose = *value;
@@ -622,10 +652,9 @@ namespace gamesnap {
             ("threads", "编码线程数 1..8", cxxopts::value<int>())
             ("monitor", "primary / foreground", cxxopts::value<std::string>())
             ("swallow", "吞掉热键（游戏收不到）")
-            ("hdr", "HDR 显示器以 FP16 捕获并输出 HDR + SDR 两份")
             ("format-hdr", "HDR 容器 avif / heic", cxxopts::value<std::string>())
             ("format-sdr", "SDR 格式 bmp/png/jpeg/webp/avif/heic", cxxopts::value<std::string>())
-            ("tone-map", "色调映射 spline / lilium", cxxopts::value<std::string>())
+            ("tone-map", "色调映射 spline / analysis", cxxopts::value<std::string>())
             ("verbose", "输出调试日志")
             ("selftest", "用合成纹理跑编码链路自检")
             ("h,help", "显示帮助");
@@ -703,8 +732,6 @@ namespace gamesnap {
         }
         if (result.count("swallow") != 0)
             config.hotkey_swallow = true;
-        if (result.count("hdr") != 0)
-            config.hdr_capture = true;
         if (result.count("format-hdr") != 0) {
             const auto format = parse_image_format(result["format-hdr"].as<std::string>());
             if (!format || !format_supports_hdr(*format)) {
@@ -724,7 +751,7 @@ namespace gamesnap {
         if (result.count("tone-map") != 0) {
             const auto algorithm = parse_tone_map_algorithm(result["tone-map"].as<std::string>());
             if (!algorithm) {
-                SPDLOG_ERROR("--tone-map 只支持 spline / lilium");
+                SPDLOG_ERROR("--tone-map 只支持 spline / analysis");
                 return std::nullopt;
             }
             config.tone_map = *algorithm;
@@ -747,7 +774,13 @@ namespace gamesnap {
                     config.hotkey_swallow ? "" : "不");
         SPDLOG_INFO("目标显示器: {}", to_string(config.monitor));
         SPDLOG_INFO("编码线程: {}", config.encode_threads);
-        SPDLOG_INFO("采集模式: 按需(热键时 StartCapture){}", config.hdr_capture ? " + HDR" : "");
+        SPDLOG_INFO("编码参数: PNG compression={} JPEG quality={} WebP quality={} lossless={} method={}",
+                    config.codec.png_compression, config.codec.jpeg_quality,
+                    config.codec.webp_quality, config.codec.webp_lossless, config.codec.webp_method);
+        SPDLOG_INFO("编码参数: AVIF quality={} lossless={} speed={} HEIC quality={} lossless={} preset={}",
+                    config.codec.avif_quality, config.codec.avif_lossless, config.codec.avif_speed,
+                    config.codec.heic_quality, config.codec.heic_lossless, config.codec.heic_preset);
+        SPDLOG_INFO("采集模式: 按需(热键时 StartCapture)，HDR 由目标显示器决定");
     }
 
 }  // namespace gamesnap

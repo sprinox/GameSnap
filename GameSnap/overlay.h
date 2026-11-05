@@ -1,5 +1,7 @@
 #pragma once
 
+#include <windows.h>
+
 #include <atomic>
 #include <memory>
 #include <thread>
@@ -25,10 +27,12 @@ namespace gamesnap {
 
     private:
         void run();
+        void run_session();
 
         std::shared_ptr<UiBridge> bridge_;
         std::thread thread_;
         std::atomic<bool> stop_{false};
+        HANDLE stop_event_ = nullptr;
     };
 
 }  // namespace gamesnap

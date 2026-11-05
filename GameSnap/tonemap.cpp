@@ -27,8 +27,8 @@ namespace gamesnap {
         switch (algorithm) {
         case ToneMapAlgorithm::Spline:
             return "spline";
-        case ToneMapAlgorithm::Lilium:
-            return "lilium";
+        case ToneMapAlgorithm::Analysis:
+            return "analysis";
         }
         return "unknown";
     }
@@ -36,8 +36,8 @@ namespace gamesnap {
     std::optional<ToneMapAlgorithm> parse_tone_map_algorithm(std::string_view text) {
         if (text == "spline")
             return ToneMapAlgorithm::Spline;
-        if (text == "lilium")
-            return ToneMapAlgorithm::Lilium;
+        if (text == "analysis")
+            return ToneMapAlgorithm::Analysis;
         return std::nullopt;
     }
 
@@ -61,20 +61,32 @@ namespace gamesnap {
             return;
         }
 
-        D3D11_QUERY_DESC query_desc{};
-        query_desc.Query = D3D11_QUERY_EVENT;
-        if (FAILED(d3d_->device()->CreateQuery(&query_desc, event_query_.put()))) {
-            error_ = "CreateQuery(EVENT) 失败";
+        winrt::com_ptr<ID3D11Device5> device5;
+        winrt::com_ptr<ID3D11DeviceContext4> context4;
+        if (FAILED(d3d_->device()->QueryInterface(__uuidof(ID3D11Device5), device5.put_void())) ||
+            FAILED(d3d_->context()->QueryInterface(__uuidof(ID3D11DeviceContext4), context4.put_void()))) {
+            error_ = "D3D11.4 fence 接口不可用";
             return;
         }
+        if (FAILED(device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, __uuidof(ID3D11Fence), fence_.put_void()))) {
+            error_ = "CreateFence 失败";
+            return;
+        }
+        fence_event_ = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (fence_event_ == nullptr) {
+            error_ = "CreateEvent(fence) 失败";
+            return;
+        }
+        context4_ = context4;
         ok_ = true;
     }
 
-    ToneMapper::~ToneMapper() = default;
+    ToneMapper::~ToneMapper() {
+        if (fence_event_ != nullptr)
+            ::CloseHandle(fence_event_);
+    }
 
     void ToneMapper::release_resources() {
-        input_view_ = nullptr;
-        input_ = nullptr;
         output_view_ = nullptr;
         output_ = nullptr;
         readback_ = nullptr;
@@ -86,7 +98,7 @@ namespace gamesnap {
     }
 
     bool ToneMapper::ensure_size(std::uint32_t width, std::uint32_t height) {
-        if (width_ == width && height_ == height && input_ && output_ && readback_ && hdr_output_ && hdr_readback_)
+        if (width_ == width && height_ == height && output_ && readback_ && hdr_output_ && hdr_readback_)
             return true;
         if (width == 0 || height == 0) {
             error_ = "空纹理";
@@ -103,14 +115,6 @@ namespace gamesnap {
         input_desc.SampleDesc.Count = 1;
         input_desc.Usage = D3D11_USAGE_DEFAULT;
         input_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(d3d_->device()->CreateTexture2D(&input_desc, nullptr, input_.put()))) {
-            error_ = "CreateTexture2D(input) 失败";
-            return false;
-        }
-        if (FAILED(d3d_->device()->CreateShaderResourceView(input_.get(), nullptr, input_view_.put()))) {
-            error_ = "CreateShaderResourceView 失败";
-            return false;
-        }
 
         D3D11_TEXTURE2D_DESC output_desc = input_desc;
         output_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -181,6 +185,12 @@ namespace gamesnap {
             return false;
         }
 
+        winrt::com_ptr<ID3D11ShaderResourceView> input_view;
+        if (FAILED(d3d_->device()->CreateShaderResourceView(hdr_texture, nullptr, input_view.put()))) {
+            error = "CreateShaderResourceView(HDR 输入) 失败";
+            return false;
+        }
+
         Constants constants{};
         constants.width = desc.Width;
         constants.height = desc.Height;
@@ -190,7 +200,7 @@ namespace gamesnap {
                         color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020)
                            ? 1U
                            : 0U;
-        constants.algorithm = algorithm == ToneMapAlgorithm::Lilium ? 1U : 0U;
+        constants.algorithm = algorithm == ToneMapAlgorithm::Analysis ? 1U : 0U;
 
         // 先分配好 CPU 缓冲，再做 Map；避免 Map 成功后 resize 失败留下 mapped 纹理。
         out.width = desc.Width;
@@ -204,12 +214,11 @@ namespace gamesnap {
         {
             std::scoped_lock lock(d3d_->context_mutex());
             auto* context = d3d_->context();
-            context->CopyResource(input_.get(), hdr_texture);
             context->UpdateSubresource(constants_.get(), 0, nullptr, &constants, 0, 0);
             context->CSSetShader(shader_.get(), nullptr, 0);
             ID3D11Buffer* cbuf = constants_.get();
             context->CSSetConstantBuffers(0, 1, &cbuf);
-            ID3D11ShaderResourceView* srv = input_view_.get();
+            ID3D11ShaderResourceView* srv = input_view.get();
             context->CSSetShaderResources(0, 1, &srv);
             ID3D11UnorderedAccessView* uav = output_view_.get();
             context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
@@ -223,29 +232,20 @@ namespace gamesnap {
             context->CSSetUnorderedAccessViews(0, 2, null_uavs.data(), nullptr);
             context->CopyResource(readback_.get(), output_.get());
             context->CopyResource(hdr_readback_.get(), hdr_output_.get());
-            context->End(event_query_.get());
+            const HRESULT signaled = context4_->Signal(fence_.get(), ++fence_value_);
+            if (FAILED(signaled)) {
+                error = "Signal tone map fence 失败";
+                return false;
+            }
         }
 
         // 等 GPU 完成，但绝不持着 context 锁等：Map 是同步阻塞的，持锁会把
         // capture 回调和其他编码线程一起卡住。设备挂起但未 TDR 时必须超时回退。
-        const auto wait_deadline = SteadyClock::now() + std::chrono::seconds(5);
-        for (;;) {
-            HRESULT ready = E_FAIL;
-            {
-                std::scoped_lock lock(d3d_->context_mutex());
-                ready = d3d_->context()->GetData(event_query_.get(), nullptr, 0, 0);
-            }
-            if (ready == S_OK)
-                break;
-            if (ready != S_FALSE) {
-                error = "等待 tone map GPU 完成失败";
-                return false;
-            }
-            if (SteadyClock::now() >= wait_deadline) {
-                error = "等待 tone map GPU 超时";
-                return false;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ::ResetEvent(fence_event_);
+        if (FAILED(fence_->SetEventOnCompletion(fence_value_, fence_event_)) ||
+            ::WaitForSingleObject(fence_event_, 5000) != WAIT_OBJECT_0) {
+            error = "等待 tone map GPU 超时";
+            return false;
         }
 
         {
@@ -262,14 +262,14 @@ namespace gamesnap {
             }
         }
 
-        for (std::uint32_t y = 0; y < desc.Height; ++y) {
-            auto const* src = static_cast<std::uint8_t const*>(mapped.pData) + static_cast<std::size_t>(y) * mapped.RowPitch;
-            auto* dst = out.pixels.data() + static_cast<std::size_t>(y) * out.stride;
+        for (std::size_t y = 0; y < desc.Height; ++y) {
+            auto const* src = static_cast<std::uint8_t const*>(mapped.pData) + y * mapped.RowPitch;
+            auto* dst = out.pixels.data() + y * out.stride;
             // shader 已经按 BGRA 写出且 alpha=255，这里只需整行复制。
             std::memcpy(dst, src, static_cast<std::size_t>(desc.Width) * 4);
             auto const* src_hdr =
-                static_cast<std::uint16_t const*>(hdr_mapped.pData) + static_cast<std::size_t>(y) * (hdr_mapped.RowPitch / 2);
-            auto* dst_hdr = hdr10.data() + static_cast<std::size_t>(y) * desc.Width * 4;
+                static_cast<std::uint16_t const*>(hdr_mapped.pData) + y * (hdr_mapped.RowPitch / 2);
+            auto* dst_hdr = hdr10.data() + y * desc.Width * 4;
             std::memcpy(dst_hdr, src_hdr, static_cast<std::size_t>(desc.Width) * 4 * sizeof(std::uint16_t));
         }
 

@@ -83,7 +83,7 @@ namespace {
         gamesnap::OverlayThread overlay(ui);
         overlay.start();
 
-        gamesnap::EncodeWorkers encoders(config.output_dir, jobs, ui);
+        gamesnap::EncodeWorkers encoders(config.output_dir, jobs, config.codec, ui);
         encoders.start(config.encode_threads);
 
         gamesnap::InputThread input(config, commands, ui);

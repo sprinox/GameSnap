@@ -18,13 +18,27 @@ YAML 先加载，命令行参数随后覆盖。仓库根的 [config.example.yaml
 | `hotkey` | 字符串 | `F12` | `F1..F24`、字母/数字、`printscreen`、`scrolllock`、`insert`、`home`、`end`、`space`、`0x7B`；可加 `ctrl+` / `shift+` / `alt+` / `win+` |
 | `swallow` | 布尔 | `false` | 是否吞掉热键，`true` 时游戏收不到 |
 | `monitor` | 字符串 | `primary` | `primary`：主显示器；`foreground`：前台窗口所在显示器 |
-| `hdr` | 布尔 | `false` | HDR 显示器以 FP16 捕获；保存 HDR + SDR 两份 |
 | `format_hdr` | 字符串 | `avif` | HDR 容器，仅 `avif` / `heic` |
 | `format_sdr` | 字符串 | `webp` | SDR 格式：`bmp` / `png` / `jpeg` / `webp` / `avif` / `heic` |
-| `tone_map` | 字符串 | `spline` | HDR→SDR 算法：`spline` / `lilium` |
+| `tone_map` | 字符串 | `spline` | HDR→SDR 算法：`spline` / `analysis` |
+| `png_compression` | 整数 0–9 | `6` | PNG 压缩级别，越高越慢/越小 |
+| `jpeg_quality` | 整数 1–100 | `95` | JPEG 质量 |
+| `webp_quality` | 整数 0–100 | `90` | WebP 质量 |
+| `webp_lossless` | 布尔 | `false` | WebP 无损 |
+| `webp_method` | 整数 0–6 | `4` | WebP 编码方法，越高越慢/越小 |
+| `avif_quality` | 整数 0–100 | `90` | AVIF 质量 |
+| `avif_lossless` | 布尔 | `false` | AVIF 无损 |
+| `avif_speed` | 整数 0–10 | `10` | AVIF 速度，越高越快 |
+| `heic_quality` | 整数 0–100 | `90` | HEIC 质量 |
+| `heic_lossless` | 布尔 | `false` | HEIC 无损 |
+| `heic_preset` | 字符串 | `fast` | x265 预设，`ultrafast`..`veryslow` |
 | `verbose` | 布尔 | `false` | 输出 debug 级别日志 |
 
 布尔值使用 yaml-cpp 的规则：`true/false`、`yes/no`、`on/off`、`y/n`（不区分大小写），不接受 `1/0`。
+
+编码器能力说明：BMP 固定无损且无参数；PNG 固定无损，`png_compression` 控制速度/体积；
+JPEG 只有有损 quality，没有无损模式；WebP 支持 quality/lossless/method；
+AVIF 支持 quality/lossless/speed；HEIC（x265）支持 quality/lossless/preset。
 
 ## 命令行参数
 
@@ -36,10 +50,9 @@ YAML 先加载，命令行参数随后覆盖。仓库根的 [config.example.yaml
 | `--threads <1-8>` | 编码线程数 |
 | `--monitor <primary\|foreground>` | 截主显示器 / 前台窗口所在显示器 |
 | `--swallow` | 吞掉热键 |
-| `--hdr` | HDR 捕获并保存 HDR + SDR 两份 |
 | `--format-hdr <avif\|heic>` | HDR 输出容器 |
 | `--format-sdr <格式>` | SDR 输出格式 |
-| `--tone-map <spline\|lilium>` | 色调映射算法 |
+| `--tone-map <spline\|analysis>` | 色调映射算法 |
 | `--verbose` | 调试日志 |
 | `--selftest` | 合成纹理自检编码链路，不经过 WGC |
 | `--help` | 显示帮助 |

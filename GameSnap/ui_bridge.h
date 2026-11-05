@@ -1,5 +1,7 @@
 #pragma once
 
+#include <windows.h>
+
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -14,6 +16,13 @@ namespace gamesnap {
     // 不能把 Image / D3D 资源直接交给 UI 线程；这里只复制文件名和小缩略图。
     class UiBridge {
     public:
+        UiBridge();
+        ~UiBridge();
+        UiBridge(UiBridge const&) = delete;
+        UiBridge& operator=(UiBridge const&) = delete;
+        UiBridge(UiBridge&&) = delete;
+        UiBridge& operator=(UiBridge&&) = delete;
+
         struct Snapshot {
             std::uint64_t trigger_serial = 0;
             std::uint64_t info_serial = 0;
@@ -30,6 +39,7 @@ namespace gamesnap {
         void publish(std::wstring filename, Image const& image);
 
         [[nodiscard]] Snapshot snapshot() const;
+        [[nodiscard]] HANDLE trigger_event() const noexcept { return trigger_event_; }
 
     private:
         mutable std::mutex mutex_;
@@ -39,6 +49,7 @@ namespace gamesnap {
         std::uint32_t thumb_height_ = 0;
         std::uint64_t info_serial_ = 0;
         std::atomic<std::uint64_t> trigger_serial_{0};
+        HANDLE trigger_event_ = nullptr;
         std::atomic<int> remaining_{0};
     };
 

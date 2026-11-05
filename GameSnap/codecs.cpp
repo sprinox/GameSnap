@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 
 #include <avif/avif.h>
+#include <zlib.h>
 #include <jpeglib.h>
 #include <libheif/heif.h>
 #include <spng.h>
@@ -19,6 +21,8 @@
 namespace gamesnap {
 
     namespace {
+
+        CodecOptions codec_options;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables): set once before encoder threads start
 
         constexpr std::uint32_t kMaxChannel10 = 1023;
 
@@ -115,6 +119,175 @@ namespace gamesnap {
                     .b = 0.0164F * c.r + 0.0880F * c.g + 0.8956F * c.b};
         }
 
+        // ── EXIF（仅 little-endian，Windows x64）─────────────────────────────
+        static_assert(std::endian::native == std::endian::little,
+                      "EXIF writer relies on little-endian host layout");
+
+        void write_u16_be(std::uint8_t* out, std::uint16_t value) {
+            const std::uint16_t encoded = std::byteswap(value);
+            std::memcpy(out, &encoded, sizeof(encoded));
+        }
+
+        void write_u32_le(std::uint8_t* out, std::uint32_t value) {
+            std::memcpy(out, &value, sizeof(value));
+        }
+
+        void write_u32_be(std::uint8_t* out, std::uint32_t value) {
+            const std::uint32_t encoded = std::byteswap(value);
+            std::memcpy(out, &encoded, sizeof(encoded));
+        }
+
+#pragma pack(push, 1)
+        struct TiffHeader {
+            std::uint16_t byte_order = 0x4949;  // "II"
+            std::uint16_t magic = 42;
+            std::uint32_t ifd0_offset = 8;
+        };
+
+        struct ExifEntry {
+            std::uint16_t tag = 0;
+            std::uint16_t type = 0;
+            std::uint32_t count = 0;
+            std::uint32_t value = 0;
+        };
+#pragma pack(pop)
+        static_assert(sizeof(TiffHeader) == 8);
+        static_assert(sizeof(ExifEntry) == 12);
+
+        std::string exif_text(std::string value, std::size_t limit) {
+            std::erase(value, '\0');
+            if (value.size() > limit)
+                value.resize(limit);
+            return value;
+        }
+
+        // 最小 TIFF/EXIF：ImageDescription=标题，DateTimeOriginal/Digitized=截图时间。
+        // 直接按 little-endian 结构体写入，不做逐字节 append/字节序转换。
+        // PNG eXIf 和 AVIF 使用纯 TIFF；JPEG/WebP/HEIC 使用 "Exif\0\0"+TIFF。
+        std::vector<std::uint8_t> make_exif(ImageMetadata const& metadata, bool with_prefix) {
+            const std::string title = exif_text(metadata.title.empty() ? "GameSnap" : metadata.title, 512);
+            std::string date_time = metadata.date_time;
+            if (date_time.size() != 19)
+                date_time = "0000:00:00 00:00:00";
+
+            constexpr std::uint32_t ifd0_offset = 8;
+            constexpr std::uint32_t ifd0_count = 3;
+            constexpr std::uint32_t ifd0_size = 2 + ifd0_count * 12 + 4;
+            constexpr std::uint32_t strings_offset = ifd0_offset + ifd0_size;
+            const std::uint32_t title_offset = strings_offset;
+            const std::uint32_t software_offset = title_offset + static_cast<std::uint32_t>(title.size()) + 1;
+            constexpr std::uint32_t software_text_size = 9;  // "GameSnap\0"
+            const std::uint32_t exif_ifd_offset = (software_offset + software_text_size + 1U) & ~1U;
+            constexpr std::uint32_t exif_ifd_count = 2;
+            constexpr std::uint32_t exif_ifd_size = 2 + exif_ifd_count * 12 + 4;
+            const std::uint32_t date_offset = exif_ifd_offset + exif_ifd_size;
+
+            const std::size_t prefix_size = with_prefix ? 6 : 0;
+            std::vector<std::uint8_t> tiff(prefix_size + date_offset + 20);
+            auto* base = tiff.data() + prefix_size;
+            if (with_prefix)
+                std::memcpy(tiff.data(), "Exif\0\0", 6);
+            const TiffHeader header{};
+            std::memcpy(base, &header, sizeof(header));
+
+            const std::array<ExifEntry, 3> ifd0_entries{{
+                {.tag = 0x010E, .type = 2,
+                 .count = static_cast<std::uint32_t>(title.size()) + 1, .value = title_offset},
+                {.tag = 0x0131, .type = 2, .count = software_text_size, .value = software_offset},
+                {.tag = 0x8769, .type = 4, .count = 1, .value = exif_ifd_offset},
+            }};
+            const auto ifd0_next = static_cast<std::uint32_t>(0);
+            auto* ifd0 = base + ifd0_offset;
+            std::memcpy(ifd0, &ifd0_count, sizeof(ifd0_count));
+            std::memcpy(ifd0 + 2, ifd0_entries.data(), sizeof(ifd0_entries));
+            std::memcpy(ifd0 + 2 + sizeof(ifd0_entries), &ifd0_next, sizeof(ifd0_next));
+
+            std::memcpy(base + title_offset, title.data(), title.size() + 1);
+            constexpr std::string_view software = "GameSnap";
+            std::memcpy(base + software_offset, software.data(), software.size() + 1);
+
+            const std::array<ExifEntry, 2> exif_entries{{
+                {.tag = 0x9003, .type = 2, .count = 20, .value = date_offset},
+                {.tag = 0x9004, .type = 2, .count = 20, .value = date_offset},
+            }};
+            const auto exif_next = static_cast<std::uint32_t>(0);
+            auto* exif_ifd = base + exif_ifd_offset;
+            std::memcpy(exif_ifd, &exif_ifd_count, sizeof(exif_ifd_count));
+            std::memcpy(exif_ifd + 2, exif_entries.data(), sizeof(exif_entries));
+            std::memcpy(exif_ifd + 2 + sizeof(exif_entries), &exif_next, sizeof(exif_next));
+            std::memcpy(base + date_offset, date_time.data(), 20);
+            return tiff;
+        }
+
+        std::vector<std::uint8_t> make_exif_tiff(ImageMetadata const& metadata) {
+            return make_exif(metadata, false);
+        }
+
+        std::vector<std::uint8_t> make_exif_payload(ImageMetadata const& metadata) {
+            return make_exif(metadata, true);
+        }
+
+        std::vector<std::uint8_t> add_jpeg_exif(std::vector<std::uint8_t> jpeg,
+                                                ImageMetadata const& metadata) {
+            const auto exif = make_exif_payload(metadata);
+            if (jpeg.size() < 2 || jpeg[0] != 0xFF || jpeg[1] != 0xD8)
+                return jpeg;
+            std::vector<std::uint8_t> out(6 + exif.size() + jpeg.size() - 2);
+            auto* p = out.data();
+            constexpr std::array<std::uint8_t, 4> app1_marker{0xFF, 0xD8, 0xFF, 0xE1};
+            std::memcpy(p, app1_marker.data(), app1_marker.size());
+            write_u16_be(p + 4, static_cast<std::uint16_t>(exif.size() + 2));
+            std::memcpy(p + 6, exif.data(), exif.size());
+            std::memcpy(p + 6 + exif.size(), jpeg.data() + 2, jpeg.size() - 2);
+            return out;
+        }
+
+        std::vector<std::uint8_t> add_png_exif(std::vector<std::uint8_t> png,
+                                               ImageMetadata const& metadata) {
+            if (png.size() < 12)
+                return png;
+            const auto tiff = make_exif_tiff(metadata);
+            std::vector<std::uint8_t> chunk(12 + tiff.size());
+            auto* chunk_data = chunk.data();
+            write_u32_be(chunk_data, static_cast<std::uint32_t>(tiff.size()));
+            constexpr std::array<std::uint8_t, 4> exif_type{'e', 'X', 'I', 'f'};
+            std::memcpy(chunk_data + 4, exif_type.data(), exif_type.size());
+            std::memcpy(chunk_data + 8, tiff.data(), tiff.size());
+            uLong crc = ::crc32(0L, Z_NULL, 0);
+            crc = ::crc32(crc, reinterpret_cast<const Bytef*>(chunk_data + 4),
+                          static_cast<uInt>(4 + tiff.size()));
+            write_u32_be(chunk_data + 8 + tiff.size(), static_cast<std::uint32_t>(crc));
+
+            // IEND 固定为最后 12 字节：length=0 + "IEND" + crc。
+            const std::size_t insert_at = png.size() - 12;
+            png.insert(png.begin() + static_cast<std::ptrdiff_t>(insert_at), chunk.begin(), chunk.end());
+            return png;
+        }
+
+        std::vector<std::uint8_t> add_webp_exif(std::vector<std::uint8_t> webp,
+                                                ImageMetadata const& metadata) {
+            if (webp.size() < 12 || std::memcmp(webp.data(), "RIFF", 4) != 0 ||
+                std::memcmp(webp.data() + 8, "WEBP", 4) != 0) {
+                return webp;
+            }
+            const auto exif = make_exif_payload(metadata);
+            const std::size_t padding = exif.size() & 1U;
+            std::vector<std::uint8_t> chunk(8 + exif.size() + padding);
+            auto* chunk_data = chunk.data();
+            constexpr std::array<std::uint8_t, 4> exif_type{'E', 'X', 'I', 'F'};
+            std::memcpy(chunk_data, exif_type.data(), exif_type.size());
+            write_u32_le(chunk_data + 4, static_cast<std::uint32_t>(exif.size()));
+            std::memcpy(chunk_data + 8, exif.data(), exif.size());
+            if (padding != 0) {
+                constexpr std::uint8_t zero = 0;
+                std::memcpy(chunk_data + 8 + exif.size(), &zero, 1);
+            }
+
+            webp.insert(webp.end(), chunk.begin(), chunk.end());
+            write_u32_le(webp.data() + 4, static_cast<std::uint32_t>(webp.size() - 8));
+            return webp;
+        }
+
         // ── BMP ──────────────────────────────────────────────────────────────
         bool write_bmp_impl(std::filesystem::path const& path, Image const& image, std::string& error) {
             if (image.pixels.empty() || image.width == 0 || image.height == 0) {
@@ -171,7 +344,7 @@ namespace gamesnap {
                 return false;
             }
             spng_set_option(ctx, SPNG_ENCODE_TO_BUFFER, 1);
-            spng_set_option(ctx, SPNG_IMG_COMPRESSION_LEVEL, 9);
+            spng_set_option(ctx, SPNG_IMG_COMPRESSION_LEVEL, codec_options.png_compression);
 
             spng_ihdr ihdr{};
             ihdr.width = image.width;
@@ -201,7 +374,10 @@ namespace gamesnap {
                 error = "spng_get_png_buffer 失败";
                 return false;
             }
-            const bool ok = write_bytes(path, png, png_size, error);
+            const std::vector<std::uint8_t> png_bytes(static_cast<std::uint8_t*>(png),
+                                                       static_cast<std::uint8_t*>(png) + png_size);
+            const auto with_exif = add_png_exif(png_bytes, image.metadata);
+            const bool ok = write_bytes(path, with_exif.data(), with_exif.size(), error);
             free(png);  // NOLINT(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
             spng_ctx_free(ctx);
             return ok;
@@ -249,7 +425,7 @@ namespace gamesnap {
             cinfo.input_components = 3;
             cinfo.in_color_space = JCS_RGB;
             jpeg_set_defaults(&cinfo);
-            jpeg_set_quality(&cinfo, 100, TRUE);
+            jpeg_set_quality(&cinfo, codec_options.jpeg_quality, TRUE);
             for (int i = 0; i < cinfo.num_components; ++i) {
                 cinfo.comp_info[i].h_samp_factor = 1;
                 cinfo.comp_info[i].v_samp_factor = 1;
@@ -267,7 +443,9 @@ namespace gamesnap {
                 jpeg_write_scanlines(&cinfo, &row_pointer, 1);
             }
             jpeg_finish_compress(&cinfo);
-            const bool ok = write_bytes(path, mem, mem_size, error);
+            const std::vector<std::uint8_t> jpeg(mem, mem + mem_size);
+            const auto with_exif = add_jpeg_exif(jpeg, image.metadata);
+            const bool ok = write_bytes(path, with_exif.data(), with_exif.size(), error);
             jpeg_destroy_compress(&cinfo);
             free(mem);  // NOLINT(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
             return ok;
@@ -280,9 +458,10 @@ namespace gamesnap {
                 error = "WebPConfigInit 失败";
                 return false;
             }
-            config.lossless = 1;
-            config.quality = 100.0F;
-            config.method = 4;
+            config.lossless = codec_options.webp_lossless ? 1 : 0;
+            config.quality = codec_options.webp_lossless ? 100.0F
+                                                         : static_cast<float>(codec_options.webp_quality);
+            config.method = codec_options.webp_method;
             config.exact = 1;
 
             WebPPicture picture;
@@ -305,8 +484,11 @@ namespace gamesnap {
             picture.custom_ptr = &writer;
             const int ok = WebPEncode(&config, &picture);
             bool result = false;
-            if (ok != 0)
-                result = write_bytes(path, writer.mem, writer.size, error);
+            if (ok != 0) {
+                const std::vector<std::uint8_t> webp(writer.mem, writer.mem + writer.size);
+                const auto with_exif = add_webp_exif(webp, image.metadata);
+                result = write_bytes(path, with_exif.data(), with_exif.size(), error);
+            }
 
             WebPMemoryWriterClear(&writer);
             WebPPictureFree(&picture);
@@ -316,22 +498,37 @@ namespace gamesnap {
         }
 
         // ── libavif ─────────────────────────────────────────────────────────
-        bool write_avif_impl(std::filesystem::path const& path, avifImage* image, std::string& error) {
+        bool write_avif_impl(std::filesystem::path const& path, avifImage* image,
+                             ImageMetadata const& metadata, std::string& error) {
+            const auto exif = make_exif_payload(metadata);
+            if (!exif.empty()) {
+                const avifResult exif_result =
+                    avifImageSetMetadataExif(image, exif.data(), exif.size());
+                if (exif_result != AVIF_RESULT_OK) {
+                    error = fmt::format("avifImageSetMetadataExif 失败: {}", avifResultToString(exif_result));
+                    return false;
+                }
+            }
+
             avifEncoder* encoder = avifEncoderCreate();
             if (encoder == nullptr) {
                 error = "avifEncoderCreate 失败";
                 return false;
             }
-            encoder->speed = AVIF_SPEED_SLOWEST;
-            encoder->maxThreads = 4;
-            encoder->quality = AVIF_QUALITY_LOSSLESS;
-            encoder->qualityAlpha = AVIF_QUALITY_LOSSLESS;
-            encoder->minQuantizer = AVIF_QUANTIZER_LOSSLESS;
-            encoder->maxQuantizer = AVIF_QUANTIZER_LOSSLESS;
-            encoder->minQuantizerAlpha = AVIF_QUANTIZER_LOSSLESS;
-            encoder->maxQuantizerAlpha = AVIF_QUANTIZER_LOSSLESS;
-            encoder->qualityGainMap = AVIF_QUALITY_LOSSLESS;
-            (void)avifEncoderSetCodecSpecificOption(encoder, "lossless", "1");
+            const int avif_speed = std::clamp(codec_options.avif_speed, 0, 10);
+            const int avif_quality = codec_options.avif_lossless ? 100 : codec_options.avif_quality;
+            encoder->speed = avif_speed;
+            encoder->maxThreads = 8;
+            encoder->quality = avif_quality;
+            encoder->qualityAlpha = avif_quality;
+            encoder->qualityGainMap = avif_quality;
+            if (codec_options.avif_lossless) {
+                encoder->minQuantizer = AVIF_QUANTIZER_LOSSLESS;
+                encoder->maxQuantizer = AVIF_QUANTIZER_LOSSLESS;
+                encoder->minQuantizerAlpha = AVIF_QUANTIZER_LOSSLESS;
+                encoder->maxQuantizerAlpha = AVIF_QUANTIZER_LOSSLESS;
+                (void)avifEncoderSetCodecSpecificOption(encoder, "lossless", "1");
+            }
 
             avifRWData output = AVIF_DATA_EMPTY;
             const avifResult result = avifEncoderWrite(encoder, image, &output);
@@ -356,7 +553,7 @@ namespace gamesnap {
             avif->yuvRange = AVIF_RANGE_FULL;
             avif->colorPrimaries = hdr ? AVIF_COLOR_PRIMARIES_BT2020 : AVIF_COLOR_PRIMARIES_BT709;
             avif->transferCharacteristics = hdr ? AVIF_TRANSFER_CHARACTERISTICS_PQ : AVIF_TRANSFER_CHARACTERISTICS_SRGB;
-            avif->matrixCoefficients = hdr ? AVIF_MATRIX_COEFFICIENTS_BT2020_NCL : AVIF_MATRIX_COEFFICIENTS_BT709;
+            avif->matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_IDENTITY;
 
             avifRGBImage rgb;
             avifRGBImageSetDefaults(&rgb, avif);
@@ -367,7 +564,7 @@ namespace gamesnap {
 
             bool ok = false;
             if (avifImageRGBToYUV(avif, &rgb) == AVIF_RESULT_OK)
-                ok = write_avif_impl(path, avif, error);
+                ok = write_avif_impl(path, avif, image.metadata, error);
             else
                 error = "avifImageRGBToYUV 失败";
             avifImageDestroy(avif);
@@ -410,7 +607,8 @@ namespace gamesnap {
         }
 
         bool avif_from_rgba10(std::filesystem::path const& path, std::uint16_t const* rgba,
-                              std::uint32_t width, std::uint32_t height, std::string& error) {
+                              std::uint32_t width, std::uint32_t height,
+                              ImageMetadata const& metadata, std::string& error) {
             avifImage* avif = avifImageCreate(width, height, 10, AVIF_PIXEL_FORMAT_YUV444);
             if (avif == nullptr) {
                 error = "avifImageCreate 失败";
@@ -419,7 +617,7 @@ namespace gamesnap {
             avif->yuvRange = AVIF_RANGE_FULL;
             avif->colorPrimaries = AVIF_COLOR_PRIMARIES_BT2020;
             avif->transferCharacteristics = AVIF_TRANSFER_CHARACTERISTICS_PQ;
-            avif->matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_BT2020_NCL;
+            avif->matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_IDENTITY;
 
             avifRGBImage rgb;
             avifRGBImageSetDefaults(&rgb, avif);
@@ -430,7 +628,7 @@ namespace gamesnap {
 
             bool ok = false;
             if (avifImageRGBToYUV(avif, &rgb) == AVIF_RESULT_OK)
-                ok = write_avif_impl(path, avif, error);
+                ok = write_avif_impl(path, avif, metadata, error);
             else
                 error = "avifImageRGBToYUV 失败";
             avifImageDestroy(avif);
@@ -439,7 +637,7 @@ namespace gamesnap {
 
         bool avif_from_hdr(std::filesystem::path const& path, HdrFrame const& frame, std::string& error) {
             auto rgba = hdr_to_rgba10(frame);
-            return avif_from_rgba10(path, rgba.data(), frame.width, frame.height, error);
+            return avif_from_rgba10(path, rgba.data(), frame.width, frame.height, frame.metadata, error);
         }
 
         bool avif_gainmap(std::filesystem::path const& path, Image const& sdr, std::uint16_t const* hdr10,
@@ -457,7 +655,7 @@ namespace gamesnap {
             base->yuvRange = AVIF_RANGE_FULL;
             base->colorPrimaries = AVIF_COLOR_PRIMARIES_BT709;
             base->transferCharacteristics = AVIF_TRANSFER_CHARACTERISTICS_SRGB;
-            base->matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_BT709;
+            base->matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_IDENTITY;
 
             avifRGBImage base_rgb{};
             base_rgb.width = width;
@@ -506,9 +704,14 @@ namespace gamesnap {
                 avifImageDestroy(base);
                 return false;
             }
+            gain_map->altColorPrimaries = AVIF_COLOR_PRIMARIES_BT2020;
+            gain_map->altTransferCharacteristics = AVIF_TRANSFER_CHARACTERISTICS_PQ;
+            gain_map->altMatrixCoefficients = AVIF_MATRIX_COEFFICIENTS_IDENTITY;
+            gain_map->altDepth = 10;
+            gain_map->altPlaneCount = 3;
 
             base->gainMap = gain_map;
-            const bool ok = write_avif_impl(path, base, error);
+            const bool ok = write_avif_impl(path, base, sdr.metadata, error);
             base->gainMap = nullptr;
             avifGainMapDestroy(gain_map);
             avifImageDestroy(base);
@@ -525,11 +728,22 @@ namespace gamesnap {
         }
 
         bool write_heic_impl(std::filesystem::path const& path, heif_context* ctx, heif_image* image,
-                             heif_encoder* encoder, std::string& error) {
-            const heif_error encoded = heif_context_encode_image(ctx, image, encoder, nullptr, nullptr);
+                             heif_encoder* encoder, ImageMetadata const& metadata, std::string& error) {
+            heif_image_handle* handle = nullptr;
+            const heif_error encoded = heif_context_encode_image(ctx, image, encoder, nullptr, &handle);
             if (encoded.code != heif_error_Ok) {
                 error = fmt::format("HEIC 编码失败: {}", encoded.message ? encoded.message : "unknown");
+                if (handle != nullptr)
+                    heif_image_handle_release(handle);
                 return false;
+            }
+            if (handle != nullptr) {
+                const auto exif = make_exif_payload(metadata);
+                const heif_error add_exif = heif_context_add_exif_metadata(
+                    ctx, handle, exif.data(), static_cast<int>(exif.size()));
+                if (add_exif.code != heif_error_Ok)
+                    SPDLOG_WARN("HEIC 写入 EXIF 失败: {}", add_exif.message ? add_exif.message : "unknown");
+                heif_image_handle_release(handle);
             }
             const std::string utf8 = wstring_to_utf8(path.wstring());
             const heif_error written = heif_context_write_to_file(ctx, utf8.c_str());
@@ -547,9 +761,11 @@ namespace gamesnap {
                 error = fmt::format("HEVC 编码器不可用: {}", result.message ? result.message : "unknown");
                 return nullptr;
             }
-            heif_encoder_set_lossy_quality(encoder, 100);
+            heif_encoder_set_lossy_quality(encoder, codec_options.heic_quality);
             heif_encoder_set_parameter_string(encoder, "chroma", "444");
-            heif_encoder_set_parameter_string(encoder, "preset", "veryslow");
+            heif_encoder_set_parameter_string(encoder, "preset", std::string(codec_options.heic_preset).c_str());
+            if (codec_options.heic_lossless)
+                heif_encoder_set_lossless(encoder, 1);
             return encoder;
         }
 
@@ -605,7 +821,7 @@ namespace gamesnap {
                 free_heif(ctx, img, nullptr);
                 return false;
             }
-            const bool ok = write_heic_impl(path, ctx, img, encoder, error);
+            const bool ok = write_heic_impl(path, ctx, img, encoder, image.metadata, error);
             free_heif(ctx, img, encoder);
             return ok;
         }
@@ -617,8 +833,8 @@ namespace gamesnap {
                               std::uint32_t height,
                               int bit_depth,
                               heif_compression_format compression,
-                              bool lossless,
                               bool hdr,
+                              ImageMetadata const& metadata,
                               std::string& error) {
             heif_context* ctx = heif_context_alloc();
             if (ctx == nullptr) {
@@ -694,18 +910,22 @@ namespace gamesnap {
                                     got_encoder.message ? got_encoder.message : "unknown");
                 return false;
             }
-            heif_encoder_set_lossy_quality(encoder, 100);
+            heif_encoder_set_lossy_quality(encoder, codec_options.heic_quality);
             heif_encoder_set_parameter_string(encoder, "chroma", "444");
-            heif_encoder_set_parameter_string(encoder, "preset", "veryslow");
-            if (lossless)
+            heif_encoder_set_parameter_string(encoder, "preset", std::string(codec_options.heic_preset).c_str());
+            if (codec_options.heic_lossless)
                 heif_encoder_set_lossless(encoder, 1);
 
-            const bool ok = write_heic_impl(path, ctx, img, encoder, error);
+            const bool ok = write_heic_impl(path, ctx, img, encoder, metadata, error);
             free_heif(ctx, img, encoder);
             return ok;
         }
 
     }  // namespace
+
+    void set_codec_options(CodecOptions const& options) {
+        codec_options = options;
+    }
 
     std::string_view to_string(ImageFormat format) {
         return format_name(format);
@@ -727,22 +947,22 @@ namespace gamesnap {
         return std::nullopt;
     }
 
-    std::string_view image_extension(ImageFormat format) {
+    std::wstring_view image_extension(ImageFormat format) {
         switch (format) {
         case ImageFormat::Bmp:
-            return "bmp";
+            return L".bmp";
         case ImageFormat::Png:
-            return "png";
+            return L".png";
         case ImageFormat::Jpeg:
-            return "jpg";
+            return L".jpg";
         case ImageFormat::Webp:
-            return "webp";
+            return L".webp";
         case ImageFormat::Avif:
-            return "avif";
+            return L".avif";
         case ImageFormat::Heic:
-            return "heic";
+            return L".heic";
         }
-        return "bin";
+        return L".bin";
     }
 
     bool format_supports_hdr(ImageFormat format) {
@@ -779,28 +999,31 @@ namespace gamesnap {
 
     bool encode_heic_hdr(std::filesystem::path const& path, HdrFrame const& frame, std::string& error) {
         auto rgba = hdr_to_rgba10(frame);
-        return encode_heic_hdr10(path, rgba.data(), frame.width, frame.height, error);
+        return encode_heic_hdr10(path, rgba.data(), frame.width, frame.height, frame.metadata, error);
     }
 
     bool encode_avif_hdr10(std::filesystem::path const& path, std::uint16_t const* rgba10,
-                           std::uint32_t width, std::uint32_t height, std::string& error) {
-        return avif_from_rgba10(path, rgba10, width, height, error);
+                           std::uint32_t width, std::uint32_t height,
+                           ImageMetadata const& metadata, std::string& error) {
+        return avif_from_rgba10(path, rgba10, width, height, metadata, error);
     }
 
     bool encode_heic_hdr10(std::filesystem::path const& path, std::uint16_t const* rgba10,
-                           std::uint32_t width, std::uint32_t height, std::string& error) {
+                           std::uint32_t width, std::uint32_t height,
+                           ImageMetadata const& metadata, std::string& error) {
         if (heif_encode_rgba(path, rgba10, width, height, 10,
-                             heif_compression_HEVC, false, true, error))
+                             heif_compression_HEVC, true, metadata, error))
             return true;
 
-        // vcpkg 的 x265 有时只有 8-bit；退化为 8-bit PQ，至少保留 HDR 元数据。
+        // vcpkg 的 x265 可能只有 8-bit（本机实测 x265_max_bit_depth=8、x265_api_get(10)=nullptr）；
+        // 退化为 8-bit PQ，至少保留 HDR 元数据。
         SPDLOG_WARN("HEIC 10-bit 编码失败，回退 8-bit: {}", error);
         const std::size_t count = static_cast<std::size_t>(width) * height * 4;
         std::vector<std::uint8_t> rgba8(count);
         for (std::size_t i = 0; i < count; ++i)
             rgba8[i] = static_cast<std::uint8_t>(rgba10[i] >> 2);
         return heif_encode_rgba(path, rgba8.data(), width, height, 8,
-                                heif_compression_HEVC, false, true, error);
+                                heif_compression_HEVC, true, metadata, error);
     }
 
     bool encode_avif_gainmap(std::filesystem::path const& path, Image const& sdr,
@@ -827,25 +1050,25 @@ namespace gamesnap {
         return false;
     }
 
-    bool write_hdr(std::filesystem::path const& path, ImageFormat format, HdrFrame const& frame, std::string& error) {
-        switch (format) {
-        case ImageFormat::Avif:
-            return encode_avif_hdr(path, frame, error);
-        case ImageFormat::Heic:
-            return encode_heic_hdr(path, frame, error);
-        default:
+    bool write_hdr(std::filesystem::path const& path, ImageFormat format, HdrFrame const& frame, std::string& error,
+                   std::vector<std::uint16_t>* rgba10_out) {
+        if (!format_supports_hdr(format)) {
             error = "该格式不支持 HDR";
             return false;
         }
+        auto rgba10 = hdr_to_rgba10(frame);
+        if (rgba10_out != nullptr)
+            *rgba10_out = rgba10;
+        return write_hdr10(path, format, rgba10.data(), frame.width, frame.height, frame.metadata, error);
     }
 
     bool write_hdr10(std::filesystem::path const& path, ImageFormat format, std::uint16_t const* rgba10,
-                     std::uint32_t width, std::uint32_t height, std::string& error) {
+                     std::uint32_t width, std::uint32_t height, ImageMetadata const& metadata, std::string& error) {
         switch (format) {
         case ImageFormat::Avif:
-            return encode_avif_hdr10(path, rgba10, width, height, error);
+            return encode_avif_hdr10(path, rgba10, width, height, metadata, error);
         case ImageFormat::Heic:
-            return encode_heic_hdr10(path, rgba10, width, height, error);
+            return encode_heic_hdr10(path, rgba10, width, height, metadata, error);
         default:
             error = "该格式不支持 HDR";
             return false;

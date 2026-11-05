@@ -2,8 +2,8 @@
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 编码侧：多线程编码 AVIF / HEIC / WebP / PNG / JPEG / BMP。
-//
-// GPU 拷贝（CopyResource）在回调里做；Map/Unmap 这种 GPU→CPU 传输在编码线程里做。
+// HDR 使用 capture 的 DEFAULT+SRV 纹理直接做 GPU tone map；CPU fallback 才回读到 staging。
+// SDR 直接 Map capture 的 staging 纹理。
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <filesystem>
@@ -24,7 +24,7 @@ namespace gamesnap {
     class EncodeWorkers {
     public:
         EncodeWorkers(std::filesystem::path output_dir, std::shared_ptr<EncodeQueue> jobs,
-                      std::shared_ptr<UiBridge> ui);
+                      CodecOptions options, std::shared_ptr<UiBridge> ui);
         ~EncodeWorkers();
 
         EncodeWorkers(const EncodeWorkers&) = delete;
@@ -43,6 +43,7 @@ namespace gamesnap {
         std::filesystem::path output_dir_;
         std::shared_ptr<EncodeQueue> jobs_;
         std::shared_ptr<UiBridge> ui_;
+        CodecOptions options_;
         std::vector<std::thread> threads_;
         std::mutex mapper_mutex_;
         std::unique_ptr<ToneMapper> mapper_;

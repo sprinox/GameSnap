@@ -275,7 +275,8 @@ namespace gamesnap {
 
     }  // namespace
 
-    OverlayThread::OverlayThread(std::shared_ptr<UiBridge> bridge) : bridge_(std::move(bridge)) {}
+    OverlayThread::OverlayThread(std::shared_ptr<UiBridge> bridge)
+        : bridge_(std::move(bridge)), stop_event_(::CreateEventW(nullptr, TRUE, FALSE, nullptr)) {}
 
     OverlayThread::~OverlayThread() {
         try {
@@ -283,6 +284,8 @@ namespace gamesnap {
             join();
         } catch (...) {  // NOLINT(bugprone-empty-catch): 析构函数不能抛
         }
+        if (stop_event_ != nullptr)
+            ::CloseHandle(stop_event_);
     }
 
     void OverlayThread::start() {
@@ -299,6 +302,8 @@ namespace gamesnap {
 
     void OverlayThread::stop() {
         stop_.store(true, std::memory_order_release);
+        if (stop_event_ != nullptr)
+            ::SetEvent(stop_event_);
     }
 
     void OverlayThread::join() {
@@ -307,6 +312,30 @@ namespace gamesnap {
     }
 
     void OverlayThread::run() {
+        std::uint64_t last_trigger = bridge_->snapshot().trigger_serial;
+        while (!stop_.load(std::memory_order_acquire)) {
+            HANDLE handles[2]{bridge_->trigger_event(), stop_event_};
+            const DWORD waited = (handles[0] != nullptr && stop_event_ != nullptr)
+                                     ? ::WaitForMultipleObjects(2, handles, FALSE, INFINITE)
+                                     : WAIT_FAILED;
+            if (waited == WAIT_OBJECT_0 + 1)
+                break;
+            if (stop_.load(std::memory_order_acquire))
+                break;
+            if (waited == WAIT_FAILED) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                continue;
+            }
+            const UiBridge::Snapshot snapshot = bridge_->snapshot();
+            if (snapshot.trigger_serial == last_trigger)
+                continue;
+            last_trigger = snapshot.trigger_serial;
+            run_session();
+            last_trigger = bridge_->snapshot().trigger_serial;
+        }
+    }
+
+    void OverlayThread::run_session() {
         ComApartment apartment;
         if (!apartment.ok())
             SPDLOG_WARN("overlay 线程初始化 COM 失败: {}", describe_hresult(apartment.result()));
@@ -322,15 +351,22 @@ namespace gamesnap {
             return;
         }
 
+        MONITORINFO monitor_info{};
+        monitor_info.cbSize = sizeof(monitor_info);
+        const HMONITOR monitor = ::MonitorFromWindow(::GetForegroundWindow(), MONITOR_DEFAULTTONEAREST);
+        ::GetMonitorInfoW(monitor, &monitor_info);
+
         HWND hwnd = ::CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
-                0x00200000 /* NOREDIRECTIONBITMAP */,
+            WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
             kOverlayClass, L"GameSnap Overlay", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, instance, nullptr);
         if (hwnd == nullptr) {
             SPDLOG_ERROR("创建 overlay 窗口失败: {}", ::GetLastError());
             return;
         }
 
+        // 先把 1x1 窗口放到目标显示器再取 DPI，避免沿用主显示器/旧窗口的 DPI。
+        ::SetWindowPos(hwnd, HWND_TOPMOST, monitor_info.rcWork.right - 1, monitor_info.rcWork.bottom - 1, 1, 1,
+                       SWP_NOACTIVATE);
         ::SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
         const float scale = dpi_scale(hwnd);
         const std::uint32_t panel_width = static_cast<std::uint32_t>(kBasePanelWidth * scale);
@@ -369,26 +405,25 @@ namespace gamesnap {
         SPDLOG_INFO("overlay 就绪: ImGui DX11 backend + DirectComposition");
         AudioPlayer audio;
 
-        MONITORINFO monitor_info{};
-        monitor_info.cbSize = sizeof(monitor_info);
-        const HMONITOR monitor = ::MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
-        ::GetMonitorInfoW(monitor, &monitor_info);
         const float margin = kBaseMargin * scale;
         const float visible_x = static_cast<float>(monitor_info.rcWork.right - panel_width) - margin;
         const float hidden_x = static_cast<float>(monitor_info.rcWork.right) + 8.0F;
         const int panel_y =
             monitor_info.rcWork.bottom - static_cast<int>(panel_height) - static_cast<int>(margin);
         float panel_x = hidden_x;
-        bool shown = false;
-        bool animating = false;
+        bool shown = true;
+        bool animating = true;
         float anim_from = hidden_x;
-        float anim_to = hidden_x;
-        std::chrono::steady_clock::time_point anim_start{};
+        float anim_to = visible_x;
+        const auto session_start = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point anim_start = session_start;
 
-        std::uint64_t last_trigger = bridge_->snapshot().trigger_serial;
+        const UiBridge::Snapshot initial_snapshot = bridge_->snapshot();
+        std::uint64_t last_trigger = initial_snapshot.trigger_serial;
         std::uint64_t last_info = 0;
-        auto last_trigger_time = std::chrono::steady_clock::now();
-        auto last_frame = std::chrono::steady_clock::now();
+        auto last_trigger_time = session_start;
+        auto last_frame = session_start;
+        audio.play();
 
         while (!stop_.load(std::memory_order_acquire)) {
             MSG message;
@@ -410,6 +445,7 @@ namespace gamesnap {
                 anim_from = panel_x;
                 anim_to = visible_x;
                 anim_start = now;
+                last_info = 0;
                 audio.play();
             }
 
@@ -431,11 +467,8 @@ namespace gamesnap {
                     animating = false;
             }
 
-            if (!want_visible && !shown && !animating && panel_x >= hidden_x - 1.0F) {
-                ::ShowWindow(hwnd, SW_HIDE);
-                std::this_thread::sleep_for(std::chrono::milliseconds(16));
-                continue;
-            }
+            if (!want_visible && !shown && !animating && panel_x >= hidden_x - 1.0F)
+                break;
 
             ::SetWindowPos(hwnd, HWND_TOPMOST, static_cast<int>(panel_x), panel_y,
                            static_cast<int>(panel_width), static_cast<int>(panel_height),

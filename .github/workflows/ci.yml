@@ -97,5 +97,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = "pre-${env:GITHUB_RUN_NUMBER}.${env:GITHUB_RUN_ATTEMPT}"
-          $notes = "Commit: $env:GITHUB_SHA`nRun: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
-          gh release create $tag --prerelease --target $env:GITHUB_SHA --title "Pre-release #$env:GITHUB_RUN_NUMBER" --notes $notes GameSnap-x64-Debug.7z GameSnap-x64-Release.7z
+          $branch = $env:GITHUB_REF_NAME
+          $title = "Pre-release #$env:GITHUB_RUN_NUMBER [$branch]"
+          $notes = "Branch: $branch`nCommit: $env:GITHUB_SHA`nRun: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          gh release create $tag --prerelease --target $env:GITHUB_SHA --title $title --notes $notes GameSnap-x64-Debug.7z GameSnap-x64-Release.7z

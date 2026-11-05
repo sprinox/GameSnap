@@ -26,11 +26,13 @@
 namespace gamesnap {
 
     class CaptureResources;
+    class UiBridge;
 
     // 一次截图的上下文，由 FrameSink 持有当前 shot。
     struct ShotContext {
         std::shared_ptr<D3DContext> d3d;
         std::shared_ptr<EncodeQueue> jobs;
+        std::shared_ptr<UiBridge> ui;
         std::shared_ptr<ID3D11Texture2D> staging;
         std::binary_semaphore done{0};                    // 回调处理完（或失败）后 release
         std::shared_ptr<std::atomic<bool>> canceled;      // 超时取消标记，和 EncodeJob 共享
@@ -119,7 +121,8 @@ namespace gamesnap {
         CaptureWorker(Config config,
                       std::shared_ptr<CommandQueue> commands,
                       std::shared_ptr<EncodeQueue> jobs,
-                      std::shared_ptr<StopSource> stop);
+                      std::shared_ptr<StopSource> stop,
+                      std::shared_ptr<UiBridge> ui);
 
         // 线程入口：所有资源都只在这个线程里创建/销毁。
         void run();
@@ -139,6 +142,7 @@ namespace gamesnap {
         std::shared_ptr<CommandQueue> commands_;
         std::shared_ptr<EncodeQueue> jobs_;
         std::shared_ptr<StopSource> stop_;
+        std::shared_ptr<UiBridge> ui_;
         moodycamel::ConsumerToken command_token_;
 
         // 当前“资源代”，只由 capture 线程读写。

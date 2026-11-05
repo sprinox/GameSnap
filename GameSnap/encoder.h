@@ -16,13 +16,15 @@ namespace gamesnap {
 
     class D3DContext;
     class ToneMapper;
+    class UiBridge;
 
     // 创建一块 CPU 可读的 staging 纹理（失败返回空）。
     std::shared_ptr<ID3D11Texture2D> create_staging_texture(ID3D11Device* device, D3D11_TEXTURE2D_DESC const& desc);
 
     class EncodeWorkers {
     public:
-        EncodeWorkers(std::filesystem::path output_dir, std::shared_ptr<EncodeQueue> jobs);
+        EncodeWorkers(std::filesystem::path output_dir, std::shared_ptr<EncodeQueue> jobs,
+                      std::shared_ptr<UiBridge> ui);
         ~EncodeWorkers();
 
         EncodeWorkers(const EncodeWorkers&) = delete;
@@ -40,6 +42,7 @@ namespace gamesnap {
 
         std::filesystem::path output_dir_;
         std::shared_ptr<EncodeQueue> jobs_;
+        std::shared_ptr<UiBridge> ui_;
         std::vector<std::thread> threads_;
         std::mutex mapper_mutex_;
         std::unique_ptr<ToneMapper> mapper_;

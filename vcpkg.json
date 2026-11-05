@@ -3,6 +3,7 @@
     "aom",
     "concurrentqueue",
     "cpptrace",
+    "cpu-features",
     "cxxopts",
     "fmt",
     {
@@ -18,6 +19,11 @@
     "spdlog",
     "x265",
     "yaml-cpp",
-    "cpu-features"
+    {
+      "name": "imgui",
+      "features": [
+        "dx11-binding"
+      ]
+    }
   ]
 }

@@ -32,6 +32,7 @@ GameSnap.exe --key printscreen --out D:\shots
 ## 文档
 
 - [架构与并发模型](docs/architecture.md)
+- [并发、锁与编码流水线审查](docs/concurrency.md)
 - [构建、静态检查与自检](docs/build.md)
 - [配置项与命令行参数](docs/config.md)
 

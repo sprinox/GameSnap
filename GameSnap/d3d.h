@@ -4,9 +4,9 @@
 // D3D11 设备上下文。每个“资源代(gen)”持有一个共享的 D3DContext：
 //   * 捕获线程用它做 CopyResource；
 //   * 编码线程用它做 Map/Unmap。
-// D3D11 的 immediate context 不是线程安全的，所以两者都通过 context_mutex() 串行化。
-// 只有 Map/Unmap 两个 context 调用需要串行化；Map 返回后的 CPU 读取不持锁，
-// Unmap 必须在资源再次被 GPU 使用前完成。
+// D3D11 的 immediate context 不是线程安全的，所以所有 context 调用
+// （CopyResource / Map / Unmap / Dispatch / GetData 等）都通过 context_mutex() 串行化。
+// Map 返回后的 CPU 读取不持锁；Unmap 必须在资源再次被 GPU 使用前完成。
 // 编码任务持有 shared_ptr<D3DContext>，因此设备重建时旧设备不会在使用中被释放。
 // ─────────────────────────────────────────────────────────────────────────────
 

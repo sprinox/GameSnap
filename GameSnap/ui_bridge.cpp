@@ -40,8 +40,17 @@ namespace gamesnap {
 
     }  // namespace
 
+    UiBridge::UiBridge() : trigger_event_(::CreateEventW(nullptr, FALSE, FALSE, nullptr)) {}
+
+    UiBridge::~UiBridge() {
+        if (trigger_event_ != nullptr)
+            ::CloseHandle(trigger_event_);
+    }
+
     void UiBridge::on_trigger() noexcept {
         trigger_serial_.fetch_add(1, std::memory_order_release);
+        if (trigger_event_ != nullptr)
+            ::SetEvent(trigger_event_);
     }
 
     void UiBridge::job_enqueued() noexcept {

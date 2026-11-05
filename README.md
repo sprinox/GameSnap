@@ -9,7 +9,7 @@ Windows 上的整显示器截图工具，面向低延迟：按下热键时不做
 - 每次截图新建 frame pool 与会话，D3D 设备、采集项、编码线程常驻
 - 每张图独立编码，多线程并行写盘；不依赖 WIC，编码使用 libavif / libwebp / libheif / spng / libjpeg-turbo
 - HDR 显示器以 FP16 捕获，同时输出 HDR + SDR 两份
-- HDR→SDR 使用 D3D11 compute shader（spline / lilium 调试），可选其它算法
+- HDR→SDR 使用 D3D11 compute shader（spline / analysis 调试），可选其它算法
 - 显示器拓扑变化、显卡热插拔、TDR 后自动重建
 - 输出 AVIF / HEIC / WebP / PNG / JPEG / BMP；AVIF/HEIC 支持 HDR
 

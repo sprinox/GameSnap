@@ -91,8 +91,8 @@ float spline_shoulder(float x)
     return h00 * white + h10 * slope0 + h01;
 }
 
-// lilium analysis 的简化版：按亮度做 false color，方便看 HDR 分布。
-float3 lilium_debug(float nits)
+// analysis 的简化版：按亮度做 false color，方便看 HDR 分布。
+float3 analysis_debug(float nits)
 {
     if (nits < 1.0) return float3(0.02, 0.02, 0.15);
     if (nits < 10.0) return float3(0.0, 0.0, 1.0);
@@ -131,7 +131,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 nits = bt2020_to_709(nits2020);
     float luma = dot(nits, float3(0.2126, 0.7152, 0.0722));
     if (Algo == 1) {
-        Out[tid.xy] = float4(lilium_debug(luma), 1.0);
+        Out[tid.xy] = float4(analysis_debug(luma), 1.0);
         return;
     }
 

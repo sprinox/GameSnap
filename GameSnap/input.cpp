@@ -55,14 +55,17 @@ namespace gamesnap {
     void InputThread::stop() {
         stop_.store(true, std::memory_order_release);
         const DWORD id = thread_id_.load(std::memory_order_acquire);
-        if (id != 0)
-            if (::PostThreadMessageW(id, WM_QUIT, 0, 0) == 0)
-                SPDLOG_DEBUG("PostThreadMessageW(WM_QUIT) 失败: {}", ::GetLastError());
+        if (id != 0 && ::PostThreadMessageW(id, WM_QUIT, 0, 0) == 0) {
+            const DWORD error = ::GetLastError();
+            if (error != ERROR_INVALID_THREAD_ID)
+                SPDLOG_DEBUG("PostThreadMessageW(WM_QUIT) 失败: {}", error);
+        }
     }
 
     void InputThread::join() {
         if (thread_.joinable())
             thread_.join();
+        thread_id_.store(0, std::memory_order_release);
     }
 
     void InputThread::run() {

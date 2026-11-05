@@ -44,15 +44,15 @@ sequenceDiagram
     U->>C: Command::Trigger
     C->>C: 新建 frame pool + 会话
     C->>P: StartCapture()
-    P->>P: 取帧，CopyResource 到 staging
+    P->>P: 取帧，HDR→DEFAULT+SRV / SDR→staging
     P->>E: EncodeJob（纹理 + 设备 + 描述）
     P-->>C: done 信号
     C->>C: Close 会话与 pool
-    E->>E: Map / Unmap，像素转换
+    E->>E: HDR GPU tone map；SDR / CPU fallback 才 Map
     E->>E: 写 BMP
 ```
 
-回调只做 GPU 侧工作，`Map/Unmap` 留给编码线程；`done` 只表示帧已经拷进 staging，不表示已经写盘。
+回调只做 GPU 侧工作，`Map/Unmap` 留给编码线程；`done` 只表示帧已经拷进目标纹理，不表示已经写盘。
 编码线程完成一张图后打印一条端到端延迟：
 
 ```text
@@ -108,7 +108,7 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 - 非 HDR：捕获纹理转 BGRA8，按 `format_sdr` 编码 BMP / PNG / JPEG / WebP / AVIF / HEIC。
 - HDR：同一帧写 `_HDR.<format_hdr>`（10-bit PQ/BT.2020 AVIF 或 HEIC）和 `_SDR.<format_sdr>`。
 - HDR 的 PQ OETF 与 SDR 色调映射在同一个 D3D11 compute dispatch 完成：FP16 → BT.2020 nit → PQ（HDR）；
-  同一 texel → BT.709 亮度 → Hermite shoulder（spline）→ sRGB（SDR）。`lilium` 是 false color 调试算法。
+  同一 texel → BT.709 亮度 → Hermite shoulder（spline）→ sRGB（SDR）。`analysis` 是 false color 调试算法。
 - ToneMapper 每个代只保留一份（编码线程共享，由 mapper mutex 串行）；GPU 用 `D3D11_QUERY_EVENT` 等待，
   等待期间不持 `context_mutex`，避免阻塞 capture 回调。
 - 编码大缓冲全进程只保留一份：编码线程 `try_lock` 取得，拿不到时本张图临时分配，任务结束立即释放。

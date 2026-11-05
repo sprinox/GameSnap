@@ -75,3 +75,17 @@ $llvm    = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\
 
 `// NOLINT(...)` 只用于无法避免的几类情况：Win32 的 `LPARAM` / `GWLP_USERDATA` 整数与指针转换、
 析构与 `noexcept` 收尾路径里的空 catch、fmt 的配置宏。
+
+
+## 一键构建脚本
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Configuration Release -Rebuild -Tidy -Selftest
+```
+
+- `-Format`：格式化 `GameSnap/*.h/*.cpp`
+- `-Tidy`：运行 clang-tidy
+- `-Selftest`：构建后运行 `--selftest`
+- `-Rebuild`：全量重建
+
+脚本会自动查找 MSBuild、clang-format、clang-tidy。

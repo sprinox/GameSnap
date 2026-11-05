@@ -91,6 +91,16 @@ namespace gamesnap {
             std::uint32_t height = kHeight;
         };
 
+        std::shared_ptr<ID3D11Texture2D> create_gpu_texture(ID3D11Device* device, D3D11_TEXTURE2D_DESC const& desc) {
+            winrt::com_ptr<ID3D11Texture2D> texture;
+            if (FAILED(device->CreateTexture2D(&desc, nullptr, texture.put())))
+                return {};
+            return std::shared_ptr<ID3D11Texture2D>{texture.detach(), [](ID3D11Texture2D* p) {
+                if (p != nullptr)
+                    p->Release();
+            }};
+        }
+
         bool run_case(Config const& config, std::shared_ptr<D3DContext> const& d3d, Case const& test_case) {
             SPDLOG_INFO("--- 自检用例: {} ---", test_case.label);
 
@@ -101,16 +111,21 @@ namespace gamesnap {
             desc.ArraySize = 1;
             desc.Format = test_case.format;
             desc.SampleDesc.Count = 1;
-            desc.Usage = D3D11_USAGE_STAGING;
-            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            const bool hdr_target = test_case.format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            desc.Usage = hdr_target ? D3D11_USAGE_DEFAULT : D3D11_USAGE_STAGING;
+            desc.BindFlags = hdr_target ? D3D11_BIND_SHADER_RESOURCE : 0;
+            desc.CPUAccessFlags = hdr_target ? 0 : D3D11_CPU_ACCESS_READ;
 
-            auto target = create_staging_texture(d3d->device(), desc);
+            auto target = hdr_target ? create_gpu_texture(d3d->device(), desc)
+                                     : create_staging_texture(d3d->device(), desc);
             if (!target) {
-                SPDLOG_ERROR("自检失败: 创建 staging 纹理失败");
+                SPDLOG_ERROR("自检失败: 创建目标纹理失败");
                 return false;
             }
 
             auto source_desc = desc;
+            source_desc.Usage = D3D11_USAGE_STAGING;
+            source_desc.BindFlags = 0;
             source_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
             winrt::com_ptr<ID3D11Texture2D> source;
             if (FAILED(d3d->device()->CreateTexture2D(&source_desc, nullptr, source.put()))) {
@@ -135,7 +150,7 @@ namespace gamesnap {
             }
 
             auto jobs = std::make_shared<EncodeQueue>();
-            EncodeWorkers workers(config.output_dir, jobs, {});
+            EncodeWorkers workers(config.output_dir, jobs, config.codec, {});
             workers.start(1);
 
             std::error_code ec;
@@ -144,11 +159,14 @@ namespace gamesnap {
                 before.push_back(entry.path());
 
             EncodeJob job;
-            job.texture = std::move(target);
+            auto texture_slot = std::make_shared<TextureSlot>();
+            texture_slot->texture = std::move(target);
+            texture_slot->hdr = hdr_target;
+            job.texture_slot = std::move(texture_slot);
             job.d3d = d3d;
             job.color_space = test_case.color_space;
             job.sdr_white_nits = test_case.sdr_white_nits;
-            job.hdr = config.hdr_capture && test_case.format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            job.hdr = test_case.format == DXGI_FORMAT_R16G16B16A16_FLOAT;
             job.hdr_format = config.hdr_format;
             job.sdr_format = config.sdr_format;
             job.tone_map = config.tone_map;
@@ -156,7 +174,11 @@ namespace gamesnap {
             job.title = L"GameSnap SelfTest";
             job.local_time = Clock::now();
             job.timings.input = SteadyClock::now();
+            job.timings.dequeued = job.timings.input;
+            job.timings.title_done = job.timings.input;
+            job.timings.prepared = job.timings.input;
             job.timings.start_capture = job.timings.input;
+            job.timings.start_capture_done = job.timings.input;
             job.timings.frame_received = job.timings.input;
             job.timings.copied = job.timings.input;
 
@@ -207,7 +229,7 @@ namespace gamesnap {
 
             SPDLOG_INFO("自检用例通过: {} 个文件", produced.size());
             return true;
-        }
+        }  // NOLINT(clang-analyzer-cplusplus.NewDeleteLeaks): custom shared_ptr deleter is opaque
 
     }  // namespace
 

@@ -13,13 +13,35 @@
 # 编码线程数（1..8）。截图在 capture 线程串行，转换/写盘按线程并行。
 encode_threads: 2
 
-# HDR 截图保存两份：HDR 容器 + SDR 格式；非 HDR 只保存 SDR。
+# HDR 由目标显示器动态决定；HDR 显示器保存 HDR 容器 + SDR 两份。
 # format_hdr 仅支持 avif / heic；format_sdr 支持 bmp / png / jpeg / webp / avif / heic。
-# bmp / png / webp 无损，jpeg 为 quality=100；avif 无损，heic 为最高质量有损。
 format_hdr: avif
 format_sdr: webp
 
-# HDR→SDR 色调映射算法：spline（默认，Hermite shoulder）或 lilium（调试 false color）。
+# ── 编码参数 ────────────────────────────────────────────────────────────────
+# PNG：compression 0..9，越大越慢、文件越小
+png_compression: 6
+
+# JPEG：quality 1..100
+jpeg_quality: 95
+
+# WebP：quality 0..100；lossless=true 时 quality 忽略；method 0..6，越大越慢
+webp_quality: 90
+webp_lossless: false
+webp_method: 4
+
+# AVIF：quality 0..100；lossless=true 时 quality 忽略；speed 0..10，越大越快
+avif_quality: 90
+avif_lossless: false
+avif_speed: 10
+
+# HEIC（x265）：quality 0..100；lossless=true 时 quality 忽略；
+# preset: ultrafast/superfast/veryfast/faster/fast/medium/slow/slower/veryslow
+heic_quality: 90
+heic_lossless: false
+heic_preset: fast
+
+# HDR→SDR 色调映射算法：spline（默认，Hermite shoulder）或 analysis（调试 false color）。
 tone_map: spline
 
 # ── 采集 ────────────────────────────────────────────────────────────────────
@@ -33,8 +55,7 @@ swallow: false
 # 截哪块屏：primary = 主显示器；foreground = 前台窗口所在显示器
 monitor: primary
 
-# HDR 显示器以 FP16 捕获；非 HDR 显示器开启会回退 SDR 捕获
-hdr: false
+# HDR 由目标显示器动态判断，无需配置。
 
 # ── 日志 ────────────────────────────────────────────────────────────────────
 # true = debug 级别日志（含每张图的排队 / 取帧 / 复制 / 转换 / 写盘耗时）

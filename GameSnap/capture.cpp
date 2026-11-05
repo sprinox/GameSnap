@@ -35,21 +35,6 @@ namespace gamesnap {
             }
         }
 
-        D3D11_TEXTURE2D_DESC make_staging_desc(std::uint32_t width, std::uint32_t height, DXGI_FORMAT format) {
-            D3D11_TEXTURE2D_DESC desc{};
-            desc.Width = width;
-            desc.Height = height;
-            desc.MipLevels = 1;
-            desc.ArraySize = 1;
-            desc.Format = format;
-            desc.SampleDesc.Count = 1;
-            desc.Usage = D3D11_USAGE_STAGING;
-            desc.BindFlags = 0;
-            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            desc.MiscFlags = 0;
-            return desc;
-        }
-
         // WGC 帧的真实描述可能和创建时不同（旋转屏、驱动做格式转换等），
         // 这里只保留尺寸/格式，其余改成可 CPU 读取的 staging 用法。
         D3D11_TEXTURE2D_DESC make_staging_desc_from(D3D11_TEXTURE2D_DESC const& source) {
@@ -65,6 +50,34 @@ namespace gamesnap {
             desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
             desc.MiscFlags = 0;
             return desc;
+        }
+
+        // HDR 帧只给 GPU tone mapper 用：DEFAULT + SRV 可以直接绑定，
+        // 不再在 tonemap 里整帧 CopyResource 到 input_。
+        D3D11_TEXTURE2D_DESC make_gpu_desc_from(D3D11_TEXTURE2D_DESC const& source) {
+            D3D11_TEXTURE2D_DESC desc{};
+            desc.Width = source.Width;
+            desc.Height = source.Height;
+            desc.MipLevels = 1;
+            desc.ArraySize = 1;
+            desc.Format = source.Format;
+            desc.SampleDesc.Count = 1;
+            desc.Usage = D3D11_USAGE_DEFAULT;
+            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            desc.CPUAccessFlags = 0;
+            desc.MiscFlags = 0;
+            return desc;
+        }
+
+        std::shared_ptr<ID3D11Texture2D> create_gpu_texture(ID3D11Device* device,
+                                                            D3D11_TEXTURE2D_DESC const& desc) {
+            winrt::com_ptr<ID3D11Texture2D> texture;
+            if (FAILED(device->CreateTexture2D(&desc, nullptr, texture.put())))
+                return {};
+            return std::shared_ptr<ID3D11Texture2D>{texture.detach(), [](ID3D11Texture2D* p) {
+                if (p != nullptr)
+                    p->Release();
+            }};
         }
 
         // 前台窗口标题，用作文件名前缀；拿不到就由编码侧回退到 GameSnap。
@@ -84,19 +97,21 @@ namespace gamesnap {
             return title;
         }
 
-        bool staging_matches(ID3D11Texture2D& texture, D3D11_TEXTURE2D_DESC const& desc) {
+        bool texture_matches(ID3D11Texture2D& texture, D3D11_TEXTURE2D_DESC const& desc) {
             D3D11_TEXTURE2D_DESC actual{};
             texture.GetDesc(&actual);
-            return actual.Width == desc.Width && actual.Height == desc.Height && actual.Format == desc.Format;
+            return actual.Width == desc.Width && actual.Height == desc.Height &&
+                   actual.Format == desc.Format && actual.Usage == desc.Usage &&
+                   actual.BindFlags == desc.BindFlags;
         }
 
-        // 主 staging 占用标记的 RAII：成功交给 job 前，任何提前返回/异常都会释放。
+        // 纹理槽的 RAII：成功交给 job 前，任何提前返回/异常都会释放占用。
         struct BusyLease {
-            explicit BusyLease(std::shared_ptr<std::atomic<bool>> busy_) : busy(std::move(busy_)) {}
-            std::shared_ptr<std::atomic<bool>> busy;
+            explicit BusyLease(std::shared_ptr<TextureSlot> slot_) : slot(std::move(slot_)) {}
+            std::shared_ptr<TextureSlot> slot;
             ~BusyLease() {
-                if (busy)
-                    busy->store(false, std::memory_order_release);
+                if (slot)
+                    slot->busy.store(false, std::memory_order_release);
             }
             BusyLease(BusyLease const&) = delete;
             BusyLease& operator=(BusyLease const&) = delete;
@@ -137,32 +152,35 @@ namespace gamesnap {
             D3D11_TEXTURE2D_DESC desc{};
             source->GetDesc(&desc);
 
-            const auto staging_desc = make_staging_desc_from(desc);
-            std::shared_ptr<ID3D11Texture2D> texture;
-            std::shared_ptr<std::atomic<bool>> busy;
-            // 用显式占用标记复用主纹理；编码线程 Map 完会立刻清标记，
-            // 不依赖 shared_ptr::use_count（标准不保证它可作为同步依据）。
-            if (shot.staging && shot.staging_busy && staging_matches(*shot.staging, staging_desc) &&
-                !shot.staging_busy->exchange(true, std::memory_order_acq_rel)) {
-                SPDLOG_DEBUG("复用旧纹理");
-                texture = shot.staging;
-                busy = shot.staging_busy;
+            const D3D11_TEXTURE2D_DESC wanted =
+                shot.hdr ? make_gpu_desc_from(desc) : make_staging_desc_from(desc);
+            std::shared_ptr<TextureSlot> slot;
+            if (shot.cache.slot && shot.cache.slot->texture && shot.cache.slot->hdr == shot.hdr &&
+                texture_matches(*shot.cache.slot->texture, wanted) &&
+                !shot.cache.slot->busy.exchange(true, std::memory_order_acq_rel)) {
+                SPDLOG_DEBUG("复用 {} 纹理", shot.hdr ? "HDR" : "SDR");
+                slot = shot.cache.slot;
             } else {
-                SPDLOG_DEBUG("创建新纹理");
-                texture = create_staging_texture(shot.d3d->device(), staging_desc);
+                SPDLOG_DEBUG("创建新 {} 纹理", shot.hdr ? "HDR" : "SDR");
+                slot = std::make_shared<TextureSlot>();
+                slot->hdr = shot.hdr;
+                slot->texture = shot.hdr ? create_gpu_texture(shot.d3d->device(), wanted)
+                                         : create_staging_texture(shot.d3d->device(), wanted);
+                slot->busy.store(true, std::memory_order_release);
             }
-            if (!texture) {
+            if (!slot || !slot->texture) {
                 shot.failed.store(true, std::memory_order_release);
                 frame.Close();
-                SPDLOG_ERROR("创建 staging 纹理失败 ({}x{}, fmt={})",
-                             desc.Width, desc.Height, static_cast<int>(desc.Format));
+                SPDLOG_ERROR("创建 {} 纹理失败 ({}x{}, fmt={})",
+                             shot.hdr ? "HDR" : "staging", desc.Width, desc.Height,
+                             static_cast<int>(desc.Format));
                 return;
             }
-            BusyLease lease{busy};
+            BusyLease lease{slot};
 
             {
                 std::scoped_lock lock(shot.d3d->context_mutex());
-                shot.d3d->context()->CopyResource(texture.get(), source.get());
+                shot.d3d->context()->CopyResource(slot->texture.get(), source.get());
             }
             frame.Close();
             // CopyResource 没有 HRESULT；TDR/拔卡时可能静默失败。GetDeviceRemovedReason 是
@@ -182,10 +200,9 @@ namespace gamesnap {
                          duration_ms(copied - received));
 
             EncodeJob job;
-            job.texture = std::move(texture);
+            job.texture_slot = slot;
             job.d3d = shot.d3d;
             job.canceled = shot.canceled;
-            job.staging_busy = busy;
             job.hdr = shot.hdr;
             job.hdr_format = shot.hdr_format;
             job.sdr_format = shot.sdr_format;
@@ -196,12 +213,15 @@ namespace gamesnap {
             job.title = std::move(shot.title);
             job.local_time = Clock::now();
             job.timings.input = shot.enqueued;
+            job.timings.dequeued = shot.dequeued;
+            job.timings.title_done = shot.title_done;
+            job.timings.prepared = shot.prepared;
             job.timings.start_capture = shot.start_call;
+            job.timings.start_capture_done = shot.start_capture_done;
             job.timings.frame_received = received;
             job.timings.copied = copied;
 
             // 先让 job 持有占用标记；只有真正入队成功后才把 lease 的所有权交出去。
-            job.staging_busy = busy;
             if (shot.canceled->load(std::memory_order_acquire))
                 return;  // lease 析构时释放 busy
             if (shot.ui)
@@ -212,7 +232,7 @@ namespace gamesnap {
                 SPDLOG_WARN("编码队列入队失败，丢弃本次截图");
                 return;  // lease 析构时释放 busy
             }
-            lease.busy.reset();
+            lease.slot.reset();
         }
 
         // 初始化结束时放开就绪闩锁（成功/失败/异常都走析构）。
@@ -519,7 +539,7 @@ namespace gamesnap {
             resources_->close();
             resources_.reset();
         }
-        staging_.reset();
+        texture_cache_ = {};
         d3d_.reset();
         SPDLOG_INFO("capture 线程退出");
     }
@@ -541,7 +561,7 @@ namespace gamesnap {
     }
 
     bool CaptureWorker::ensure_ready(ReloadReason reason) {
-        if (!resources_ || !d3d_ || !staging_)
+        if (!resources_ || !d3d_)
             return rebuild(ReloadReason::Startup);
 
         if (d3d_->device_removed()) {
@@ -612,9 +632,7 @@ namespace gamesnap {
             return false;
         }
 
-        const bool hdr = config_.hdr_capture && display.hdr;
-        if (config_.hdr_capture && !display.hdr)
-            SPDLOG_WARN("--hdr 已开启，但目标显示器不是 HDR：按 SDR 捕获");
+        const bool hdr = display.hdr;
 
         const auto format = hdr ? winrt::DirectXPixelFormat::R16G16B16A16Float
                                 : winrt::DirectXPixelFormat::B8G8R8A8UIntNormalized;
@@ -624,17 +642,7 @@ namespace gamesnap {
             SPDLOG_ERROR("{}", error);
             return false;
         }
-
         const auto size = resources->item_size();
-        const auto desc = make_staging_desc(
-            static_cast<std::uint32_t>(size.Width), static_cast<std::uint32_t>(size.Height), dxgi_format_of(format));
-
-        auto staging = create_staging_texture(d3d->device(), desc);
-        if (!staging) {
-            SPDLOG_ERROR("创建 staging 纹理失败");
-            resources->close();
-            return false;
-        }
 
         // 3) 全部成功后再替换，旧的一代最后关闭。
         if (resources_) {
@@ -643,21 +651,46 @@ namespace gamesnap {
         }
         d3d_ = std::move(d3d);
         resources_ = std::move(resources);
-        staging_ = std::move(staging);
-        staging_busy_ = std::make_shared<std::atomic<bool>>(false);
+        texture_cache_ = {};
+        {
+            const auto wanted = hdr ? make_gpu_desc_from(D3D11_TEXTURE2D_DESC{
+                                                 .Width = static_cast<UINT>(size.Width),
+                                                 .Height = static_cast<UINT>(size.Height),
+                                                 .MipLevels = 1,
+                                                 .ArraySize = 1,
+                                                 .Format = dxgi_format_of(format),
+                                                 .SampleDesc = {.Count = 1}})
+                                   : make_staging_desc_from(D3D11_TEXTURE2D_DESC{
+                                                 .Width = static_cast<UINT>(size.Width),
+                                                 .Height = static_cast<UINT>(size.Height),
+                                                 .MipLevels = 1,
+                                                 .ArraySize = 1,
+                                                 .Format = dxgi_format_of(format),
+                                                 .SampleDesc = {.Count = 1}});
+            auto texture = hdr ? create_gpu_texture(d3d_->device(), wanted)
+                               : create_staging_texture(d3d_->device(), wanted);
+            if (texture) {
+                auto slot = std::make_shared<TextureSlot>();
+                slot->texture = std::move(texture);
+                slot->hdr = hdr;
+                texture_cache_.slot = std::move(slot);
+            }
+        }
         display_ = display;
         monitor_ = display.monitor;
         ++generation_;
 
         SPDLOG_INFO("捕获资源就绪: 代 #{}，{}x{}，{}",
-                    generation_, desc.Width, desc.Height,
+                    generation_, size.Width, size.Height,
                     hdr ? "FP16 捕获(HDR→SDR)" : "BGRA8");
         return true;
     }
 
     void CaptureWorker::shot(Command const& command) {
+        const auto dequeued = SteadyClock::now();
         // 热路径上不做完整自检：资源缺失就建，StartCapture 失败再走重建。
-        if (!resources_ || !d3d_ || !staging_) {
+        const bool hdr = display_.hdr;
+        if (!resources_ || !d3d_) {
             if (!rebuild(ReloadReason::Startup))
                 return;
         }
@@ -672,21 +705,23 @@ namespace gamesnap {
         shot->d3d = d3d_;
         shot->jobs = jobs_;
         shot->ui = ui_;
-        shot->staging = staging_;
-        shot->staging_busy = staging_busy_;
+        shot->cache = texture_cache_;
         shot->canceled = std::make_shared<std::atomic<bool>>(false);
         shot->enqueued = command.enqueued;
         shot->sequence = ++sequence_;
+        shot->dequeued = dequeued;
         shot->title = foreground_window_title();
+        shot->title_done = SteadyClock::now();
         shot->color_space = display_.color_space;
         shot->sdr_white_nits = display_.sdr_white_nits;
-        shot->hdr = config_.hdr_capture && display_.hdr;
+        shot->hdr = hdr;
         shot->hdr_format = config_.hdr_format;
         shot->sdr_format = config_.sdr_format;
         shot->tone_map = config_.tone_map;
 
         try {
             resources_->prepare();
+            shot->prepared = SteadyClock::now();
         } catch (winrt::hresult_error const& e) {
             SPDLOG_ERROR("准备捕获会话失败: {}", describe_hresult(e.code()));
             // 会话已不可信；即使 rebuild 失败，也不要让下一张继续用坏资源。
@@ -702,6 +737,7 @@ namespace gamesnap {
         sink->arm(shot);
         try {
             resources_->start_capture();
+            shot->start_capture_done = SteadyClock::now();
         } catch (winrt::hresult_error const& e) {
             SPDLOG_ERROR("StartCapture 失败: {}", describe_hresult(e.code()));
             sink->disarm();
@@ -722,18 +758,26 @@ namespace gamesnap {
             SPDLOG_ERROR("[#{:04}] FrameArrived 回调未退出，放弃当前资源代", shot->sequence);
             resources_->abandon();
             resources_.reset();
-            staging_.reset();
+            texture_cache_ = {};
             return;
         }
         if (shot->failed.load(std::memory_order_acquire)) {
             SPDLOG_WARN("[#{:04}] 帧拷贝失败（设备移除/TDR），重建资源", shot->sequence);
             resources_->close();
             resources_.reset();
-            staging_.reset();
+            texture_cache_ = {};
             rebuild(ReloadReason::DeviceRemoved);
             return;
         }
         resources_->stop_capture();
+        // pool/session 已在上一张结束后重建好，下一次热键只做 arm + StartCapture。
+        try {
+            resources_->prepare();
+        } catch (winrt::hresult_error const& e) {
+            SPDLOG_WARN("预创建下一张 capture pool/session 失败: {}", describe_hresult(e.code()));
+            resources_->close();
+            resources_.reset();
+        }
     }
 
 }  // namespace gamesnap

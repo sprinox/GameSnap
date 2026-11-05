@@ -104,7 +104,11 @@ namespace gamesnap {
     // 一次截图在各阶段的时刻，用来统计“按键 → 落盘”的端到端延迟。
     struct ShotTimings {
         SteadyClock::time_point input;           // 热键事件进入命令队列
+        SteadyClock::time_point dequeued;        // 截图线程取出命令
+        SteadyClock::time_point title_done;      // 前台窗口标题读取完成
+        SteadyClock::time_point prepared;        // frame pool / session 准备完成
         SteadyClock::time_point start_capture;   // 调用 StartCapture
+        SteadyClock::time_point start_capture_done;  // StartCapture 返回
         SteadyClock::time_point frame_received;  // 拿到帧的时刻
         SteadyClock::time_point copied;          // CopyResource 完成
     };
@@ -179,10 +183,10 @@ namespace gamesnap {
         UINT hotkey_modifiers = 0;    // 修饰键组合
         bool hotkey_swallow = false;  // 是否吞掉热键（默认不吞，游戏仍能收到）
         MonitorChoice monitor = MonitorChoice::Primary;
-        bool hdr_capture = false;                    // HDR 显示器以 FP16 捕获，再色调映射到 SDR 输出
         ImageFormat hdr_format = ImageFormat::Avif;  // HDR 输出容器（仅 avif/heic）
         ImageFormat sdr_format = ImageFormat::Webp;  // SDR 输出格式
         ToneMapAlgorithm tone_map = ToneMapAlgorithm::Spline;
+        CodecOptions codec;
         bool verbose = false;
         bool selftest = false;  // 不经过 WGC，用合成纹理验证编码链路
     };

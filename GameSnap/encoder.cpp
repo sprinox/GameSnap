@@ -29,7 +29,7 @@ namespace gamesnap {
                 if (invalid)
                     ch = L'_';
             }
-            const auto first = title.find_first_not_of(L" .");
+            const auto first = title.find_first_not_of(L" ."); // 把字符串开头和结尾的“空格”和“点”全部删掉
             const auto last = title.find_last_not_of(L" .");
             if (first == std::wstring::npos)
                 title.clear();
@@ -49,9 +49,20 @@ namespace gamesnap {
         }
 
         // 文件名：<标题>_YYYYMMDD_HHMMSS_mmm_序号[_HDR|_SDR].<ext>
+        std::string exif_date_time(Clock::time_point time) {
+            const auto local = std::chrono::zoned_time(std::chrono::current_zone(), time).get_local_time();
+            const auto days = std::chrono::floor<std::chrono::days>(local);
+            const std::chrono::year_month_day date{days};
+            const std::chrono::hh_mm_ss clock{local - days};
+            return fmt::format("{:04}:{:02}:{:02} {:02}:{:02}:{:02}",
+                               static_cast<int>(date.year()), static_cast<unsigned>(date.month()),
+                               static_cast<unsigned>(date.day()), clock.hours().count(),
+                               clock.minutes().count(), clock.seconds().count());
+        }
+
         std::filesystem::path make_output_path(std::filesystem::path const& dir, Clock::time_point time,
                                                std::wstring title, std::uint64_t sequence,
-                                               std::string_view extension, std::string_view suffix) {
+                                               std::wstring_view extension, std::wstring_view suffix) {
             // fmt 没有 zoned_time 的 formatter，用 C++20 chrono 拆出本地日期/时间再格式化。
             const auto local = std::chrono::zoned_time(std::chrono::current_zone(), time).get_local_time();
             const auto days = std::chrono::floor<std::chrono::days>(local);
@@ -67,10 +78,9 @@ namespace gamesnap {
             std::wstring name = sanitize_filename(std::move(title)) + L"_" + utf8_to_wstring(stamp);
             if (!suffix.empty()) {
                 name += L"_";
-                name += utf8_to_wstring(suffix);
+                name += suffix;
             }
-            name += L".";
-            name += utf8_to_wstring(extension);
+            name += extension;
             return dir / name;
         }
 
@@ -109,11 +119,8 @@ namespace gamesnap {
         }
 
         // ── staging 纹理 → CPU 像素 ──────────────────────────────────────────
-        struct RawCopy {
-            std::vector<std::uint8_t> bytes;
-            std::uint32_t width = 0;
-            std::uint32_t height = 0;
-            std::uint32_t stride = 0;
+        // RawCopy 就是 Image 加一个源 DXGI 格式；不要重复维护宽高/stride。
+        struct RawCopy : Image {
             DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
             bool alpha_normalized = false;
         };
@@ -135,6 +142,50 @@ namespace gamesnap {
             return pool;
         }
 
+        struct ToneLut {
+            bool pq = false;
+            std::uint32_t white = 0;
+            std::array<std::uint8_t, kToneLutSize> values{};
+        };
+
+        struct ToneLutCache {
+            std::mutex mutex;
+            std::shared_ptr<const ToneLut> current;
+        };
+
+        ToneLutCache& tone_lut_cache() {
+            static ToneLutCache cache;
+            return cache;
+        }
+
+        void release_tone_lut() {
+            auto& cache = tone_lut_cache();
+            std::scoped_lock lock(cache.mutex);
+            cache.current.reset();
+        }
+
+        // SDR 后不再保留下一次 HDR 才需要的大缓冲。
+        struct ScratchTrim {
+            ScratchTrim(EncodeScratch& scratch_, bool keep_hdr_) : scratch(scratch_), keep_hdr(keep_hdr_) {}
+            ~ScratchTrim() noexcept {
+                if (keep_hdr)
+                    return;
+                try {
+                    scratch.hdr10.clear();
+                    scratch.hdr10.shrink_to_fit();
+                    scratch.raw.pixels.clear();
+                    scratch.raw.pixels.shrink_to_fit();
+                } catch (...) {  // NOLINT(bugprone-empty-catch): 析构不能抛
+                }
+            }
+            EncodeScratch& scratch;
+            bool keep_hdr = false;
+            ScratchTrim(ScratchTrim const&) = delete;
+            ScratchTrim& operator=(ScratchTrim const&) = delete;
+            ScratchTrim(ScratchTrim&&) = delete;
+            ScratchTrim& operator=(ScratchTrim&&) = delete;
+        };
+
         // 统一成 32bpp BGRA（Image 定义在 image.h）。
 
         std::uint32_t bytes_per_pixel(DXGI_FORMAT format) {
@@ -152,10 +203,31 @@ namespace gamesnap {
         }
 
         // GPU→CPU：在编码线程里 Map staging、逐行拷到紧凑缓冲、再 Unmap。
-        // 锁只覆盖 Map/Unmap 两个 context 调用；读取映射内存是普通 CPU 访问，可以在锁外并行。
+        // HDR 现在直接使用 DEFAULT+SRV，不能 Map；只有 CPU fallback 时才创建一块 staging
+        // 并做一次 CopyResource，正常 GPU 路径没有这次拷贝。
         bool map_to_cpu(D3DContext& d3d, ID3D11Texture2D* texture, RawCopy& raw, std::string& error) {
             D3D11_TEXTURE2D_DESC desc{};
             texture->GetDesc(&desc);
+
+            std::shared_ptr<ID3D11Texture2D> readback;
+            if (desc.Usage != D3D11_USAGE_STAGING) {
+                D3D11_TEXTURE2D_DESC read_desc = desc;
+                read_desc.Usage = D3D11_USAGE_STAGING;
+                read_desc.BindFlags = 0;
+                read_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                read_desc.MiscFlags = 0;
+                readback = create_staging_texture(d3d.device(), read_desc);
+                if (!readback) {
+                    error = "创建 HDR 回读 staging 失败";
+                    return false;
+                }
+                {
+                    std::scoped_lock lock(d3d.context_mutex());
+                    d3d.context()->CopyResource(readback.get(), texture);
+                }
+                texture = readback.get();
+                texture->GetDesc(&desc);
+            }
             const std::uint32_t bpp = bytes_per_pixel(desc.Format);
             if (desc.Width == 0 || desc.Height == 0 || bpp == 0) {
                 error = fmt::format("不支持的 staging 纹理: {}x{} fmt={}",
@@ -169,7 +241,7 @@ namespace gamesnap {
             raw.format = desc.Format;
             raw.alpha_normalized = desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
                                    desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-            raw.bytes.resize(static_cast<std::size_t>(raw.stride) * raw.height);
+            raw.pixels.resize(static_cast<std::size_t>(raw.stride) * raw.height);
 
             D3D11_MAPPED_SUBRESOURCE mapped{};
             const auto map_deadline = SteadyClock::now() + std::chrono::seconds(5);
@@ -191,10 +263,10 @@ namespace gamesnap {
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
-            for (std::uint32_t y = 0; y < raw.height; ++y) {
+            for (std::size_t y = 0; y < raw.height; ++y) {
                 auto const* src = static_cast<const std::uint8_t*>(mapped.pData) +
-                                  (static_cast<std::size_t>(y) * mapped.RowPitch);
-                auto* dst = raw.bytes.data() + (static_cast<std::size_t>(y) * raw.stride);
+                                  y * mapped.RowPitch;
+                auto* dst = raw.pixels.data() + y * raw.stride;
                 if (raw.alpha_normalized)
                     bgra_copy_set_alpha_row(src, dst, raw.width);
                 else
@@ -221,7 +293,7 @@ namespace gamesnap {
 
             // SDR + BGRA：直接搬缓冲，但统一 alpha 为 255（截图不需要窗口 alpha）。
             if (is_bgra) {
-                out.pixels.swap(raw.bytes);
+                out.pixels.swap(raw.pixels);
                 if (!raw.alpha_normalized) {
                     for (std::uint32_t y = 0; y < out.height; ++y) {
                         auto* row = out.pixels.data() + static_cast<std::size_t>(y) * out.stride;
@@ -235,7 +307,7 @@ namespace gamesnap {
 
             if (is_rgba) {
                 for (std::uint32_t y = 0; y < raw.height; ++y) {
-                    const std::uint8_t* src = raw.bytes.data() + (static_cast<std::size_t>(y) * raw.stride);
+                    const std::uint8_t* src = raw.pixels.data() + (static_cast<std::size_t>(y) * raw.stride);
                     std::uint8_t* dst = out.pixels.data() + (static_cast<std::size_t>(y) * out.stride);
                     for (std::uint32_t x = 0; x < raw.width; ++x) {
                         const std::uint8_t* p = src + (static_cast<std::size_t>(x) * 4);
@@ -259,39 +331,41 @@ namespace gamesnap {
             // PQ 的输入域是 [0,1]；scRGB 统一按 [0,4] 采样，超出部分当作白色。
             const float domain = is_pq ? 1.0F : 4.0F;
 
-            // LUT 只依赖 (PQ/scRGB, SDR 白点)；编码线程复用，避免每张回退图重算 32K 次 pow。
-            struct LutCache {
-                bool valid = false;
-                bool pq = false;
-                std::uint32_t white = 0;
-                std::array<std::uint8_t, kToneLutSize> lut{};
-            };
-            thread_local LutCache cache;
+            // LUT 只依赖 (PQ/scRGB, SDR 白点)；全进程一份，用 shared_ptr 读取。
+            auto& lut_cache = tone_lut_cache();
             const std::uint32_t white_key = std::max<std::uint32_t>(sdr_white_nits, 1);
-            if (!cache.valid || cache.pq != is_pq || cache.white != white_key) {
-                for (std::size_t i = 0; i < kToneLutSize; ++i) {
-                    const float value = static_cast<float>(i) / static_cast<float>(kToneLutSize - 1) * domain;
-                    const float linear = is_pq ? (pq_to_nits(value) / sdr_white)
-                                               : (value * 80.0F / sdr_white);
-                    cache.lut[i] = linear_to_srgb8(linear);
+            std::shared_ptr<const ToneLut> lut;
+            {
+                std::scoped_lock lock(lut_cache.mutex);
+                if (!lut_cache.current || lut_cache.current->pq != is_pq ||
+                    lut_cache.current->white != white_key) {
+                    auto next = std::make_shared<ToneLut>();
+                    next->pq = is_pq;
+                    next->white = white_key;
+                    for (std::size_t i = 0; i < kToneLutSize; ++i) {
+                        const float value =
+                            static_cast<float>(i) / static_cast<float>(kToneLutSize - 1) * domain;
+                        const float linear = is_pq ? (pq_to_nits(value) / sdr_white)
+                                                   : (value * 80.0F / sdr_white);
+                        next->values[i] = linear_to_srgb8(linear);
+                    }
+                    lut_cache.current = std::move(next);
                 }
-                cache.valid = true;
-                cache.pq = is_pq;
-                cache.white = white_key;
+                lut = lut_cache.current;
             }
-            const auto& lut = cache.lut;
-            const auto sample = [&lut, domain](float value) -> std::uint8_t {
+            const auto& table = lut->values;
+            const auto sample = [&table, domain](float value) -> std::uint8_t {
                 if (!(value > 0.0F))  // 同时拦掉 NaN
                     return 0;
                 if (value >= domain)
-                    return lut.back();
+                    return table.back();
                 const auto index = static_cast<std::size_t>(value / domain * (kToneLutSize - 1));
-                return lut[index];
+                return table[index];
             };
 
             std::vector<float> row_floats(static_cast<std::size_t>(raw.width) * 4);
             for (std::uint32_t y = 0; y < raw.height; ++y) {
-                const auto* src = reinterpret_cast<const std::uint16_t*>(raw.bytes.data() + (static_cast<std::size_t>(y) * raw.stride));
+                const auto* src = reinterpret_cast<const std::uint16_t*>(raw.pixels.data() + (static_cast<std::size_t>(y) * raw.stride));
                 half_to_float_row(src, row_floats.data(), static_cast<std::size_t>(raw.width) * 4);
                 std::uint8_t* dst = out.pixels.data() + (static_cast<std::size_t>(y) * out.stride);
                 for (std::uint32_t x = 0; x < raw.width; ++x) {
@@ -328,8 +402,11 @@ namespace gamesnap {
     // ── EncodeWorkers ────────────────────────────────────────────────────────
 
     EncodeWorkers::EncodeWorkers(std::filesystem::path output_dir, std::shared_ptr<EncodeQueue> jobs,
-                                 std::shared_ptr<UiBridge> ui)
-        : output_dir_(std::move(output_dir)), jobs_(std::move(jobs)), ui_(std::move(ui)) {}
+                                 CodecOptions options, std::shared_ptr<UiBridge> ui)
+        : output_dir_(std::move(output_dir)), jobs_(std::move(jobs)), ui_(std::move(ui)),
+          options_(options) {
+        set_codec_options(options_);
+    }
 
     EncodeWorkers::~EncodeWorkers() {
         stop();
@@ -366,7 +443,7 @@ namespace gamesnap {
     }
 
     void EncodeWorkers::worker_main(std::size_t index) {
-        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_LOWEST);
         const std::wstring thread_name = utf8_to_wstring(fmt::format("GameSnap.Encode.{}", index));
         ::SetThreadDescription(::GetCurrentThread(), thread_name.c_str());
 
@@ -407,15 +484,16 @@ namespace gamesnap {
             }
         };
         const UiJobGuard ui_job_guard{ui_.get()};
+        set_codec_options(options_);
 
         // 主 staging 的占用标记由这里释放；提前返回/异常也会释放。
         struct BusyGuard {
-            explicit BusyGuard(std::shared_ptr<std::atomic<bool>> busy_) : busy(std::move(busy_)) {}
-            std::shared_ptr<std::atomic<bool>> busy;
+            explicit BusyGuard(std::shared_ptr<TextureSlot> slot_) : slot(std::move(slot_)) {}
+            std::shared_ptr<TextureSlot> slot;
             void release() {
-                if (busy) {
-                    busy->store(false, std::memory_order_release);
-                    busy.reset();
+                if (slot) {
+                    slot->busy.store(false, std::memory_order_release);
+                    slot.reset();
                 }
             }
             ~BusyGuard() { release(); }
@@ -423,12 +501,11 @@ namespace gamesnap {
             BusyGuard& operator=(BusyGuard const&) = delete;
             BusyGuard(BusyGuard&&) = delete;
             BusyGuard& operator=(BusyGuard&&) = delete;
-        } guard{job.staging_busy};
-        job.staging_busy.reset();
+        } guard{job.texture_slot};
 
         if (job.canceled && job.canceled->load(std::memory_order_acquire))
             return;
-        if (!job.d3d || !job.texture) {
+        if (!job.d3d || !job.texture_slot || !job.texture_slot->texture) {
             SPDLOG_WARN("[#{:04}] 非法的编码任务", job.sequence);
             return;
         }
@@ -441,15 +518,24 @@ namespace gamesnap {
         RawCopy& raw = scratch.raw;
         Image& sdr = scratch.sdr;
         std::vector<std::uint16_t>& hdr10 = scratch.hdr10;
-        raw.bytes.clear();
+        ScratchTrim trim{scratch, job.hdr};
+        if (!job.hdr) {
+            release_tone_lut();
+            std::scoped_lock mapper_lock(mapper_mutex_);
+            mapper_.reset();
+            mapper_owner_ = nullptr;
+        }
+        raw.pixels.clear();
         sdr.pixels.clear();
         hdr10.clear();
+        sdr.metadata.title = wstring_to_utf8(job.title);
+        sdr.metadata.date_time = exif_date_time(job.local_time);
         std::string error;
         D3D11_TEXTURE2D_DESC texture_desc{};
-        job.texture->GetDesc(&texture_desc);
+        job.texture_slot->texture->GetDesc(&texture_desc);
 
-        // HDR 优先走 GPU：mapper 内部先 CopyResource，再 dispatch/readback。
-        // 只有它失败时才需要把 staging 读完再走 CPU 回退。
+        // HDR 优先走 GPU：mapper 直接采样 DEFAULT+SRV 纹理，fence/event 等待 GPU 完成。
+        // 只有它失败时才把 DEFAULT 纹理回读到 staging，再走 CPU 回退。
         bool gpu_ok = false;
         if (job.hdr) {
             std::scoped_lock mapper_lock(mapper_mutex_);
@@ -460,7 +546,7 @@ namespace gamesnap {
                     SPDLOG_WARN("tone mapper 初始化失败: {}", mapper_->init_error());
             }
             if (mapper_->ok()) {
-                gpu_ok = mapper_->map(job.texture.get(), job.color_space, job.sdr_white_nits,
+                gpu_ok = mapper_->map(job.texture_slot->texture.get(), job.color_space, job.sdr_white_nits,
                                       job.tone_map, sdr, hdr10, error);
                 if (!gpu_ok)
                     SPDLOG_WARN("[#{:04}] compute tone map 失败，回退 CPU: {}", job.sequence, error);
@@ -468,7 +554,7 @@ namespace gamesnap {
         }
 
         if (!gpu_ok) {
-            if (!map_to_cpu(*job.d3d, job.texture.get(), raw, error)) {
+            if (!map_to_cpu(*job.d3d, job.texture_slot->texture.get(), raw, error)) {
                 SPDLOG_ERROR("[#{:04}] 取像素失败: {}", job.sequence, error);
                 return;
             }
@@ -489,19 +575,20 @@ namespace gamesnap {
         if (job.hdr) {
             ImageFormat hdr_format = format_supports_hdr(job.hdr_format) ? job.hdr_format : ImageFormat::Avif;
             const auto hdr_path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
-                                                   image_extension(hdr_format), "HDR");
+                                                   image_extension(hdr_format), L"HDR");
             bool hdr_ok = false;
             if (gpu_ok) {
                 hdr_ok = write_hdr10(hdr_path, hdr_format, hdr10.data(), texture_desc.Width,
-                                     texture_desc.Height, error);
+                                     texture_desc.Height, sdr.metadata, error);
             } else {
-                const HdrFrame frame{.bytes = raw.bytes.data(),
+                const HdrFrame frame{.bytes = raw.pixels.data(),
                                      .width = raw.width,
                                      .height = raw.height,
                                      .stride = raw.stride,
                                      .pq = is_pq,
-                                     .sdr_white_nits = job.sdr_white_nits};
-                hdr_ok = write_hdr(hdr_path, hdr_format, frame, error);
+                                     .sdr_white_nits = job.sdr_white_nits,
+                                     .metadata = sdr.metadata};
+                hdr_ok = write_hdr(hdr_path, hdr_format, frame, error, &hdr10);
             }
             if (!hdr_ok) {
                 SPDLOG_ERROR("[#{:04}] HDR 编码失败 ({}): {}", job.sequence, to_string(hdr_format), error);
@@ -516,7 +603,7 @@ namespace gamesnap {
             if (job.sdr_format == ImageFormat::Heic)
                 SPDLOG_WARN("[#{:04}] libheif 不支持 gain map，HEIC SDR 不包含 HDR 重建信息", job.sequence);
             const auto sdr_path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
-                                                   image_extension(job.sdr_format), "SDR");
+                                                   image_extension(job.sdr_format), L"SDR");
             if (ui_ && !sdr.pixels.empty())
                 ui_->publish(hdr_path.filename().wstring(), sdr);
             const bool sdr_ok =
@@ -534,6 +621,7 @@ namespace gamesnap {
                 SPDLOG_ERROR("[#{:04}] 不支持的像素格式 {}", job.sequence, static_cast<int>(raw.format));
                 return;
             }
+            image.metadata = sdr.metadata;
             const auto path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
                                                image_extension(job.sdr_format), {});
             if (ui_ && !image.pixels.empty())
@@ -560,6 +648,10 @@ namespace gamesnap {
 
         const auto& t = job.timings;
         const double key_to_start = duration_ms(t.start_capture - t.input);
+        const double queue_wait = duration_ms(t.dequeued - t.input);
+        const double title_lookup = duration_ms(t.title_done - t.dequeued);
+        const double prepare = duration_ms(t.prepared - t.title_done);
+        const double start_capture_call = duration_ms(t.start_capture_done - t.start_capture);
         const double start_to_frame = duration_ms(t.frame_received - t.start_capture);
         const double copy = duration_ms(t.copied - t.frame_received);
         const double pixel = duration_ms(mapped_at - t.copied);
@@ -567,10 +659,14 @@ namespace gamesnap {
         const double total = duration_ms(encoded_at - t.input);
 
         SPDLOG_INFO(
-            "[#{:04}] {} {}x{} {} | 按键→StartCapture {:.2f}ms | StartCapture→首帧 {:.2f}ms | "
-            "GPU 拷贝 {:.2f}ms | 取像素 {:.2f}ms | 编码/写盘 {:.2f}ms | 按键→落盘 {:.2f}ms",
+            "[#{:04}] {} {}x{} {} | 按键→StartCapture {:.2f}ms "
+            "(排队 {:.2f} | 标题 {:.2f} | 准备 {:.2f}) | "
+            "StartCapture调用 {:.2f}ms | StartCapture→首帧 {:.2f}ms | "
+            "GPU 拷贝 {:.2f}ms | 取像素 {:.2f}ms | 编码/写盘 {:.2f}ms | "
+            "按键→落盘 {:.2f}ms",
             job.sequence, paths, width, height, job.hdr ? "HDR+SDR" : "SDR",
-            key_to_start, start_to_frame, copy, pixel, convert, total);
+            key_to_start, queue_wait, title_lookup, prepare,
+            start_capture_call, start_to_frame, copy, pixel, convert, total);
     }
 
 }  // namespace gamesnap

@@ -293,6 +293,9 @@ namespace gamesnap {
              ok;
         ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R16G16B16A16_FLOAT, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, .sdr_white_nits = 203, .label = "HDR10(PQ) FP16 641x361", .width = 641, .height = 361}) &&
              ok;
+        // WGC 的 FP16 帧实际是 scRGB（线性，1.0 = 80 nits），这才是真实采集帧的编码。
+        ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R16G16B16A16_FLOAT, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, .sdr_white_nits = 80, .label = "HDR scRGB FP16"}) &&
+             ok;
 
         SPDLOG_INFO("=== 自检{}：输出目录 {} ===", ok ? "全部通过" : "失败",
                     wstring_to_utf8(config.output_dir.wstring()));

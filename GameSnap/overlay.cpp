@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <vector>
 
@@ -34,7 +35,8 @@ namespace gamesnap {
         // 超过就整体释放，回到“闲置不占显存/内存”。
         constexpr auto kOverlayLinger = std::chrono::seconds(30);
         constexpr float kBasePanelWidth = 440.0F;
-        constexpr float kBasePanelHeight = 210.0F;
+        // 内容高度 = 上下 padding 32 + 缩略图 90 = 122；再留一点余量和文件名换行的空间。
+        constexpr float kBasePanelHeight = 150.0F;
         constexpr float kBaseMargin = 16.0F;
 
         LRESULT CALLBACK overlay_window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -405,6 +407,11 @@ namespace gamesnap {
             }
             state_->instance = instance;
             state_->hwnd = hwnd;
+            // 面板常驻后会出现在下一次截图里：让 WGC/截图 API 排除本窗口。
+            if (!::SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)) {
+                SPDLOG_DEBUG("SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) 失败: {}",
+                             ::GetLastError());
+            }
             // 先把 1x1 窗口放到目标显示器再取 DPI，避免沿用主显示器/旧窗口的 DPI。
             ::SetWindowPos(hwnd, HWND_TOPMOST, monitor_info.rcWork.right - 1, monitor_info.rcWork.bottom - 1, 1, 1,
                            SWP_NOACTIVATE);
@@ -686,21 +693,40 @@ namespace gamesnap {
                 ImGui::Dummy(ImVec2(thumb_width, thumb_height));
             }
 
-            ImGui::SetCursorPos(ImVec2(padding + thumb_width + 14.0F * scale, padding));
+            const float text_x = padding + thumb_width + 14.0F * scale;
+            ImGui::SetCursorPos(ImVec2(text_x, padding));
             ImGui::BeginGroup();
+            // 标题行：左边 GameSnap，右边编码状态。状态右对齐，放不下时退回短文案，
+            // 避免和标题重叠。
             ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, 255));
             ImGui::TextUnformatted("GameSnap");
             ImGui::PopStyleColor();
+
+            char status[64];
+            char short_status[32];
+            if (snapshot.remaining > 0) {
+                std::snprintf(status, sizeof(status), "剩余编码任务: %d", snapshot.remaining);
+                std::snprintf(short_status, sizeof(short_status), "剩余 %d", snapshot.remaining);
+            } else {
+                std::snprintf(status, sizeof(status), "编码完成");
+                std::snprintf(short_status, sizeof(short_status), "编码完成");
+            }
+            const float title_width = ImGui::CalcTextSize("GameSnap").x;
+            const float status_room =
+                static_cast<float>(panel_width) - padding - text_x - title_width - 8.0F * scale;
+            const char* status_text = ImGui::CalcTextSize(status).x <= status_room ? status : short_status;
+            const float status_width = ImGui::CalcTextSize(status_text).x;
+
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(std::max(text_x + title_width + 8.0F * scale,
+                                          static_cast<float>(panel_width) - padding - status_width));
+            ImGui::TextUnformatted(status_text);
+
             ImGui::Spacing();
             const std::string filename = snapshot.filename.empty() ? "正在生成截图…" : filename_utf8;
             ImGui::PushTextWrapPos(static_cast<float>(panel_width) - padding);
             ImGui::TextWrapped("%s", filename.c_str());
             ImGui::PopTextWrapPos();
-            ImGui::Spacing();
-            if (snapshot.remaining > 0)
-                ImGui::Text("剩余编码任务: %d", snapshot.remaining);
-            else
-                ImGui::TextUnformatted("编码完成");
             ImGui::EndGroup();
             ImGui::End();
             ImGui::PopFont();

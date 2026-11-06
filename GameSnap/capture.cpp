@@ -447,6 +447,9 @@ namespace gamesnap {
           command_token_(*commands_) {}
 
     void CaptureWorker::run() {
+        // 启动阶段的资源初始化：无论成功还是失败都必须放行主线程的 wait_ready()。
+        // guard 只管失败/异常提前返回的那条路径；成功路径要显式 count_down 再 dismiss，
+        // 否则 dismiss() 会把 count_down 一起取消，主线程永远卡在 ready_.wait() 上。
         auto ready_guard = ScopeExit{[&] { ready_.count_down(); }};
 
 
@@ -466,6 +469,7 @@ namespace gamesnap {
             stop_->request_stop();
             return;
         }
+        ready_.count_down();  // 成功：先放行主线程，再取消 guard 避免重复 count_down
         ready_guard.dismiss();
 
         for (;;) {
@@ -568,6 +572,9 @@ namespace gamesnap {
         }
 
         // 2) 先建好新一代；任何一步失败都保留旧代继续服役。
+        // 这几条日志是卡死时唯一能定位“卡在哪一步”的线索：D3D 创建和 WGC 的
+        // CreateForMonitor 都可能因为驱动/HDR 全屏而长时间不返回。
+        SPDLOG_INFO("重建捕获资源: 创建 D3D 设备…");
         std::string error;
         auto d3d = D3DContext::create(display.monitor, &error);
         if (!d3d) {
@@ -580,6 +587,7 @@ namespace gamesnap {
         const auto format = hdr ? winrt::DirectXPixelFormat::R16G16B16A16Float
                                 : winrt::DirectXPixelFormat::B8G8R8A8UIntNormalized;
 
+        SPDLOG_INFO("重建捕获资源: 创建 GraphicsCaptureItem（CreateForMonitor）…");
         auto resources = CaptureResources::create(display.monitor, d3d, format, error);
         if (!resources) {
             SPDLOG_ERROR("{}", error);
@@ -629,7 +637,13 @@ namespace gamesnap {
         shot->timings.dequeued = dequeued;
         shot->title = foreground_window_title();
         shot->timings.title_done = SteadyClock::now();
-        shot->color_space = display_.color_space;
+        // WGC 抓的是 DWM 的合成表面，FP16 帧的编码是合成色彩空间（CCCS）：scRGB，
+        // 即 BT.709 原色 + 线性伽马，1.0 = 80 nits，HDR 高光会超过 1.0。
+        // 它不是显示器的线格式：显示器的 ColorSpace（G2084/P2020 = PQ）只说明屏幕怎么输出，
+        // 只用于判断是否 HDR 和打日志。把帧当 PQ 处理会把白点写成 10000 nits、中间调压暗、
+        // 并用 saturate() 丢掉 1.0 以上的高光。
+        shot->color_space = hdr ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+                                : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         shot->sdr_white_nits = display_.sdr_white_nits;
         shot->hdr = hdr;
         shot->hdr_format = config_.hdr_format;

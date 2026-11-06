@@ -398,61 +398,83 @@ namespace gamesnap {
             longjmp(reinterpret_cast<JpegErrorMgr*>(cinfo->err)->jump, 1);  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
         }
 
+        // libjpeg 用 longjmp 报错：longjmp 之后普通自动变量的值不确定（C11 7.13.2.1），
+        // 因此所有跨越 setjmp/longjmp 仍然要使用的状态都放在线程局部对象里。
+        struct JpegScratch {
+            jpeg_compress_struct cinfo{};
+            JpegErrorMgr error{};
+            unsigned char* mem = nullptr;
+            unsigned long mem_size = 0;
+            bool created = false;  // 跨 setjmp/longjmp，必须放在 thread_local 里
+            std::vector<std::uint8_t> row;
+        };
+
+        JpegScratch& jpeg_scratch() {
+            static thread_local JpegScratch scratch;
+            return scratch;
+        }
+
         bool write_jpeg_impl(std::filesystem::path const& path, Image const& image, std::string& error) {
             if (image.width == 0 || image.height == 0) {
                 error = "空图像";
                 return false;
             }
-            thread_local jpeg_compress_struct cinfo;
-            cinfo = {};
-            JpegErrorMgr jerr{};
-            cinfo.err = jpeg_std_error(&jerr.base);
-            jerr.base.error_exit = jpeg_error_exit;
+            JpegScratch& scratch = jpeg_scratch();
+            scratch.cinfo = {};
+            scratch.error = {};
+            scratch.mem = nullptr;
+            scratch.mem_size = 0;
+            scratch.created = false;
+            scratch.cinfo.err = jpeg_std_error(&scratch.error.base);
+            scratch.error.base.error_exit = jpeg_error_exit;
+            scratch.row.resize(static_cast<std::size_t>(image.width) * 3);
 
-            unsigned char* mem = nullptr;
-            unsigned long mem_size = 0;
-            // thread_local：longjmp 不会跳过它的析构，也不会每张图重新分配。
-            thread_local std::vector<std::uint8_t> row;
-            row.resize(static_cast<std::size_t>(image.width) * 3);
-
-            if (setjmp(jerr.jump) != 0) {  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
-                jpeg_destroy_compress(&cinfo);
-                free(mem);  // NOLINT(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+            if (setjmp(scratch.error.jump) != 0) {  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+                if (scratch.created) {
+                    jpeg_destroy_compress(&scratch.cinfo);
+                    scratch.created = false;
+                }
+                free(scratch.mem);  // NOLINT(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+                scratch.mem = nullptr;
                 error = "JPEG 编码失败";
                 return false;
             }
 
-            jpeg_create_compress(&cinfo);
-            jpeg_mem_dest(&cinfo, &mem, &mem_size);
+            jpeg_create_compress(&scratch.cinfo);
+            scratch.created = true;
+            jpeg_mem_dest(&scratch.cinfo, &scratch.mem, &scratch.mem_size);
 
-            cinfo.image_width = image.width;
-            cinfo.image_height = image.height;
-            cinfo.input_components = 3;
-            cinfo.in_color_space = JCS_RGB;
-            jpeg_set_defaults(&cinfo);
-            jpeg_set_quality(&cinfo, codec_options.jpeg_quality, TRUE);
-            for (int i = 0; i < cinfo.num_components; ++i) {
-                cinfo.comp_info[i].h_samp_factor = 1;
-                cinfo.comp_info[i].v_samp_factor = 1;
+            scratch.cinfo.image_width = image.width;
+            scratch.cinfo.image_height = image.height;
+            scratch.cinfo.input_components = 3;
+            scratch.cinfo.in_color_space = JCS_RGB;
+            jpeg_set_defaults(&scratch.cinfo);
+            jpeg_set_quality(&scratch.cinfo, codec_options.jpeg_quality, TRUE);
+            for (int i = 0; i < scratch.cinfo.num_components; ++i) {
+                scratch.cinfo.comp_info[i].h_samp_factor = 1;
+                scratch.cinfo.comp_info[i].v_samp_factor = 1;
             }
-            jpeg_start_compress(&cinfo, TRUE);
+            jpeg_start_compress(&scratch.cinfo, TRUE);
 
-            while (cinfo.next_scanline < cinfo.image_height) {
-                auto const* src = image.pixels.data() + static_cast<std::size_t>(cinfo.next_scanline) * image.stride;
+            while (scratch.cinfo.next_scanline < scratch.cinfo.image_height) {
+                auto const* src =
+                    image.pixels.data() + static_cast<std::size_t>(scratch.cinfo.next_scanline) * image.stride;
                 for (std::uint32_t x = 0; x < image.width; ++x) {
-                    row[x * 3 + 0] = src[x * 4 + 2];
-                    row[x * 3 + 1] = src[x * 4 + 1];
-                    row[x * 3 + 2] = src[x * 4 + 0];
+                    scratch.row[x * 3 + 0] = src[x * 4 + 2];
+                    scratch.row[x * 3 + 1] = src[x * 4 + 1];
+                    scratch.row[x * 3 + 2] = src[x * 4 + 0];
                 }
-                JSAMPROW row_pointer = row.data();
-                jpeg_write_scanlines(&cinfo, &row_pointer, 1);
+                JSAMPROW row_pointer = scratch.row.data();
+                jpeg_write_scanlines(&scratch.cinfo, &row_pointer, 1);
             }
-            jpeg_finish_compress(&cinfo);
-            const std::vector<std::uint8_t> jpeg(mem, mem + mem_size);
+            jpeg_finish_compress(&scratch.cinfo);
+            const std::vector<std::uint8_t> jpeg(scratch.mem, scratch.mem + scratch.mem_size);
             const auto with_exif = add_jpeg_exif(jpeg, image.metadata);
             const bool ok = write_bytes(path, with_exif.data(), with_exif.size(), error);
-            jpeg_destroy_compress(&cinfo);
-            free(mem);  // NOLINT(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+            jpeg_destroy_compress(&scratch.cinfo);
+            scratch.created = false;
+            free(scratch.mem);  // NOLINT(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+            scratch.mem = nullptr;
             return ok;
         }
 

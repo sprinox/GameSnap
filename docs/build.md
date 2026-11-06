@@ -39,7 +39,8 @@ Release 默认启用 clang-tidy。机器上没有 `clang-tidy.exe` 时会在 `Mi
 .\GameSnap\x64\Release\GameSnap.exe --selftest --out .\test
 ```
 
-用合成纹理走完“staging → Map → 转换 → BMP 写盘”，不经过 WGC。采集失败仍需看真实运行的日志。
+用合成纹理走完“staging → Map → 转换 → 编码 → 写盘”，不经过 WGC；输出格式取配置/命令行
+（`--format-sdr` / `--format-hdr`）。采集失败仍需看真实运行的日志。
 
 ## clang-format
 

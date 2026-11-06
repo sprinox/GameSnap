@@ -37,13 +37,8 @@ namespace gamesnap {
         std::binary_semaphore done{0};                    // 回调处理完（或失败）后 release
         std::shared_ptr<std::atomic<bool>> canceled;      // 超时取消标记，和 EncodeJob 共享
         std::atomic<bool> failed{false};                  // CopyResource / 设备移除失败
-        SteadyClock::time_point enqueued;
-        SteadyClock::time_point dequeued;
-        SteadyClock::time_point title_done;
-        SteadyClock::time_point prepared;
-        SteadyClock::time_point start_call;
+        ShotTimings timings;                              // 各阶段时刻，随 EncodeJob 一起传递
         std::uint64_t sequence = 0;
-        std::uint64_t gpu_fence = 0;
         std::wstring title;
         DXGI_COLOR_SPACE_TYPE color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         std::uint32_t sdr_white_nits = 80;

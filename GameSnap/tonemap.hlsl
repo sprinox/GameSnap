@@ -79,29 +79,48 @@ float spline_shoulder(float x)
 {
     const float knee = saturate(SdrWhite / max(PeakNits, 1.0));
     const float white = 0.8;
-    if (x <= 0.0) return 0.0;
-    if (x <= knee) return x * (white / max(knee, 1e-4));
-    if (x >= 1.0) return 1.0;
-
-    float t = (x - knee) / max(1.0 - knee, 1e-4);
-    float h00 = 2.0 * t * t * t - 3.0 * t * t + 1.0;
-    float h10 = t * t * t - 2.0 * t * t + t;
-    float h01 = -2.0 * t * t * t + 3.0 * t * t;
-    const float slope0 = (white / max(knee, 1e-4)) * (1.0 - knee);
-    return h00 * white + h10 * slope0 + h01;
-    return 1.0;
+    float mapped = 0.0;
+    if (x <= 0.0)
+    {
+        mapped = 0.0;
+    }
+    else if (x <= knee)
+    {
+        mapped = x * (white / max(knee, 1e-4));
+    }
+    else if (x >= 1.0)
+    {
+        mapped = 1.0;
+    }
+    else
+    {
+        const float t = (x - knee) / max(1.0 - knee, 1e-4);
+        const float h00 = 2.0 * t * t * t - 3.0 * t * t + 1.0;
+        const float h10 = t * t * t - 2.0 * t * t + t;
+        const float h01 = -2.0 * t * t * t + 3.0 * t * t;
+        const float slope0 = (white / max(knee, 1e-4)) * (1.0 - knee);
+        mapped = h00 * white + h10 * slope0 + h01;
+    }
+    return mapped;
 }
 
 // analysis 的简化版：按亮度做 false color，方便看 HDR 分布。
 float3 analysis_debug(float nits)
 {
-    if (nits < 1.0) return float3(0.02, 0.02, 0.15);
-    if (nits < 10.0) return float3(0.0, 0.0, 1.0);
-    if (nits < 100.0) return float3(0.0, 1.0, 0.0);
-    if (nits < 300.0) return float3(1.0, 1.0, 0.0);
-    if (nits < 1000.0) return float3(1.0, 0.4, 0.0);
-    return float3(1.0, 0.0, 1.0);
-    return float3(1.0, 0.0, 1.0);
+    float3 color = float3(0.0, 0.0, 0.0);
+    if (nits < 1.0)
+        color = float3(0.02, 0.02, 0.15);
+    else if (nits < 10.0)
+        color = float3(0.0, 0.0, 1.0);
+    else if (nits < 100.0)
+        color = float3(0.0, 1.0, 0.0);
+    else if (nits < 300.0)
+        color = float3(1.0, 1.0, 0.0);
+    else if (nits < 1000.0)
+        color = float3(1.0, 0.4, 0.0);
+    else
+        color = float3(1.0, 0.0, 1.0);
+    return color;
 }
 
 [numthreads(8, 8, 1)]
@@ -133,7 +152,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 nits = bt2020_to_709(nits2020);
     float luma = dot(nits, float3(0.2126, 0.7152, 0.0722));
     if (Algo == 1) {
-        Out[tid.xy] = float4(analysis_debug(luma), 1.0);
+        // CPU 侧按 BGRA 读回，调试路径也必须按 BGRA 写出，否则红蓝互换。
+        Out[tid.xy] = float4(analysis_debug(luma).bgr, 1.0);
         return;
     }
 

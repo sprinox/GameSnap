@@ -39,6 +39,8 @@ namespace gamesnap {
     private:
         void worker_main(std::size_t index);
         void encode(EncodeJob& job);
+        // 包一层 try/catch：单张失败不能让整个编码线程退出。
+        void encode_one(std::size_t index, EncodeJob& job);
 
         std::filesystem::path output_dir_;
         std::shared_ptr<EncodeQueue> jobs_;
@@ -46,6 +48,8 @@ namespace gamesnap {
         CodecOptions options_;
         ToneMapBackend tone_map_backend_ = ToneMapBackend::Auto;
         std::vector<std::thread> threads_;
+        std::size_t worker_count_ = 0;
+        std::atomic<std::size_t> stopped_{0};  // 已消费 stop 哨兵的线程数
     };
 
 }  // namespace gamesnap

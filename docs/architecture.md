@@ -129,7 +129,8 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 
 仍保留的预分配 / 常驻项：
 
-- 16KB 的色调映射 LUT：HDR 时缓存，SDR job 结束后释放，下一张 SDR 再按需重建；
+- 16KB 的色调映射 LUT：HDR CPU 回退路径构建后缓存；SDR job 结束时释放，但先读
+  `ToneLutCache::empty` 原子标记，空表时直接返回，不拿 `ToneLutCache::mutex`；
 - WGC 的 `Direct3D11CaptureFramePool` / `GraphicsCaptureSession`：上一张结束后预创建下一套，用于压低热键延迟；
 - libjpeg 的 `thread_local cinfo` 与行缓冲：`longjmp` 会跳过普通局部对象析构，不能安全改成每张分配，属于非纹理的小缓冲。
 

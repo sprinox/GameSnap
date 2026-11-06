@@ -112,13 +112,16 @@ SDR 的 BGRA→BGRA 路径仍通过 `pixels.swap()` 避免一次整帧复制。
 
 ### 2.5 16KB tone LUT
 
-`ToneLutCache` 是进程级静态对象，只有一个 `shared_ptr<const ToneLut>`：
+`ToneLutCache` 是进程级静态对象，包含 `shared_ptr<const ToneLut>` 和一个
+`std::atomic<bool> empty{true}`：
 
-- HDR job：缓存并复用；
-- SDR job：该 job 结束后 `release_tone_lut()`；
-- 下一张 SDR 再按需重建。
+- 只在 HDR CPU 回退路径（FP16 逐像素转换）首次用到时构建；
+- HDR job 缓存，SDR job 结束时释放，保持旧行为；
+- `empty` 为 true 时 `release_tone_lut()` 直接返回，不拿锁；只有表非空才进入 mutex；
+- `empty` 与 mutex 保护的 `current` 允许短暂不一致，不保证 100% 避免重复加锁/释放，
+  只优化绝大多数 SDR job。
 
-LUT 只受 `ToneLutCache::mutex` 保护，持锁时间只覆盖查表/建表。
+LUT 的 `current` 由 `ToneLutCache::mutex` 保护；`empty` 是快速路径原子标记。
 
 ### 2.6 WGC pool/session 预创建
 
@@ -134,7 +137,7 @@ LUT 只受 `ToneLutCache::mutex` 保护，持锁时间只覆盖查表/建表。
 | 锁 | 保护对象 | 持有时长 | 说明 |
 |---|---|---|---|
 | `D3DContext::context_mutex` | immediate context 的所有调用 | 微秒–毫秒 | 必要；Map 后的 CPU 行拷贝在锁外 |
-| `ToneLutCache::mutex` | 16KB LUT 的 `current` | 建表/取指针 | 只在这张表上 |
+| `ToneLutCache::mutex` | 16KB LUT 的 `current` | 建表/取指针/非空时释放 | HDR CPU 回退 + SDR 释放；空表由 atomic `empty` 快速跳过 |
 | `UiBridge::mutex_` | 文件名、缩略图、`info_serial_` | 微秒 | Overlay 每帧只复制 `shared_ptr`/字符串 |
 | `FrameSink::mutex_` + `idle_cv_` | `shot_` / `accepting_` / `in_flight_` | 微秒 | 等回调退出用 |
 | `codec_options` | 编码参数 | 无锁 | 构造编码线程前写一次，之后只读 |
@@ -173,6 +176,8 @@ LUT 只受 `ToneLutCache::mutex` 保护，持锁时间只覆盖查表/建表。
 ## 5. 退出与失败
 
 - 退出顺序：input / system-events → capture `Shutdown` → encode `stop` 哨兵 → join。
+  哨兵只在“队列里不再有新生产者”之后投递；由于 moodycamel 的 MPMC 队列不保证跨生产者 FIFO，
+  最后一个消费到哨兵的编码线程会清空残留任务，避免 Shutdown 时丢掉已入队的截图。
 - capture 初始化失败会设置 `fatal_error_` 并 `request_stop()`；主线程用 ready latch 退出等待。
 - 编码异常在 `worker_main()` 里捕获，单张失败不会杀死线程。
 - 回调 2 秒不退出：`close_and_wait()` 超时，资源走 `abandon()`，不调用 WGC `Close()`。
@@ -204,7 +209,7 @@ LUT 只受 `ToneLutCache::mutex` 保护，持锁时间只覆盖查表/建表。
 
 ### 6.2 例外
 
-- **16KB tone LUT**：保留 HDR 缓存、SDR 释放的旧行为。
+- **16KB tone LUT**：HDR 缓存，SDR 释放；空表由 atomic `empty` 快速跳过，避免大多数 SDR job 拿锁。
 - **WGC pool/session**：保留下一张预创建，以压低热键延迟。
 - **libjpeg `thread_local cinfo` / 行缓冲**：`longjmp` 不执行普通局部对象析构，
   改成每张分配会泄漏或破坏状态；这是非纹理的小缓冲。
@@ -217,7 +222,7 @@ LUT 只受 `ToneLutCache::mutex` 保护，持锁时间只覆盖查表/建表。
 - [ ] 每张截图是否新建 `TextureSlot`，job 是否持有到编码结束？
 - [ ] 编码线程是否不再使用 `thread_local` 大缓冲？
 - [ ] `ToneMapper` 是否只在该 job 内使用，且不跨线程共享？
-- [ ] 16KB LUT 是否只在 SDR job 结束时释放？
+- [ ] 16KB LUT 是否 HDR 缓存、SDR 释放，且空表时 atomic 快路径不拿锁？
 - [ ] `context_mutex` 内是否没有 fence 等待、CPU 行拷贝、编码或写盘？
 - [ ] `UiBridge` 是否只复制 `shared_ptr`/字符串，不复制缩略图像素？
 - [ ] `FrameSink::disarm()` 是否置 `accepting_ = false` 并等待在途回调？

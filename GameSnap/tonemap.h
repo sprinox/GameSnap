@@ -14,7 +14,9 @@ namespace gamesnap {
     std::string_view to_string(ToneMapAlgorithm algorithm);
     std::optional<ToneMapAlgorithm> parse_tone_map_algorithm(std::string_view text);
 
-    // 在 D3D11 compute shader 里完成色调映射；编码线程共享一个实例。
+    // 在 D3D11 compute shader 里完成色调映射。
+    // 每个 HDR job 临时创建一个实例（编码线程之间不共享），因此内部不需要锁；
+    // ensure_size() 的缓存只在同一个实例内有效。
     class ToneMapper {
     public:
         explicit ToneMapper(std::shared_ptr<D3DContext> d3d);

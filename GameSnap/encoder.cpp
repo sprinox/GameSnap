@@ -134,6 +134,9 @@ namespace gamesnap {
         struct ToneLutCache {
             std::mutex mutex;
             std::shared_ptr<const ToneLut> current;
+            // 快速判断是否为空；允许与 mutex 保护的 current 有短暂不一致，
+            // 只用于避免绝大多数 SDR job 拿锁。
+            std::atomic<bool> empty{true};
         };
 
         ToneLutCache& tone_lut_cache() {
@@ -143,8 +146,11 @@ namespace gamesnap {
 
         void release_tone_lut() {
             auto& cache = tone_lut_cache();
+            if (cache.empty.load(std::memory_order_acquire))
+                return;
             std::scoped_lock lock(cache.mutex);
             cache.current.reset();
+            cache.empty.store(true, std::memory_order_release);
         }
 
 
@@ -296,7 +302,8 @@ namespace gamesnap {
             // PQ 的输入域是 [0,1]；scRGB 统一按 [0,4] 采样，超出部分当作白色。
             const float domain = is_pq ? 1.0F : 4.0F;
 
-            // LUT 只依赖 (PQ/scRGB, SDR 白点)；全进程一份，用 shared_ptr 读取。
+            // LUT 只依赖 (PQ/scRGB, SDR 白点)，首次用到时构建，之后常驻（16 KB）。
+            // 只有 HDR CPU 回退路径会进来，SDR 编码不会构建也不需要释放它。
             auto& lut_cache = tone_lut_cache();
             const std::uint32_t white_key = std::max<std::uint32_t>(sdr_white_nits, 1);
             std::shared_ptr<const ToneLut> lut;
@@ -317,6 +324,7 @@ namespace gamesnap {
                     lut_cache.current = std::move(next);
                 }
                 lut = lut_cache.current;
+                lut_cache.empty.store(false, std::memory_order_release);
             }
             const auto& table = lut->values;
             const auto sample = [&table, domain](float value) -> std::uint8_t {
@@ -381,6 +389,8 @@ namespace gamesnap {
     void EncodeWorkers::start(std::size_t thread_count) {
         thread_count = std::clamp<std::size_t>(thread_count, 1, 8);
         threads_.reserve(thread_count);
+        worker_count_ = thread_count;
+        stopped_.store(0, std::memory_order_relaxed);
         for (std::size_t i = 0; i < thread_count; ++i) {
             threads_.emplace_back([this, i] {
                 // 线程入口不能抛：逃逸的异常会直接 std::terminate。
@@ -398,7 +408,9 @@ namespace gamesnap {
     void EncodeWorkers::stop() {
         if (!jobs_)
             return;
-        // 每个线程一个哨兵；队列是 FIFO，所以前面的任务会先被编码完。
+        // 每个线程一个哨兵。注意 MPMC 队列只在同一生产者内保序，主线程投递的哨兵
+        // 可能越过 capture 线程此前投递的任务；worker_main() 里由最后一个拿到哨兵
+        // 的线程清空残留任务，保证退出时不丢图。
         for (std::size_t i = 0; i < threads_.size(); ++i)
             jobs_->enqueue(EncodeJob{.stop = true});
         for (auto& thread : threads_) {
@@ -418,21 +430,37 @@ namespace gamesnap {
         for (;;) {
             EncodeJob job;
             jobs_->wait_dequeue(token, job);
-            if (job.stop)
+            if (job.stop) {
+                // moodycamel 的 MPMC 队列只在同一生产者内保序：主线程投递的 stop
+                // 哨兵可能越过 capture 线程此前投递的任务。最后一个消费到哨兵的
+                // 线程负责清空残留任务，避免退出时丢图。
+                if (stopped_.fetch_add(1, std::memory_order_acq_rel) + 1 == worker_count_) {
+                    EncodeJob leftover;
+                    while (jobs_->try_dequeue(leftover)) {
+                        if (!leftover.stop)
+                            encode_one(index, leftover);
+                    }
+                }
                 break;
-            // 单张图编码失败不能让整个线程挂掉（更不能让异常逃出 std::thread）。
-            try {
-                encode(job);
-            } catch (winrt::hresult_error const& e) {
-                SPDLOG_ERROR("编码线程 {}: [#{}] 失败: {}", index, job.sequence, describe_hresult(e.code()));
-            } catch (std::exception const& e) {
-                SPDLOG_ERROR("编码线程 {}: [#{}] 失败: {}", index, job.sequence, e.what());
-            } catch (...) {
-                SPDLOG_ERROR("编码线程 {}: [#{}] 失败（未知异常）", index, job.sequence);
             }
+            encode_one(index, job);
         }
 
         SPDLOG_INFO("编码线程 {} 退出", index);
+    }
+
+    void EncodeWorkers::encode_one(std::size_t index, EncodeJob& job) {
+        // 不声明 noexcept：catch 里写日志本身仍可能失败（OOM 级别的极端情况），
+        // 那时让异常交给线程入口的兜底 catch，而不是直接 std::terminate。
+        try {
+            encode(job);
+        } catch (winrt::hresult_error const& e) {
+            SPDLOG_ERROR("编码线程 {}: [#{}] 失败: {}", index, job.sequence, describe_hresult(e.code()));
+        } catch (std::exception const& e) {
+            SPDLOG_ERROR("编码线程 {}: [#{}] 失败: {}", index, job.sequence, e.what());
+        } catch (...) {
+            SPDLOG_ERROR("编码线程 {}: [#{}] 失败（未知异常）", index, job.sequence);
+        }
     }
 
     void EncodeWorkers::encode(EncodeJob& job) {
@@ -452,13 +480,13 @@ namespace gamesnap {
         RawCopy raw;
         Image sdr;
         std::vector<std::uint16_t> hdr10;
-        // LUT 保留旧行为：HDR 缓存，SDR 完成后释放（下一张 SDR 重新生成）。
+        sdr.metadata.title = wstring_to_utf8(job.title);
+        sdr.metadata.date_time = exif_date_time(job.local_time);
+        // 保留旧行为：HDR 缓存 LUT，SDR job 结束后释放；empty 为 true 时不拿锁。
         auto lut_release = ScopeExit{[&] {
             if (!job.hdr)
                 release_tone_lut();
         }};
-        sdr.metadata.title = wstring_to_utf8(job.title);
-        sdr.metadata.date_time = exif_date_time(job.local_time);
         std::string error;
         D3D11_TEXTURE2D_DESC texture_desc{};
         job.texture_slot->texture->GetDesc(&texture_desc);

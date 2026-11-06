@@ -125,13 +125,6 @@ namespace gamesnap {
             bool alpha_normalized = false;
         };
 
-        // 全进程只保留一份大缓冲；编码线程 try_lock，拿不到就临时分配并在本张图结束后释放。
-        struct EncodeScratch {
-            RawCopy raw;
-            Image sdr;
-            std::vector<std::uint16_t> hdr10;
-        };
-
         struct ToneLut {
             bool pq = false;
             std::uint32_t white = 0;
@@ -146,6 +139,12 @@ namespace gamesnap {
         ToneLutCache& tone_lut_cache() {
             static ToneLutCache cache;
             return cache;
+        }
+
+        void release_tone_lut() {
+            auto& cache = tone_lut_cache();
+            std::scoped_lock lock(cache.mutex);
+            cache.current.reset();
         }
 
 
@@ -442,12 +441,6 @@ namespace gamesnap {
                 ui_->job_finished();
         }};
 
-        auto texture_slot = job.texture_slot;
-        auto guard = ScopeExit{[&] {
-            if (texture_slot)
-                texture_slot->busy.store(false, std::memory_order_release);
-        }};
-
         if (job.canceled && job.canceled->load(std::memory_order_acquire))
             return;
         if (!job.d3d || !job.texture_slot || !job.texture_slot->texture) {
@@ -455,27 +448,15 @@ namespace gamesnap {
             return;
         }
 
-        // 全进程一份大缓冲；争用不到时本张图临时分配，结束后立刻销毁。
-        thread_local EncodeScratch scratch;
-        RawCopy& raw = scratch.raw;
-        Image& sdr = scratch.sdr;
-        std::vector<std::uint16_t>& hdr10 = scratch.hdr10;
-        auto trim = ScopeExit{[&] {
-            if (!job.hdr) {
-                scratch.hdr10.clear();
-                scratch.hdr10.shrink_to_fit();
-            }
+        // 所有大缓冲都按 job 动态分配，闲置时不占内存/显存。
+        RawCopy raw;
+        Image sdr;
+        std::vector<std::uint16_t> hdr10;
+        // LUT 保留旧行为：HDR 缓存，SDR 完成后释放（下一张 SDR 重新生成）。
+        auto lut_release = ScopeExit{[&] {
+            if (!job.hdr)
+                release_tone_lut();
         }};
-        if (!job.hdr) {
-            std::scoped_lock mapper_lock(mapper_mutex_);
-            if (mapper_) {
-                mapper_.reset();
-                mapper_owner_ = nullptr;
-            }
-        }
-        raw.pixels.clear();
-        sdr.pixels.clear();
-        hdr10.clear();
         sdr.metadata.title = wstring_to_utf8(job.title);
         sdr.metadata.date_time = exif_date_time(job.local_time);
         std::string error;
@@ -485,27 +466,15 @@ namespace gamesnap {
         // HDR 优先走 GPU：mapper 直接采样 DEFAULT+SRV 纹理，fence/event 等待 GPU 完成。
         // 只有它失败时才把 DEFAULT 纹理回读到 staging，再走 CPU 回退。
         bool gpu_ok = false;
-        const auto map_now = SteadyClock::now();
-        const bool mapper_circuit_open =
-            mapper_disabled_until_ns_.load(std::memory_order_acquire) >
-            map_now.time_since_epoch().count();
-        if (job.hdr && tone_map_backend_ != ToneMapBackend::Cpu && !mapper_circuit_open) {
-            std::scoped_lock mapper_lock(mapper_mutex_);
-            if (!mapper_ || mapper_owner_ != job.d3d.get()) {
-                mapper_ = std::make_unique<ToneMapper>(job.d3d);
-                mapper_owner_ = job.d3d.get();
-                if (!mapper_->ok())
-                    SPDLOG_WARN("tone mapper 初始化失败: {}", mapper_->init_error());
-            }
-            if (mapper_->ok()) {
-                gpu_ok = mapper_->map(job.texture_slot->texture.get(), job.color_space, job.sdr_white_nits,
-                                      job.tone_map, sdr, hdr10, error);
-                if (!gpu_ok) {
+        if (job.hdr && tone_map_backend_ != ToneMapBackend::Cpu) {
+            auto mapper = std::make_unique<ToneMapper>(job.d3d);
+            if (!mapper->ok()) {
+                SPDLOG_WARN("tone mapper 初始化失败: {}", mapper->init_error());
+            } else {
+                gpu_ok = mapper->map(job.texture_slot->texture.get(), job.color_space,
+                                     job.sdr_white_nits, job.tone_map, sdr, hdr10, error);
+                if (!gpu_ok)
                     SPDLOG_WARN("[#{:04}] compute tone map 失败，回退 CPU: {}", job.sequence, error);
-                    const auto disabled_until = SteadyClock::now() + std::chrono::seconds(30);
-                    mapper_disabled_until_ns_.store(disabled_until.time_since_epoch().count(),
-                                                    std::memory_order_release);
-                }
             }
         }
 
@@ -517,8 +486,6 @@ namespace gamesnap {
         }
         const auto mapped_at = SteadyClock::now();
 
-        // staging 的所有 GPU/CPU 读取都已完成，允许下一张截图复用主纹理。
-        guard.dismiss();
         if (job.canceled && job.canceled->load(std::memory_order_acquire))
             return;
 

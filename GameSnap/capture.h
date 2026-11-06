@@ -34,7 +34,6 @@ namespace gamesnap {
         std::shared_ptr<D3DContext> d3d;
         std::shared_ptr<EncodeQueue> jobs;
         std::shared_ptr<UiBridge> ui;
-        std::shared_ptr<TextureSlot> texture_slot;
         std::binary_semaphore done{0};                    // 回调处理完（或失败）后 release
         std::shared_ptr<std::atomic<bool>> canceled;      // 超时取消标记，和 EncodeJob 共享
         std::atomic<bool> failed{false};                  // CopyResource / 设备移除失败
@@ -151,7 +150,6 @@ namespace gamesnap {
         // 当前“资源代”，只由 capture 线程读写。
         std::shared_ptr<D3DContext> d3d_;
         std::shared_ptr<CaptureResources> resources_;
-        std::shared_ptr<TextureSlot> texture_slot_;
         DisplayInfo display_{};
         HMONITOR monitor_ = nullptr;
         std::uint64_t generation_ = 0;

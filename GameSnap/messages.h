@@ -44,7 +44,6 @@ namespace gamesnap {
     // 纹理和占用标记绑定在同一个对象里，避免两个独立 shared_ptr 不配套。
     struct TextureSlot {
         std::shared_ptr<ID3D11Texture2D> texture;
-        std::atomic<bool> busy{false};
         bool hdr = false;
     };
 

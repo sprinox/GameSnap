@@ -50,3 +50,14 @@ config.yaml          实际加载的配置
 
 push / PR 自动构建 Debug + Release x64；push 到 master 或 main 时自动发布 pre-release
 （GitHub Releases，包含两个配置的 exe/pdb）。
+
+## 许可证
+
+**GNU General Public License v3.0 or later**，见 [LICENSE](LICENSE)。
+
+这条路径由依赖决定：项目静态链接了 `x265`（GPL-2.0-or-later，HEIC 编码必需），
+因此分发的可执行文件必须整体按 GPL 发布；`cpu-features`（Apache-2.0）又排除了 GPLv2，
+所以只能是 GPLv3+。各依赖的许可证与静态链接合规说明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+
+如果需要改成 MIT / BSD / Apache-2.0，必须先去掉 HEIC 输出（移除 `x265` 与 `libheif`）。
+

@@ -3,6 +3,9 @@
 ## 工具链
 
 - Visual Studio 2026 BuildTools（v145）、Windows SDK `10.0.28000.0`、C++23（`/std:c++latest`）、x64
+- **工程不写死 `PlatformToolset`**，用 `$(DefaultPlatformToolset)`（VS 2022 → v143，VS 2026 → v145）。
+  vcpkg 通过 `vswhere -latest` 用最新 MSVC 构建静态库；如果工程固定在旧 toolset 上，链接期会缺新版
+  STL 的 `__std_*` 符号（`LNK2019: unresolved external symbol __std_rotate` 之类），CI 上尤其容易踩。
 - 依赖由 vcpkg manifest 管理（`vcpkg.json`）：spdlog、fmt、cpptrace、concurrentqueue、yaml-cpp、cxxopts、
   libavif（启用 `aom` feature）、libwebp、libheif、x265、spng、libjpeg-turbo、cpu-features
 - Debug/Release 全局按 `/arch:AVX2` 编译；启动时仍用 `cpu-features` 检查 AVX2 / F16C。
@@ -19,6 +22,10 @@
 ```powershell
 msbuild .\GameSnap\GameSnap.vcxproj /p:Configuration=Release /p:Platform=x64
 ```
+
+CI（`.github/workflows/ci.yml`）的 vcpkg 缓存 key 带上了 runner 镜像版本
+（`${{ env.ImageVersion }}`）：镜像升级会换一套 MSVC，静态库必须按新 toolset 重编，
+否则就会撞上上面说的 STL 符号不匹配。本地切换 VS 版本后请删除 `vcpkg_installed` 重装。
 
 使用预编译头：`pch.h`（`/Yu`）由 `pch.cpp`（`/Yc`）生成，所有 `.cpp` 第一行包含它，全量构建约 26 秒。
 

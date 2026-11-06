@@ -40,7 +40,9 @@ namespace gamesnap {
         void on_trigger() noexcept;
         void job_enqueued() noexcept;
         void job_finished() noexcept;
-        void publish(std::wstring filename, Image const& image);
+        // sequence 是截图序号：多编码线程下完成顺序不固定，只接受不比已发布结果更旧的作业，
+        // 避免旧截图的面板信息覆盖新截图。应在文件真正写成功之后调用。
+        void publish(std::uint64_t sequence, std::wstring filename, Image const& image);
 
         [[nodiscard]] Snapshot snapshot() const;
         [[nodiscard]] HANDLE trigger_event() const noexcept { return trigger_event_; }
@@ -50,6 +52,7 @@ namespace gamesnap {
         std::wstring filename_;
         std::shared_ptr<const Thumbnail> thumbnail_;
         std::uint64_t info_serial_ = 0;
+        std::uint64_t published_sequence_ = 0;  // 已发布的最新截图序号
         std::atomic<std::uint64_t> trigger_serial_{0};
         HANDLE trigger_event_ = nullptr;
         std::atomic<int> remaining_{0};

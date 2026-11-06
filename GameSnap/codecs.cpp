@@ -600,7 +600,14 @@ namespace gamesnap {
         }
 
         // HDR FP16 → 10-bit BT.2020 PQ RGBA 缓冲。
-        U16Buffer hdr_to_rgba10(HdrFrame const& frame) {
+        // 只接受 FP16 RGBA：WGC 实际给的帧格式可能和请求的不同（驱动转换、旋转、HDR 被关掉），
+        // 盲按 8 字节/像素解读 4 字节/像素的缓冲会越界读取。
+        U16Buffer hdr_to_rgba10(HdrFrame const& frame, std::string& error) {
+            if (frame.bytes == nullptr || frame.width == 0 || frame.height == 0 ||
+                frame.bytes_per_pixel != 8 || frame.stride < static_cast<std::size_t>(frame.width) * 8) {
+                error = "HDR 源不是 FP16 RGBA（bytes/pixel 或 stride 不符）";
+                return {};
+            }
             U16Buffer rgba;
             rgba.resize(static_cast<std::size_t>(frame.width) * frame.height * 4);
             std::vector<float> row_floats(static_cast<std::size_t>(frame.width) * 4);
@@ -1071,11 +1078,15 @@ namespace gamesnap {
             return false;
         }
         if (rgba10_out != nullptr) {
-            *rgba10_out = hdr_to_rgba10(frame);
+            *rgba10_out = hdr_to_rgba10(frame, error);
+            if (rgba10_out->empty())
+                return false;  // error 已由 hdr_to_rgba10 写入
             return write_hdr10(path, format, rgba10_out->data(), frame.width, frame.height,
                                frame.metadata, error);
         }
-        auto rgba10 = hdr_to_rgba10(frame);
+        auto rgba10 = hdr_to_rgba10(frame, error);
+        if (rgba10.empty())
+            return false;
         return write_hdr10(path, format, rgba10.data(), frame.width, frame.height, frame.metadata, error);
     }
 

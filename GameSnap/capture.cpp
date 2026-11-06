@@ -10,7 +10,7 @@
 namespace gamesnap {
     namespace {
 
-        constexpr int kFramePoolBuffers = 2;
+        constexpr int kFramePoolBuffers = 1;
         constexpr auto kFrameWait = std::chrono::milliseconds(500);
         constexpr auto kCallbackWait = std::chrono::seconds(2);
 

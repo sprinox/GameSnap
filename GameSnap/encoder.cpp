@@ -541,6 +541,7 @@ namespace gamesnap {
                                      .width = raw.width,
                                      .height = raw.height,
                                      .stride = raw.stride,
+                                     .bytes_per_pixel = raw.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8U : 4U,
                                      .pq = is_pq,
                                      .sdr_white_nits = job.sdr_white_nits,
                                      .metadata = sdr.metadata};
@@ -560,8 +561,6 @@ namespace gamesnap {
                 SPDLOG_WARN("[#{:04}] libheif 不支持 gain map，HEIC SDR 不包含 HDR 重建信息", job.sequence);
             const auto sdr_path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
                                                    image_extension(job.sdr_format), L"SDR");
-            if (ui_ && !sdr.pixels.empty())
-                ui_->publish(hdr_path.filename().wstring(), sdr);
             const bool sdr_ok =
                 (!hdr10.empty() && job.sdr_format == ImageFormat::Avif)
                     ? encode_avif_gainmap(sdr_path, sdr, hdr10.data(), sdr.width, sdr.height, error)
@@ -571,6 +570,9 @@ namespace gamesnap {
             } else {
                 written.push_back(sdr_path);
             }
+            // 只在文件真正写成功之后更新面板，避免显示一个没写出来的文件名。
+            if (ui_ && !sdr.pixels.empty() && !written.empty())
+                ui_->publish(job.sequence, written.front().filename().wstring(), sdr);
         } else {
             if (!convert_pixels(raw, job.color_space, job.sdr_white_nits, sdr)) {
                 SPDLOG_ERROR("[#{:04}] 不支持的像素格式 {}", job.sequence, static_cast<int>(raw.format));
@@ -578,13 +580,14 @@ namespace gamesnap {
             }
             const auto path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
                                                image_extension(job.sdr_format), {});
-            if (ui_ && !sdr.pixels.empty())
-                ui_->publish(path.filename().wstring(), sdr);
             if (!write_sdr(path, job.sdr_format, sdr, error)) {
                 SPDLOG_ERROR("[#{:04}] 编码失败 ({}): {}", job.sequence, to_string(job.sdr_format), error);
                 return;
             }
             written.push_back(path);
+            // 写成功后才更新面板（同上）。
+            if (ui_ && !sdr.pixels.empty())
+                ui_->publish(job.sequence, path.filename().wstring(), sdr);
             width = static_cast<int>(sdr.width);
             height = static_cast<int>(sdr.height);
         }

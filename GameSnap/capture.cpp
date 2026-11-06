@@ -98,14 +98,6 @@ namespace gamesnap {
             return title;
         }
 
-        bool texture_matches(ID3D11Texture2D& texture, D3D11_TEXTURE2D_DESC const& desc) {
-            D3D11_TEXTURE2D_DESC actual{};
-            texture.GetDesc(&actual);
-            return actual.Width == desc.Width && actual.Height == desc.Height &&
-                   actual.Format == desc.Format && actual.Usage == desc.Usage &&
-                   actual.BindFlags == desc.BindFlags;
-        }
-
         // 纹理槽的 RAII：成功交给 job 前，任何提前返回/异常都会释放占用。
 
         // FrameArrived 回调里只做 GPU 侧的事：取帧 → CopyResource 到 staging → 入队。
@@ -143,20 +135,10 @@ namespace gamesnap {
 
             const D3D11_TEXTURE2D_DESC wanted =
                 shot.hdr ? make_gpu_desc_from(desc) : make_staging_desc_from(desc);
-            std::shared_ptr<TextureSlot> slot;
-            if (shot.texture_slot && shot.texture_slot->texture && shot.texture_slot->hdr == shot.hdr &&
-                texture_matches(*shot.texture_slot->texture, wanted) &&
-                !shot.texture_slot->busy.exchange(true, std::memory_order_acq_rel)) {
-                SPDLOG_DEBUG("复用 {} 纹理", shot.hdr ? "HDR" : "SDR");
-                slot = shot.texture_slot;
-            } else {
-                SPDLOG_DEBUG("创建新 {} 纹理", shot.hdr ? "HDR" : "SDR");
-                slot = std::make_shared<TextureSlot>();
-                slot->hdr = shot.hdr;
-                slot->texture = shot.hdr ? create_gpu_texture(shot.d3d->device(), wanted)
-                                         : create_staging_texture(shot.d3d->device(), wanted);
-                slot->busy.store(true, std::memory_order_release);
-            }
+            auto slot = std::make_shared<TextureSlot>();
+            slot->hdr = shot.hdr;
+            slot->texture = shot.hdr ? create_gpu_texture(shot.d3d->device(), wanted)
+                                     : create_staging_texture(shot.d3d->device(), wanted);
             if (!slot || !slot->texture) {
                 shot.failed.store(true, std::memory_order_release);
                 frame.Close();
@@ -165,11 +147,6 @@ namespace gamesnap {
                              static_cast<int>(desc.Format));
                 return;
             }
-            auto lease = ScopeExit{[&] {
-                if (slot)
-                    slot->busy.store(false, std::memory_order_release);
-            }};
-
             {
                 std::scoped_lock lock(shot.d3d->context_mutex());
                 shot.d3d->context()->CopyResource(slot->texture.get(), source.get());
@@ -216,16 +193,15 @@ namespace gamesnap {
 
             // 先让 job 持有占用标记；只有真正入队成功后才把 lease 的所有权交出去。
             if (shot.canceled->load(std::memory_order_acquire))
-                return;  // lease 析构时释放 busy
+                return;
             if (shot.ui)
                 shot.ui->job_enqueued();  // 先计数，避免极快 job 先 finished 再 enqueued
             if (!shot.jobs->enqueue(std::move(job))) {
                 if (shot.ui)
                     shot.ui->job_finished();
                 SPDLOG_WARN("编码队列入队失败，丢弃本次截图");
-                return;  // lease 析构时释放 busy
+                return;
             }
-            lease.dismiss();
         }
     }
 
@@ -506,7 +482,6 @@ namespace gamesnap {
             resources_->close();
             resources_.reset();
         }
-        texture_slot_.reset();
         d3d_.reset();
         SPDLOG_INFO("capture 线程退出");
     }
@@ -618,31 +593,6 @@ namespace gamesnap {
         }
         d3d_ = std::move(d3d);
         resources_ = std::move(resources);
-        texture_slot_.reset();
-        {
-            const auto wanted = hdr ? make_gpu_desc_from(D3D11_TEXTURE2D_DESC{
-                                                 .Width = static_cast<UINT>(size.Width),
-                                                 .Height = static_cast<UINT>(size.Height),
-                                                 .MipLevels = 1,
-                                                 .ArraySize = 1,
-                                                 .Format = dxgi_format_of(format),
-                                                 .SampleDesc = {.Count = 1}})
-                                   : make_staging_desc_from(D3D11_TEXTURE2D_DESC{
-                                                 .Width = static_cast<UINT>(size.Width),
-                                                 .Height = static_cast<UINT>(size.Height),
-                                                 .MipLevels = 1,
-                                                 .ArraySize = 1,
-                                                 .Format = dxgi_format_of(format),
-                                                 .SampleDesc = {.Count = 1}});
-            auto texture = hdr ? create_gpu_texture(d3d_->device(), wanted)
-                               : create_staging_texture(d3d_->device(), wanted);
-            if (texture) {
-                auto slot = std::make_shared<TextureSlot>();
-                slot->texture = std::move(texture);
-                slot->hdr = hdr;
-                texture_slot_ = std::move(slot);
-            }
-        }
         display_ = display;
         monitor_ = display.monitor;
         ++generation_;
@@ -672,7 +622,6 @@ namespace gamesnap {
         shot->d3d = d3d_;
         shot->jobs = jobs_;
         shot->ui = ui_;
-        shot->texture_slot = texture_slot_;
         shot->canceled = std::make_shared<std::atomic<bool>>(false);
         shot->enqueued = command.enqueued;
         shot->sequence = ++sequence_;
@@ -717,15 +666,13 @@ namespace gamesnap {
             SPDLOG_ERROR("[#{:04}] FrameArrived 回调未退出，放弃当前资源代", shot->sequence);
             resources_->abandon();
             resources_.reset();
-            texture_slot_.reset();
-            return;
+                return;
         }
         if (shot->failed.load(std::memory_order_acquire)) {
             SPDLOG_WARN("[#{:04}] 帧拷贝失败（设备移除/TDR），重建资源", shot->sequence);
             resources_->close();
             resources_.reset();
-            texture_slot_.reset();
-            rebuild(ReloadReason::DeviceRemoved);
+                rebuild(ReloadReason::DeviceRemoved);
             return;
         }
         resources_->stop_capture();

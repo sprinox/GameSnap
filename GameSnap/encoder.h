@@ -15,7 +15,6 @@
 namespace gamesnap {
 
     class D3DContext;
-    class ToneMapper;
     class UiBridge;
 
     // 创建一块 CPU 可读的 staging 纹理（失败返回空）。
@@ -47,10 +46,6 @@ namespace gamesnap {
         CodecOptions options_;
         ToneMapBackend tone_map_backend_ = ToneMapBackend::Auto;
         std::vector<std::thread> threads_;
-        std::mutex mapper_mutex_;
-        std::unique_ptr<ToneMapper> mapper_;
-        D3DContext* mapper_owner_ = nullptr;
-        std::atomic<std::int64_t> mapper_disabled_until_ns_{0};
     };
 
 }  // namespace gamesnap

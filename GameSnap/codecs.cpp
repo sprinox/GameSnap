@@ -67,7 +67,7 @@ namespace gamesnap {
             return true;
         }
 
-        bool to_rgba(Image const& image, std::vector<std::uint8_t>& rgba) {
+        bool to_rgba(Image const& image, ByteBuffer& rgba) {
             if (image.width == 0 || image.height == 0 || image.stride != image.width * 4)
                 return false;
             rgba.resize(static_cast<std::size_t>(image.width) * image.height * 4);
@@ -338,7 +338,7 @@ namespace gamesnap {
         // ── PNG（libspng，最高压缩） ─────────────────────────────────────────
         bool write_png_impl(std::filesystem::path const& path, Image const& image, std::string& error) {
             // PNG 转换缓冲只在本次编码期间存在；空闲时不占内存。
-            std::vector<std::uint8_t> rgba;
+            ByteBuffer rgba;
             if (!to_rgba(image, rgba)) {
                 error = "PNG 需要 BGRA8 紧凑图像";
                 return false;
@@ -599,8 +599,9 @@ namespace gamesnap {
         }
 
         // HDR FP16 → 10-bit BT.2020 PQ RGBA 缓冲。
-        std::vector<std::uint16_t> hdr_to_rgba10(HdrFrame const& frame) {
-            std::vector<std::uint16_t> rgba(static_cast<std::size_t>(frame.width) * frame.height * 4);
+        U16Buffer hdr_to_rgba10(HdrFrame const& frame) {
+            U16Buffer rgba;
+            rgba.resize(static_cast<std::size_t>(frame.width) * frame.height * 4);
             std::vector<float> row_floats(static_cast<std::size_t>(frame.width) * 4);
             for (std::uint32_t y = 0; y < frame.height; ++y) {
                 auto const* row16 =
@@ -1027,7 +1028,8 @@ namespace gamesnap {
             SPDLOG_WARN("HEIC 10-bit 编码失败，回退 8-bit: {}", error);
         }
         const std::size_t count = static_cast<std::size_t>(width) * height * 4;
-        std::vector<std::uint8_t> rgba8(count);
+        ByteBuffer rgba8;
+        rgba8.resize(count);
         for (std::size_t i = 0; i < count; ++i)
             rgba8[i] = static_cast<std::uint8_t>(rgba10[i] >> 2);
         return heif_encode_rgba(path, rgba8.data(), width, height, 8,
@@ -1059,7 +1061,7 @@ namespace gamesnap {
     }
 
     bool write_hdr(std::filesystem::path const& path, ImageFormat format, HdrFrame const& frame, std::string& error,
-                   std::vector<std::uint16_t>* rgba10_out) {
+                   U16Buffer* rgba10_out) {
         if (!format_supports_hdr(format)) {
             error = "该格式不支持 HDR";
             return false;

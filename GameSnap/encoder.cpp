@@ -144,6 +144,7 @@ namespace gamesnap {
             return cache;
         }
 
+        // SDR job 结束时调用：表为空时直接返回，不拿锁。HDR job 不调用，表随之常驻。
         void release_tone_lut() {
             auto& cache = tone_lut_cache();
             if (cache.empty.load(std::memory_order_acquire))
@@ -302,8 +303,9 @@ namespace gamesnap {
             // PQ 的输入域是 [0,1]；scRGB 统一按 [0,4] 采样，超出部分当作白色。
             const float domain = is_pq ? 1.0F : 4.0F;
 
-            // LUT 只依赖 (PQ/scRGB, SDR 白点)，首次用到时构建，之后常驻（16 KB）。
-            // 只有 HDR CPU 回退路径会进来，SDR 编码不会构建也不需要释放它。
+            // LUT 只依赖 (PQ/scRGB, SDR 白点)；全进程一份，用 shared_ptr 读取。
+            // 只有 HDR CPU 回退路径会构建它：HDR job 构建后缓存，SDR job 结束时由
+            // release_tone_lut() 释放（空表走 atomic 快路径，不拿锁）。
             auto& lut_cache = tone_lut_cache();
             const std::uint32_t white_key = std::max<std::uint32_t>(sdr_white_nits, 1);
             std::shared_ptr<const ToneLut> lut;
@@ -479,10 +481,10 @@ namespace gamesnap {
         // 所有大缓冲都按 job 动态分配，闲置时不占内存/显存。
         RawCopy raw;
         Image sdr;
-        std::vector<std::uint16_t> hdr10;
+        U16Buffer hdr10;
         sdr.metadata.title = wstring_to_utf8(job.title);
         sdr.metadata.date_time = exif_date_time(job.local_time);
-        // 保留旧行为：HDR 缓存 LUT，SDR job 结束后释放；empty 为 true 时不拿锁。
+        // LUT 保留既有策略：HDR job 缓存，SDR job 结束后释放；表为空时 atomic 快路径不拿锁。
         auto lut_release = ScopeExit{[&] {
             if (!job.hdr)
                 release_tone_lut();
@@ -493,6 +495,9 @@ namespace gamesnap {
 
         // HDR 优先走 GPU：mapper 直接采样 DEFAULT+SRV 纹理，fence/event 等待 GPU 完成。
         // 只有它失败时才把 DEFAULT 纹理回读到 staging，再走 CPU 回退。
+        //
+        // ToneMapper 每个 HDR job 现建现用（4 张全尺寸纹理，4K 下约 127 MiB），map 完随 job 析构。
+        // 这是刻意选择：复用会把这几张纹理变成闲置常驻显存，而截图工具绝大多数时间是闲置的。
         bool gpu_ok = false;
         if (job.hdr && tone_map_backend_ != ToneMapBackend::Cpu) {
             auto mapper = std::make_unique<ToneMapper>(job.d3d);

@@ -60,6 +60,12 @@
     <ClCompile Include="system_events.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="pch.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="simd.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="capture.h">
@@ -87,6 +93,9 @@
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="system_events.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="simd.h">
       <Filter>头文件</Filter>
     </ClInclude>
   </ItemGroup>

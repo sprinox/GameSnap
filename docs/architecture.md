@@ -69,7 +69,8 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 - 启动或重建时创建：D3D 设备（优先目标显示器所属适配器）、`GraphicsCaptureItem`、编码线程；
 - 每张截图使用一套独立的 `Direct3D11CaptureFramePool` + `GraphicsCaptureSession`，以及**只属于这个 pool 的 `FrameSink`**：
   `CreateFreeThreaded` → 注册 `FrameArrived` → `CreateCaptureSession` → arm shot → `StartCapture`；
-- 每张图先等 `done`，再等该 pool 的回调真正退出（`wait_idle`），然后才关闭会话和 pool；
+- 每张图先等 `done`，再走 `quiesce()`（停止接收新 shot → 注销 `FrameArrived` → 等回调退出），
+  然后才关闭会话和 pool；`close()` 和单张收尾共用这一个函数，顺序只有一份实现；
   回调 2 秒内不退出说明驱动卡住，此时不调用 `Close()`，直接放弃这一代资源；
 - 上一张结束后会为下一张预创建 pool/session；这是为了压低热键到 `StartCapture` 的延迟，**不预分配截图纹理**；
 - 每张图的 shot 只交给本 pool 的 sink，旧 pool 的迟到回调不可能取走下一张截图的 shot；
@@ -111,8 +112,10 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 - HDR 的 PQ OETF 与 SDR 色调映射在同一个 D3D11 compute dispatch 完成：FP16 → BT.2020 nit → PQ（HDR）；
   同一 texel → BT.709 亮度 → Hermite shoulder（spline）→ sRGB（SDR）。`analysis` 是 false color 调试算法。
 - 每个 HDR job 临时创建自己的 `ToneMapper`，map 完随 job 析构；GPU 用 `ID3D11Fence` + event 等待，
-  等待期间不持 `context_mutex`，避免阻塞 capture 回调。不再有跨线程共享的常驻 mapper / mapper mutex。
+  等待期间不持 `context_mutex`，避免阻塞 capture 回调。不做跨 job 复用：它占 4 张全尺寸纹理
+  （4K 下约 127 MiB），而这个工具绝大多数时间是闲置的，闲置常驻不划算。
 - 每个编码 job 临时分配 `raw` / `sdr` / `hdr10` 缓冲，编码完成后立即释放；不再使用 `thread_local EncodeScratch`。
+  这些缓冲用未初始化的 `UninitBuffer`（`resize` 只分配不置零），避免整帧清零后立刻被覆盖。
 - SDR AVIF 内嵌 ISO 21496-1 gain map；HEIC 的 libheif 1.23 没有 gain map 写入 API，只输出 SDR 基图。
 - 文件名：`<前台窗口标题>_YYYYMMDD_HHMMSS_mmm_序号[_HDR|_SDR].<扩展名>`；标题在命令出队时取，非法字符替换为 `_`。
 
@@ -124,7 +127,7 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 - 编码线程的 `raw` / `sdr` / `hdr10` 大缓冲；
 - `ToneMapper` 的 HDR/SDR 输出与 readback 纹理。
 
-这些资源全部按 job 动态创建，并在编码结束、`EncodeJob` 析构时释放。`ToneMapper` 现在每个 HDR job 一个，
+这些资源全部按 job 动态创建，并在编码结束、`EncodeJob` 析构时释放。`ToneMapper` 每个 HDR job 一个，
 不再由多个编码线程共享，因此也没有 `mapper_mutex_` 和 30 秒熔断状态。
 
 仍保留的预分配 / 常驻项：
@@ -137,7 +140,8 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 取舍：
 
 - 闲置时不再常驻全尺寸 capture 纹理、编码 scratch 和 ToneMapper 纹理，4K 下可省下数百 MiB 的峰值/常驻占用；
-- 每张截图会增加纹理创建、ToneMapper 初始化和 vector 重新分配开销；HDR 连拍时分配/释放更频繁；
+- 每张截图会增加纹理创建、ToneMapper 初始化和缓冲分配开销；HDR 连拍时分配/释放更频繁；
+- 像素缓冲用 `UninitBuffer` 分配，不再为先清零再整帧覆盖的 `resize()` 付 memset；
 - 不再有纹理缓存的 `busy` 跨线程竞争，资源生命周期由 `EncodeJob` 的 `shared_ptr` 直接表达；
 - WGC pool/session 仍预创建，不属于截图纹理缓存；如果需要进一步降低闲置显存，可再关闭这条预创建路径，但会增加热键到 `StartCapture` 的延迟。
 

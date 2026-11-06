@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <exception>
+#include <process.h>
 
 #include "capture.h"
 #include "overlay.h"
@@ -36,8 +37,14 @@ namespace {
             if (auto* source = stop_source_slot().load(std::memory_order_acquire))
                 source->request_stop();
             // 第一次正常收尾；再按一次说明收尾卡住，直接强制结束。
-            if (ctrl_c_count().fetch_add(1, std::memory_order_acq_rel) >= 1)
-                std::terminate();
+            // 这条路径不能经过日志框架：收尾卡住时可能有线程正持着日志锁，
+            // 走 std::terminate() 再写日志会直接死锁。
+            if (ctrl_c_count().fetch_add(1, std::memory_order_acq_rel) >= 1) {
+                constexpr std::string_view kMessage = "GameSnap: 收尾卡住，强制退出\n";
+                (void)std::fwrite(kMessage.data(), 1, kMessage.size(), stderr);
+                (void)std::fflush(stderr);
+                ::_exit(1);
+            }
             return TRUE;
         case CTRL_CLOSE_EVENT:
         case CTRL_LOGOFF_EVENT:
@@ -70,7 +77,7 @@ namespace {
         auto commands = std::make_shared<gamesnap::CommandQueue>();
         auto jobs = std::make_shared<gamesnap::EncodeQueue>();
         auto ui = std::make_shared<gamesnap::UiBridge>();
-        gamesnap::OverlayThread overlay(ui);
+        gamesnap::OverlayThread overlay(ui, config.monitor);
         overlay.start();
 
         gamesnap::EncodeWorkers encoders(config.output_dir, jobs, config.codec, config.tone_map_backend, ui);

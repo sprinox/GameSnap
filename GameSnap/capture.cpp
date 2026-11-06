@@ -336,15 +336,26 @@ namespace gamesnap {
     void CaptureResources::close() {
         if (closed_)
             return;
+        // 先停止接收、注销回调并等在途回调退出，再 Close 会话和 pool。
+        // 回调 2 秒不退出说明驱动卡住，此时不能 Close，直接放弃这一代。
+        if (!quiesce(kCallbackWait)) {
+            SPDLOG_WARN("关闭 capture 资源时 FrameArrived 回调未在 {}ms 内退出，放弃本代资源",
+                        kCallbackWait.count());
+            abandon();
+            return;
+        }
         closed_ = true;
         stop_capture();
         item_ = nullptr;
-        if (sink_) {
+        sink_.reset();
+    }
+
+    bool CaptureResources::quiesce(std::chrono::milliseconds timeout) {
+        // 顺序不能反：先挡住新 shot（并唤醒等帧的一方），再注销投递，最后等在途回调退出。
+        if (sink_)
             sink_->disarm();
-            if (!sink_->wait_idle(kCallbackWait))
-                SPDLOG_WARN("关闭 capture 资源时 FrameArrived 回调未在 {}ms 内退出", kCallbackWait.count());
-            sink_.reset();
-        }
+        unregister_frame_arrived();
+        return sink_ ? sink_->wait_idle(timeout) : true;
     }
 
     void CaptureResources::abandon() noexcept {
@@ -368,9 +379,18 @@ namespace gamesnap {
     }
 
     void FrameSink::disarm() {
-        std::scoped_lock lock(mutex_);
-        accepting_ = false;
-        shot_.reset();
+        std::shared_ptr<ShotContext> dropped;
+        {
+            std::scoped_lock lock(mutex_);
+            accepting_ = false;
+            dropped = std::exchange(shot_, nullptr);
+        }
+        // 没有回调接手这张 shot：标记失败并唤醒等帧的一方。
+        // 与回调并发时双方都在锁内交接，因此 done 只会被 release 一次。
+        if (dropped) {
+            dropped->failed.store(true, std::memory_order_release);
+            dropped->done.release();
+        }
     }
 
     void FrameSink::on_frame(winrt::Direct3D11CaptureFramePool const& pool) {
@@ -396,21 +416,15 @@ namespace gamesnap {
             shot->done.release();
         }
 
+        // 只在最后一个在途回调退出时唤醒：关闭流程等待期间 WGC 仍会按刷新率投递空回调，
+        // 每次都 notify 会让 capture 线程反复醒来检查谓词。
+        bool idle = false;
         {
             std::scoped_lock lock(mutex_);
-            --in_flight_;
+            idle = --in_flight_ == 0;
         }
-        idle_cv_.notify_all();
-    }
-
-    bool FrameSink::close_and_wait(std::chrono::milliseconds timeout) {
-        {
-            std::scoped_lock lock(mutex_);
-            accepting_ = false;
-            shot_.reset();
-        }
-        idle_cv_.notify_all();
-        return wait_idle(timeout);
+        if (idle)
+            idle_cv_.notify_all();
     }
 
     bool FrameSink::wait_idle(std::chrono::milliseconds timeout) {
@@ -646,9 +660,9 @@ namespace gamesnap {
             shot->canceled->store(true, std::memory_order_release);
             SPDLOG_WARN("[#{:04}] {}ms 内没有等到帧，取消本次截图", shot->sequence, kFrameWait.count());
         }
-        // 先注销 token 阻止新回调，再由 sink 停止接收并等在途回调退出。
-        resources_->unregister_frame_arrived();
-        if (!sink->close_and_wait(kCallbackWait)) {
+        // 收尾顺序和 close() 共用 quiesce()：disarm → 注销 → 等在途回调退出。
+        // 回调 2 秒不退出说明驱动卡住，此时不能 Close，直接放弃这一代。
+        if (!resources_->quiesce(kCallbackWait)) {
             SPDLOG_ERROR("[#{:04}] FrameArrived 回调未退出，放弃当前资源代", shot->sequence);
             resources_->abandon();
             resources_.reset();

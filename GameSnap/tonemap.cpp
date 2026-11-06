@@ -200,7 +200,7 @@ namespace gamesnap {
                          std::uint32_t sdr_white_nits,
                          ToneMapAlgorithm algorithm,
                          Image& out,
-                         std::vector<std::uint16_t>& hdr10,
+                         U16Buffer& hdr10,
                          std::string& error) {
         if (!ok_ || !hdr_texture || !d3d_) {
             error = error_.empty() ? "ToneMapper 未初始化" : error_;

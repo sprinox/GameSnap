@@ -5,13 +5,67 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace gamesnap {
+
+    // 未初始化缓冲：resize() 只分配、不置零。用于“随后会被整体写满”的像素和中间缓冲，
+    // 省掉 4K HDR 一张图几十 MiB 的 memset。新增区域的内容是未定义的，读之前必须先写。
+    template <typename T>
+    class UninitBuffer {
+        static_assert(std::is_trivially_copyable_v<T>, "UninitBuffer 只用于可直接 memcpy 的类型");
+
+    public:
+        UninitBuffer() = default;
+        ~UninitBuffer() = default;
+        UninitBuffer(UninitBuffer const&) = delete;
+        UninitBuffer& operator=(UninitBuffer const&) = delete;
+        UninitBuffer(UninitBuffer&&) noexcept = default;
+        UninitBuffer& operator=(UninitBuffer&&) noexcept = default;
+
+        [[nodiscard]] T* data() noexcept { return data_.get(); }
+        [[nodiscard]] T const* data() const noexcept { return data_.get(); }
+        [[nodiscard]] std::size_t size() const noexcept { return size_; }
+        [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+
+        T& operator[](std::size_t index) noexcept { return data_[index]; }
+        T const& operator[](std::size_t index) const noexcept { return data_[index]; }
+
+        void clear() noexcept { size_ = 0; }
+
+        // 变大时重新分配并保留旧内容；新增区域不初始化。变小时只缩短长度。
+        void resize(std::size_t count) {
+            if (count <= size_) {
+                size_ = count;
+                return;
+            }
+            auto next = std::make_unique_for_overwrite<T[]>(count);
+            if (size_ != 0)
+                std::memcpy(next.get(), data_.get(), size_ * sizeof(T));
+            data_ = std::move(next);
+            size_ = count;
+        }
+
+        void swap(UninitBuffer& other) noexcept {
+            data_.swap(other.data_);
+            std::swap(size_, other.size_);
+        }
+
+    private:
+        std::unique_ptr<T[]> data_;
+        std::size_t size_ = 0;
+    };
+
+    using ByteBuffer = UninitBuffer<std::uint8_t>;
+    using U16Buffer = UninitBuffer<std::uint16_t>;
 
     enum class ImageFormat : std::uint8_t {
         Bmp = 1,
@@ -66,7 +120,7 @@ namespace gamesnap {
 
     // 紧凑 BGRA8，行间无 padding；stride = width * 4。
     struct Image {
-        std::vector<std::uint8_t> pixels;
+        ByteBuffer pixels;
         std::uint32_t width = 0;
         std::uint32_t height = 0;
         std::uint32_t stride = 0;

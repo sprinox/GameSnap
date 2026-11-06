@@ -30,7 +30,6 @@ namespace gamesnap {
         // 调用方必须持有 context_mutex；返回 0 表示不支持 fence。
         std::uint64_t signal_fence_locked();
         bool wait_fence(std::uint64_t value, std::chrono::milliseconds timeout, std::string& error);
-
         // DXGI 工厂失效：显示拓扑或适配器集合发生变化。
         [[nodiscard]] bool factory_current() const;
         // GetDeviceRemovedReason 失败：TDR / 驱动重启 / 显卡被拔掉。
@@ -49,7 +48,8 @@ namespace gamesnap {
         std::mutex context_mutex_;
         winrt::com_ptr<ID3D11Fence> fence_;
         winrt::com_ptr<ID3D11DeviceContext4> context4_;
-        std::atomic<std::uint64_t> fence_value_{0};
+        // 只在持有 context_mutex 时自增，不需要原子量。
+        std::uint64_t fence_value_ = 0;
     };
 
 }  // namespace gamesnap

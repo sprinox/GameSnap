@@ -17,7 +17,6 @@ namespace gamesnap {
 
     enum class ReloadReason : std::uint8_t {
         Startup,  // 首次创建
-        Manual,
         DisplayChange,   // 分辨率 / 显示器拓扑 / HDR 切换
         DeviceChange,    // 显卡插拔、驱动重启导致 DXGI 工厂失效
         DeviceRemoved,   // GetDeviceRemovedReason 失败（TDR 等）
@@ -38,7 +37,7 @@ namespace gamesnap {
     // 输入线程 / 系统事件线程 → 截图线程。截图线程是捕获资源的唯一所有者。
     struct Command {
         CommandKind kind = CommandKind::Validate;
-        ReloadReason reason = ReloadReason::Manual;
+        ReloadReason reason = ReloadReason::Startup;
         SteadyClock::time_point enqueued = SteadyClock::now();
     };
 
@@ -63,6 +62,7 @@ namespace gamesnap {
         DXGI_COLOR_SPACE_TYPE color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         std::uint32_t sdr_white_nits = 80;
         std::uint64_t sequence = 0;
+        std::uint64_t gpu_fence = 0;
         std::wstring title;            // 截图时前台窗口的标题，用作文件名前缀
         Clock::time_point local_time;  // 墙上时间，只用于文件名
         ShotTimings timings{};

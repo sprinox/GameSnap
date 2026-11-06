@@ -44,6 +44,9 @@ heic_preset: fast
 # HDR→SDR 色调映射算法：spline（默认，Hermite shoulder）或 analysis（调试 false color）。
 tone_map: spline
 
+# HDR→SDR 计算后端：auto（默认，优先 GPU）/ gpu / cpu。
+tone_map_backend: auto
+
 # ── 采集 ────────────────────────────────────────────────────────────────────
 # 键盘热键：F1..F24 / A-Z / 0-9 / printscreen / scrolllock / insert / home / end / space / 0x7B
 # 可加修饰键：ctrl / shift / alt / win，例如 ctrl+shift+F12

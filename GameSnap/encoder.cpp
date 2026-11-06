@@ -132,16 +132,6 @@ namespace gamesnap {
             std::vector<std::uint16_t> hdr10;
         };
 
-        struct ScratchPool {
-            std::mutex mutex;
-            EncodeScratch scratch;
-        };
-
-        ScratchPool& scratch_pool() {
-            static ScratchPool pool;
-            return pool;
-        }
-
         struct ToneLut {
             bool pq = false;
             std::uint32_t white = 0;
@@ -158,33 +148,6 @@ namespace gamesnap {
             return cache;
         }
 
-        void release_tone_lut() {
-            auto& cache = tone_lut_cache();
-            std::scoped_lock lock(cache.mutex);
-            cache.current.reset();
-        }
-
-        // SDR 后不再保留下一次 HDR 才需要的大缓冲。
-        struct ScratchTrim {
-            ScratchTrim(EncodeScratch& scratch_, bool keep_hdr_) : scratch(scratch_), keep_hdr(keep_hdr_) {}
-            ~ScratchTrim() noexcept {
-                if (keep_hdr)
-                    return;
-                try {
-                    scratch.hdr10.clear();
-                    scratch.hdr10.shrink_to_fit();
-                    scratch.raw.pixels.clear();
-                    scratch.raw.pixels.shrink_to_fit();
-                } catch (...) {  // NOLINT(bugprone-empty-catch): 析构不能抛
-                }
-            }
-            EncodeScratch& scratch;
-            bool keep_hdr = false;
-            ScratchTrim(ScratchTrim const&) = delete;
-            ScratchTrim& operator=(ScratchTrim const&) = delete;
-            ScratchTrim(ScratchTrim&&) = delete;
-            ScratchTrim& operator=(ScratchTrim&&) = delete;
-        };
 
         // 统一成 32bpp BGRA（Image 定义在 image.h）。
 
@@ -205,7 +168,10 @@ namespace gamesnap {
         // GPU→CPU：在编码线程里 Map staging、逐行拷到紧凑缓冲、再 Unmap。
         // HDR 现在直接使用 DEFAULT+SRV，不能 Map；只有 CPU fallback 时才创建一块 staging
         // 并做一次 CopyResource，正常 GPU 路径没有这次拷贝。
-        bool map_to_cpu(D3DContext& d3d, ID3D11Texture2D* texture, RawCopy& raw, std::string& error) {
+        bool map_to_cpu(D3DContext& d3d, ID3D11Texture2D* texture, std::uint64_t gpu_fence,
+                        RawCopy& raw, std::string& error) {
+            if (gpu_fence != 0 && !d3d.wait_fence(gpu_fence, std::chrono::seconds(5), error))
+                return false;
             D3D11_TEXTURE2D_DESC desc{};
             texture->GetDesc(&desc);
 
@@ -402,9 +368,10 @@ namespace gamesnap {
     // ── EncodeWorkers ────────────────────────────────────────────────────────
 
     EncodeWorkers::EncodeWorkers(std::filesystem::path output_dir, std::shared_ptr<EncodeQueue> jobs,
-                                 CodecOptions options, std::shared_ptr<UiBridge> ui)
+                                 CodecOptions options, ToneMapBackend tone_map_backend,
+                                 std::shared_ptr<UiBridge> ui)
         : output_dir_(std::move(output_dir)), jobs_(std::move(jobs)), ui_(std::move(ui)),
-          options_(options) {
+          options_(options), tone_map_backend_(tone_map_backend) {
         set_codec_options(options_);
     }
 
@@ -470,38 +437,16 @@ namespace gamesnap {
     }
 
     void EncodeWorkers::encode(EncodeJob& job) {
-        // 每个真实 job 只减一次；异常/提前返回也一样。
-        struct UiJobGuard {
-            explicit UiJobGuard(UiBridge* bridge) : ui(bridge) {}
-            UiBridge* ui;
-            UiJobGuard(UiJobGuard const&) = delete;
-            UiJobGuard& operator=(UiJobGuard const&) = delete;
-            UiJobGuard(UiJobGuard&&) = delete;
-            UiJobGuard& operator=(UiJobGuard&&) = delete;
-            ~UiJobGuard() {
-                if (ui != nullptr)
-                    ui->job_finished();
-            }
-        };
-        const UiJobGuard ui_job_guard{ui_.get()};
-        set_codec_options(options_);
+        auto ui_job_guard = ScopeExit{[&] {
+            if (ui_)
+                ui_->job_finished();
+        }};
 
-        // 主 staging 的占用标记由这里释放；提前返回/异常也会释放。
-        struct BusyGuard {
-            explicit BusyGuard(std::shared_ptr<TextureSlot> slot_) : slot(std::move(slot_)) {}
-            std::shared_ptr<TextureSlot> slot;
-            void release() {
-                if (slot) {
-                    slot->busy.store(false, std::memory_order_release);
-                    slot.reset();
-                }
-            }
-            ~BusyGuard() { release(); }
-            BusyGuard(BusyGuard const&) = delete;
-            BusyGuard& operator=(BusyGuard const&) = delete;
-            BusyGuard(BusyGuard&&) = delete;
-            BusyGuard& operator=(BusyGuard&&) = delete;
-        } guard{job.texture_slot};
+        auto texture_slot = job.texture_slot;
+        auto guard = ScopeExit{[&] {
+            if (texture_slot)
+                texture_slot->busy.store(false, std::memory_order_release);
+        }};
 
         if (job.canceled && job.canceled->load(std::memory_order_acquire))
             return;
@@ -511,19 +456,22 @@ namespace gamesnap {
         }
 
         // 全进程一份大缓冲；争用不到时本张图临时分配，结束后立刻销毁。
-        ScratchPool& pool = scratch_pool();
-        std::unique_lock<std::mutex> scratch_lock(pool.mutex, std::try_to_lock);
-        EncodeScratch local;
-        EncodeScratch& scratch = scratch_lock.owns_lock() ? pool.scratch : local;
+        thread_local EncodeScratch scratch;
         RawCopy& raw = scratch.raw;
         Image& sdr = scratch.sdr;
         std::vector<std::uint16_t>& hdr10 = scratch.hdr10;
-        ScratchTrim trim{scratch, job.hdr};
+        auto trim = ScopeExit{[&] {
+            if (!job.hdr) {
+                scratch.hdr10.clear();
+                scratch.hdr10.shrink_to_fit();
+            }
+        }};
         if (!job.hdr) {
-            release_tone_lut();
             std::scoped_lock mapper_lock(mapper_mutex_);
-            mapper_.reset();
-            mapper_owner_ = nullptr;
+            if (mapper_) {
+                mapper_.reset();
+                mapper_owner_ = nullptr;
+            }
         }
         raw.pixels.clear();
         sdr.pixels.clear();
@@ -537,7 +485,11 @@ namespace gamesnap {
         // HDR 优先走 GPU：mapper 直接采样 DEFAULT+SRV 纹理，fence/event 等待 GPU 完成。
         // 只有它失败时才把 DEFAULT 纹理回读到 staging，再走 CPU 回退。
         bool gpu_ok = false;
-        if (job.hdr) {
+        const auto map_now = SteadyClock::now();
+        const bool mapper_circuit_open =
+            mapper_disabled_until_ns_.load(std::memory_order_acquire) >
+            map_now.time_since_epoch().count();
+        if (job.hdr && tone_map_backend_ != ToneMapBackend::Cpu && !mapper_circuit_open) {
             std::scoped_lock mapper_lock(mapper_mutex_);
             if (!mapper_ || mapper_owner_ != job.d3d.get()) {
                 mapper_ = std::make_unique<ToneMapper>(job.d3d);
@@ -548,13 +500,17 @@ namespace gamesnap {
             if (mapper_->ok()) {
                 gpu_ok = mapper_->map(job.texture_slot->texture.get(), job.color_space, job.sdr_white_nits,
                                       job.tone_map, sdr, hdr10, error);
-                if (!gpu_ok)
+                if (!gpu_ok) {
                     SPDLOG_WARN("[#{:04}] compute tone map 失败，回退 CPU: {}", job.sequence, error);
+                    const auto disabled_until = SteadyClock::now() + std::chrono::seconds(30);
+                    mapper_disabled_until_ns_.store(disabled_until.time_since_epoch().count(),
+                                                    std::memory_order_release);
+                }
             }
         }
 
         if (!gpu_ok) {
-            if (!map_to_cpu(*job.d3d, job.texture_slot->texture.get(), raw, error)) {
+            if (!map_to_cpu(*job.d3d, job.texture_slot->texture.get(), job.gpu_fence, raw, error)) {
                 SPDLOG_ERROR("[#{:04}] 取像素失败: {}", job.sequence, error);
                 return;
             }
@@ -562,7 +518,7 @@ namespace gamesnap {
         const auto mapped_at = SteadyClock::now();
 
         // staging 的所有 GPU/CPU 读取都已完成，允许下一张截图复用主纹理。
-        guard.release();
+        guard.dismiss();
         if (job.canceled && job.canceled->load(std::memory_order_acquire))
             return;
 
@@ -616,23 +572,21 @@ namespace gamesnap {
                 written.push_back(sdr_path);
             }
         } else {
-            Image image;
-            if (!convert_pixels(raw, job.color_space, job.sdr_white_nits, image)) {
+            if (!convert_pixels(raw, job.color_space, job.sdr_white_nits, sdr)) {
                 SPDLOG_ERROR("[#{:04}] 不支持的像素格式 {}", job.sequence, static_cast<int>(raw.format));
                 return;
             }
-            image.metadata = sdr.metadata;
             const auto path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
                                                image_extension(job.sdr_format), {});
-            if (ui_ && !image.pixels.empty())
-                ui_->publish(path.filename().wstring(), image);
-            if (!write_sdr(path, job.sdr_format, image, error)) {
+            if (ui_ && !sdr.pixels.empty())
+                ui_->publish(path.filename().wstring(), sdr);
+            if (!write_sdr(path, job.sdr_format, sdr, error)) {
                 SPDLOG_ERROR("[#{:04}] 编码失败 ({}): {}", job.sequence, to_string(job.sdr_format), error);
                 return;
             }
             written.push_back(path);
-            width = static_cast<int>(image.width);
-            height = static_cast<int>(image.height);
+            width = static_cast<int>(sdr.width);
+            height = static_cast<int>(sdr.height);
         }
 
         const auto encoded_at = SteadyClock::now();
@@ -651,7 +605,6 @@ namespace gamesnap {
         const double queue_wait = duration_ms(t.dequeued - t.input);
         const double title_lookup = duration_ms(t.title_done - t.dequeued);
         const double prepare = duration_ms(t.prepared - t.title_done);
-        const double start_capture_call = duration_ms(t.start_capture_done - t.start_capture);
         const double start_to_frame = duration_ms(t.frame_received - t.start_capture);
         const double copy = duration_ms(t.copied - t.frame_received);
         const double pixel = duration_ms(mapped_at - t.copied);
@@ -661,12 +614,12 @@ namespace gamesnap {
         SPDLOG_INFO(
             "[#{:04}] {} {}x{} {} | 按键→StartCapture {:.2f}ms "
             "(排队 {:.2f} | 标题 {:.2f} | 准备 {:.2f}) | "
-            "StartCapture调用 {:.2f}ms | StartCapture→首帧 {:.2f}ms | "
+            "StartCapture→首帧 {:.2f}ms | "
             "GPU 拷贝 {:.2f}ms | 取像素 {:.2f}ms | 编码/写盘 {:.2f}ms | "
             "按键→落盘 {:.2f}ms",
             job.sequence, paths, width, height, job.hdr ? "HDR+SDR" : "SDR",
             key_to_start, queue_wait, title_lookup, prepare,
-            start_capture_call, start_to_frame, copy, pixel, convert, total);
+            start_to_frame, copy, pixel, convert, total);
     }
 
 }  // namespace gamesnap

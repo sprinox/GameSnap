@@ -66,16 +66,12 @@ namespace gamesnap {
     }
 
     void UiBridge::publish(std::wstring filename, Image const& image) {
-        std::vector<std::uint8_t> thumbnail;
-        std::uint32_t width = 0;
-        std::uint32_t height = 0;
-        make_thumbnail(image, thumbnail, width, height);
+        auto thumbnail = std::make_shared<Thumbnail>();
+        make_thumbnail(image, thumbnail->pixels, thumbnail->width, thumbnail->height);
 
         std::scoped_lock lock(mutex_);
         filename_ = std::move(filename);
         thumbnail_ = std::move(thumbnail);
-        thumb_width_ = width;
-        thumb_height_ = height;
         ++info_serial_;
     }
 
@@ -88,8 +84,6 @@ namespace gamesnap {
             result.info_serial = info_serial_;
             result.filename = filename_;
             result.thumbnail = thumbnail_;
-            result.thumb_width = thumb_width_;
-            result.thumb_height = thumb_height_;
         }
         return result;
     }

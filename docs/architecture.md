@@ -84,10 +84,10 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 
 1. `CaptureResources`（item / pool / session）只在 capture 线程创建、使用、销毁。
 2. `FrameArrived` 在 frame pool 的工作线程上串行投递；每个 pool 一个独立 `FrameSink`，回调只接触本 pool 的 sink 和 shot。
-3. `ID3D11DeviceContext` 不是线程安全的：回调线程的 `CopyResource` 与编码线程的 `Map` / `Unmap` 共用 `D3DContext::context_mutex()`；`Map` 使用 `D3D11_MAP_FLAG_DO_NOT_WAIT`，GPU 未完成时在锁外 sleep 重试，锁只覆盖单次 `Map` / `Unmap`。`Map` 返回后的逐行 `memcpy` 只是普通 CPU 读内存，在锁外并行执行，转换和写盘也在锁外。ToneMapper 用 `D3D11_QUERY_EVENT` 在锁外等待 GPU 完成。
+3. `ID3D11DeviceContext` 不是线程安全的：回调线程的 `CopyResource` 与编码线程的 `Map` / `Unmap` 共用 `D3DContext::context_mutex()`；`CopyResource` 后由 `D3DContext` 的 fence 发布完成值；编码线程在锁外等待 fence/event，再在锁内 `Map` / `Unmap`。`Map` 返回后的逐行 `memcpy` 只是普通 CPU 读内存，在锁外并行执行，转换和写盘也在锁外。ToneMapper 同样使用 fence + event 等待。
 4. 资源按“代”整体替换：先建好新一代，全部成功后才替换，失败则旧代继续工作。
 5. 退出顺序：先停 input 和 system-events，再给 capture 投递 `Shutdown`，最后给编码线程投递 `stop`；生产者先停，消费者后停。
-6. staging 纹理只有一块，用一个显式的 `atomic<bool>` 占用标记：编码线程 Map 完立刻释放，截图时标记已占用就临时新建一块，不依赖 `shared_ptr::use_count`。
+6. 采集纹理由 `TextureSlot` 缓存：HDR 为 DEFAULT+SRV，SDR 为 staging；`busy` 与纹理绑定，编码线程完成 GPU/Map 后释放，占用时临时新建，不依赖 `shared_ptr::use_count`。
 
 ## 显示器与设备变化
 
@@ -109,9 +109,9 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 - HDR：同一帧写 `_HDR.<format_hdr>`（10-bit PQ/BT.2020 AVIF 或 HEIC）和 `_SDR.<format_sdr>`。
 - HDR 的 PQ OETF 与 SDR 色调映射在同一个 D3D11 compute dispatch 完成：FP16 → BT.2020 nit → PQ（HDR）；
   同一 texel → BT.709 亮度 → Hermite shoulder（spline）→ sRGB（SDR）。`analysis` 是 false color 调试算法。
-- ToneMapper 每个代只保留一份（编码线程共享，由 mapper mutex 串行）；GPU 用 `D3D11_QUERY_EVENT` 等待，
+- ToneMapper 每个代只保留一份（编码线程共享，由 mapper mutex 串行）；GPU 用 `ID3D11Fence` + event 等待，
   等待期间不持 `context_mutex`，避免阻塞 capture 回调。
-- 编码大缓冲全进程只保留一份：编码线程 `try_lock` 取得，拿不到时本张图临时分配，任务结束立即释放。
+- 每个编码线程持有自己的 `EncodeScratch`，线程内复用；SDR 不再走临时 `Image`。
 - SDR AVIF 内嵌 ISO 21496-1 gain map；HEIC 的 libheif 1.23 没有 gain map 写入 API，只输出 SDR 基图。
 - 文件名：`<前台窗口标题>_YYYYMMDD_HHMMSS_mmm_序号[_HDR|_SDR].<扩展名>`；标题在命令出队时取，非法字符替换为 `_`。
 

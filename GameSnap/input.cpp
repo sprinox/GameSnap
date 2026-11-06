@@ -181,7 +181,6 @@ namespace gamesnap {
     void InputThread::trigger(SteadyClock::time_point when) {
         Command command;
         command.kind = CommandKind::Trigger;
-        command.reason = ReloadReason::Manual;
         command.enqueued = when;
         // 键盘钩子线程和 GameInput 回调线程都会调用；一次按键只入队一次，
         // 用不带 token 的 enqueue，避免两个线程共享同一个 ProducerToken。

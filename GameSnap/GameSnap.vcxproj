@@ -88,7 +88,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <EnableParallelCodeGeneration>true</EnableParallelCodeGeneration>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
-      <FloatingPointModel>Fast</FloatingPointModel>
+      <FloatingPointModel>Precise</FloatingPointModel>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
@@ -127,7 +127,7 @@
       <ControlFlowGuard>Guard</ControlFlowGuard>
       <EnableParallelCodeGeneration>true</EnableParallelCodeGeneration>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
-      <FloatingPointModel>Fast</FloatingPointModel>
+      <FloatingPointModel>Precise</FloatingPointModel>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
     </ClCompile>
@@ -143,11 +143,15 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="capture.cpp" />
-    <ClCompile Include="codecs.cpp" />
+    <ClCompile Include="codecs.cpp">
+      <FloatingPointModel>Precise</FloatingPointModel>
+    </ClCompile>
     <ClCompile Include="common.cpp" />
     <ClCompile Include="d3d.cpp" />
     <ClCompile Include="display.cpp" />
-    <ClCompile Include="encoder.cpp" />
+    <ClCompile Include="encoder.cpp">
+      <FloatingPointModel>Precise</FloatingPointModel>
+    </ClCompile>
     <ClCompile Include="input.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="overlay.cpp" />
@@ -159,7 +163,9 @@
     <ClCompile Include="selftest.cpp" />
     <ClCompile Include="simd.cpp" />
     <ClCompile Include="system_events.cpp" />
-    <ClCompile Include="tonemap.cpp" />
+    <ClCompile Include="tonemap.cpp">
+      <FloatingPointModel>Precise</FloatingPointModel>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="capture.h" />
@@ -187,6 +193,7 @@
       <EntryPointName>main</EntryPointName>
       <HeaderFileOutput>$(TargetDir)tonemap_cs.h</HeaderFileOutput>
       <VariableName>kTonemapCS</VariableName>
+      <AdditionalOptions Condition="'$(Configuration)'=='Release'">/O3 %(AdditionalOptions)</AdditionalOptions>
     </FxCompile>
   </ItemGroup>
   <ItemGroup>

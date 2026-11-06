@@ -44,7 +44,6 @@ namespace gamesnap {
         winrt::com_ptr<ID3D11Buffer> constants_;
         winrt::com_ptr<ID3D11Fence> fence_;
         winrt::com_ptr<ID3D11DeviceContext4> context4_;
-        HANDLE fence_event_ = nullptr;
         std::uint64_t fence_value_ = 0;
         winrt::com_ptr<ID3D11Texture2D> output_;
         winrt::com_ptr<ID3D11UnorderedAccessView> output_view_;

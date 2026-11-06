@@ -23,14 +23,18 @@ namespace gamesnap {
         UiBridge(UiBridge&&) = delete;
         UiBridge& operator=(UiBridge&&) = delete;
 
+        struct Thumbnail {
+            std::vector<std::uint8_t> pixels;
+            std::uint32_t width = 0;
+            std::uint32_t height = 0;
+        };
+
         struct Snapshot {
             std::uint64_t trigger_serial = 0;
             std::uint64_t info_serial = 0;
             int remaining = 0;
             std::wstring filename;
-            std::vector<std::uint8_t> thumbnail;
-            std::uint32_t thumb_width = 0;
-            std::uint32_t thumb_height = 0;
+            std::shared_ptr<const Thumbnail> thumbnail;
         };
 
         void on_trigger() noexcept;
@@ -44,9 +48,7 @@ namespace gamesnap {
     private:
         mutable std::mutex mutex_;
         std::wstring filename_;
-        std::vector<std::uint8_t> thumbnail_;
-        std::uint32_t thumb_width_ = 0;
-        std::uint32_t thumb_height_ = 0;
+        std::shared_ptr<const Thumbnail> thumbnail_;
         std::uint64_t info_serial_ = 0;
         std::atomic<std::uint64_t> trigger_serial_{0};
         HANDLE trigger_event_ = nullptr;

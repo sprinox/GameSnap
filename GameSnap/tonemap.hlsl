@@ -1,6 +1,6 @@
 Texture2D<float4> Hdr : register(t0);
 RWTexture2D<float4> Out : register(u0);
-RWTexture2D<uint4> HdrOut : register(u1);
+RWTexture2D<float4> HdrOut : register(u1);
 
 cbuffer Params : register(b0)
 {
@@ -89,6 +89,7 @@ float spline_shoulder(float x)
     float h01 = -2.0 * t * t * t + 3.0 * t * t;
     const float slope0 = (white / max(knee, 1e-4)) * (1.0 - knee);
     return h00 * white + h10 * slope0 + h01;
+    return 1.0;
 }
 
 // analysis 的简化版：按亮度做 false color，方便看 HDR 分布。
@@ -99,6 +100,7 @@ float3 analysis_debug(float nits)
     if (nits < 100.0) return float3(0.0, 1.0, 0.0);
     if (nits < 300.0) return float3(1.0, 1.0, 0.0);
     if (nits < 1000.0) return float3(1.0, 0.4, 0.0);
+    return float3(1.0, 0.0, 1.0);
     return float3(1.0, 0.0, 1.0);
 }
 
@@ -126,7 +128,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         pq_code = uint3(round(saturate(nits_to_pq3(nits2020)) * 1023.0));
 
     // 同一个 kernel 里输出 10-bit PQ / BT.2020，供 AVIF/HEIC 直接使用。
-    HdrOut[tid.xy] = uint4(pq_code, 1023);
+    HdrOut[tid.xy] = float4(float3(pq_code) / 1023.0, 1.0);
 
     float3 nits = bt2020_to_709(nits2020);
     float luma = dot(nits, float3(0.2126, 0.7152, 0.0722));

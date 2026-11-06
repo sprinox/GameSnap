@@ -13,10 +13,16 @@
 #include <libheif/heif.h>
 #include <spng.h>
 #include <webp/encode.h>
+#include <x265.h>
+
+#pragma comment(lib, "x265-static.lib")
+#include <webp/mux.h>
 
 #include "codecs.h"
 #include "common.h"
 #include "simd.h"
+
+#pragma comment(lib, "libwebpmux.lib")
 
 namespace gamesnap {
 
@@ -51,14 +57,11 @@ namespace gamesnap {
                 return false;
             }
             file.write(static_cast<char const*>(data), static_cast<std::streamsize>(size));
-            file.flush();
-            if (!file.good()) {
-                error = "写文件失败";
-                return false;
-            }
             file.close();
             if (file.fail()) {
-                error = "关闭文件失败";
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+                error = "写文件失败";
                 return false;
             }
             return true;
@@ -126,10 +129,6 @@ namespace gamesnap {
         void write_u16_be(std::uint8_t* out, std::uint16_t value) {
             const std::uint16_t encoded = std::byteswap(value);
             std::memcpy(out, &encoded, sizeof(encoded));
-        }
-
-        void write_u32_le(std::uint8_t* out, std::uint32_t value) {
-            std::memcpy(out, &value, sizeof(value));
         }
 
         void write_u32_be(std::uint8_t* out, std::uint32_t value) {
@@ -270,22 +269,28 @@ namespace gamesnap {
                 std::memcmp(webp.data() + 8, "WEBP", 4) != 0) {
                 return webp;
             }
+
             const auto exif = make_exif_payload(metadata);
-            const std::size_t padding = exif.size() & 1U;
-            std::vector<std::uint8_t> chunk(8 + exif.size() + padding);
-            auto* chunk_data = chunk.data();
-            constexpr std::array<std::uint8_t, 4> exif_type{'E', 'X', 'I', 'F'};
-            std::memcpy(chunk_data, exif_type.data(), exif_type.size());
-            write_u32_le(chunk_data + 4, static_cast<std::uint32_t>(exif.size()));
-            std::memcpy(chunk_data + 8, exif.data(), exif.size());
-            if (padding != 0) {
-                constexpr std::uint8_t zero = 0;
-                std::memcpy(chunk_data + 8 + exif.size(), &zero, 1);
+            WebPData image_data{.bytes = webp.data(), .size = webp.size()};
+            WebPData exif_data{.bytes = exif.data(), .size = exif.size()};
+            WebPMux* mux = WebPMuxNew();
+            if (mux == nullptr)
+                return webp;
+            if (WebPMuxSetImage(mux, &image_data, 1) != WEBP_MUX_OK ||
+                WebPMuxSetChunk(mux, "EXIF", &exif_data, 1) != WEBP_MUX_OK) {
+                WebPMuxDelete(mux);
+                return webp;
             }
 
-            webp.insert(webp.end(), chunk.begin(), chunk.end());
-            write_u32_le(webp.data() + 4, static_cast<std::uint32_t>(webp.size() - 8));
-            return webp;
+            WebPData assembled{};
+            if (WebPMuxAssemble(mux, &assembled) != WEBP_MUX_OK) {
+                WebPMuxDelete(mux);
+                return webp;
+            }
+            std::vector<std::uint8_t> out(assembled.bytes, assembled.bytes + assembled.size);
+            WebPDataClear(&assembled);
+            WebPMuxDelete(mux);
+            return out;
         }
 
         // ── BMP ──────────────────────────────────────────────────────────────
@@ -518,7 +523,7 @@ namespace gamesnap {
             const int avif_speed = std::clamp(codec_options.avif_speed, 0, 10);
             const int avif_quality = codec_options.avif_lossless ? 100 : codec_options.avif_quality;
             encoder->speed = avif_speed;
-            encoder->maxThreads = 8;
+            encoder->maxThreads = 1;  // 并行度由 encode_threads 提供，避免 N×8 超订
             encoder->quality = avif_quality;
             encoder->qualityAlpha = avif_quality;
             encoder->qualityGainMap = avif_quality;
@@ -635,11 +640,6 @@ namespace gamesnap {
             return ok;
         }
 
-        bool avif_from_hdr(std::filesystem::path const& path, HdrFrame const& frame, std::string& error) {
-            auto rgba = hdr_to_rgba10(frame);
-            return avif_from_rgba10(path, rgba.data(), frame.width, frame.height, frame.metadata, error);
-        }
-
         bool avif_gainmap(std::filesystem::path const& path, Image const& sdr, std::uint16_t const* hdr10,
                           std::uint32_t width, std::uint32_t height, std::string& error) {
             if (sdr.width != width || sdr.height != height || sdr.stride != width * 4) {
@@ -745,13 +745,27 @@ namespace gamesnap {
                     SPDLOG_WARN("HEIC 写入 EXIF 失败: {}", add_exif.message ? add_exif.message : "unknown");
                 heif_image_handle_release(handle);
             }
-            const std::string utf8 = wstring_to_utf8(path.wstring());
-            const heif_error written = heif_context_write_to_file(ctx, utf8.c_str());
+            struct MemoryWriter {
+                std::vector<std::uint8_t> bytes;
+            };
+            heif_writer writer{
+                .writer_api_version = 1,
+                .write = [](heif_context*, void const* data, std::size_t size,
+                            void* userdata) -> heif_error {
+                    auto* output = static_cast<MemoryWriter*>(userdata);
+                    const auto* begin = static_cast<const std::uint8_t*>(data);
+                    output->bytes.insert(output->bytes.end(), begin, begin + size);
+                    return heif_error{.code = heif_error_Ok,
+                                      .subcode = heif_suberror_Unspecified,
+                                      .message = nullptr};
+                }};
+            MemoryWriter output;
+            const heif_error written = heif_context_write(ctx, &writer, &output);
             if (written.code != heif_error_Ok) {
-                error = fmt::format("HEIC 写文件失败: {}", written.message ? written.message : "unknown");
+                error = fmt::format("HEIC 序列化失败: {}", written.message ? written.message : "unknown");
                 return false;
             }
-            return true;
+            return write_bytes(path, output.bytes.data(), output.bytes.size(), error);
         }
 
         heif_encoder* make_heif_encoder(heif_context* ctx, std::string& error) {
@@ -969,39 +983,6 @@ namespace gamesnap {
         return format == ImageFormat::Avif || format == ImageFormat::Heic;
     }
 
-    bool encode_bmp(std::filesystem::path const& path, Image const& image, std::string& error) {
-        return write_bmp_impl(path, image, error);
-    }
-
-    bool encode_png(std::filesystem::path const& path, Image const& image, std::string& error) {
-        return write_png_impl(path, image, error);
-    }
-
-    bool encode_jpeg(std::filesystem::path const& path, Image const& image, std::string& error) {
-        return write_jpeg_impl(path, image, error);
-    }
-
-    bool encode_webp(std::filesystem::path const& path, Image const& image, std::string& error) {
-        return write_webp_impl(path, image, error);
-    }
-
-    bool encode_avif(std::filesystem::path const& path, Image const& image, std::string& error) {
-        return avif_from_bgra(path, image, false, error);
-    }
-
-    bool encode_heic(std::filesystem::path const& path, Image const& image, std::string& error) {
-        return heic_from_bgra(path, image, error);
-    }
-
-    bool encode_avif_hdr(std::filesystem::path const& path, HdrFrame const& frame, std::string& error) {
-        return avif_from_hdr(path, frame, error);
-    }
-
-    bool encode_heic_hdr(std::filesystem::path const& path, HdrFrame const& frame, std::string& error) {
-        auto rgba = hdr_to_rgba10(frame);
-        return encode_heic_hdr10(path, rgba.data(), frame.width, frame.height, frame.metadata, error);
-    }
-
     bool encode_avif_hdr10(std::filesystem::path const& path, std::uint16_t const* rgba10,
                            std::uint32_t width, std::uint32_t height,
                            ImageMetadata const& metadata, std::string& error) {
@@ -1011,13 +992,18 @@ namespace gamesnap {
     bool encode_heic_hdr10(std::filesystem::path const& path, std::uint16_t const* rgba10,
                            std::uint32_t width, std::uint32_t height,
                            ImageMetadata const& metadata, std::string& error) {
-        if (heif_encode_rgba(path, rgba10, width, height, 10,
-                             heif_compression_HEVC, true, metadata, error))
-            return true;
-
-        // vcpkg 的 x265 可能只有 8-bit（本机实测 x265_max_bit_depth=8、x265_api_get(10)=nullptr）；
-        // 退化为 8-bit PQ，至少保留 HDR 元数据。
-        SPDLOG_WARN("HEIC 10-bit 编码失败，回退 8-bit: {}", error);
+        static const bool kSupports10Bit = [] {
+            const bool available = x265_max_bit_depth >= 10;
+            if (!available)
+                SPDLOG_INFO("x265 不支持 10-bit，HEIC 直接使用 8-bit PQ");
+            return available;
+        }();
+        if (kSupports10Bit) {
+            if (heif_encode_rgba(path, rgba10, width, height, 10,
+                                 heif_compression_HEVC, true, metadata, error))
+                return true;
+            SPDLOG_WARN("HEIC 10-bit 编码失败，回退 8-bit: {}", error);
+        }
         const std::size_t count = static_cast<std::size_t>(width) * height * 4;
         std::vector<std::uint8_t> rgba8(count);
         for (std::size_t i = 0; i < count; ++i)
@@ -1035,17 +1021,17 @@ namespace gamesnap {
     bool write_sdr(std::filesystem::path const& path, ImageFormat format, Image const& image, std::string& error) {
         switch (format) {
         case ImageFormat::Bmp:
-            return encode_bmp(path, image, error);
+            return write_bmp_impl(path, image, error);
         case ImageFormat::Png:
-            return encode_png(path, image, error);
+            return write_png_impl(path, image, error);
         case ImageFormat::Jpeg:
-            return encode_jpeg(path, image, error);
+            return write_jpeg_impl(path, image, error);
         case ImageFormat::Webp:
-            return encode_webp(path, image, error);
+            return write_webp_impl(path, image, error);
         case ImageFormat::Avif:
-            return encode_avif(path, image, error);
+            return avif_from_bgra(path, image, false, error);
         case ImageFormat::Heic:
-            return encode_heic(path, image, error);
+            return heic_from_bgra(path, image, error);
         }
         return false;
     }
@@ -1056,9 +1042,12 @@ namespace gamesnap {
             error = "该格式不支持 HDR";
             return false;
         }
+        if (rgba10_out != nullptr) {
+            *rgba10_out = hdr_to_rgba10(frame);
+            return write_hdr10(path, format, rgba10_out->data(), frame.width, frame.height,
+                               frame.metadata, error);
+        }
         auto rgba10 = hdr_to_rgba10(frame);
-        if (rgba10_out != nullptr)
-            *rgba10_out = rgba10;
         return write_hdr10(path, format, rgba10.data(), frame.width, frame.height, frame.metadata, error);
     }
 

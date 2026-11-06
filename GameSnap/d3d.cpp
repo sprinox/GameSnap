@@ -84,6 +84,16 @@ namespace gamesnap {
             if (!context->winrt_device_)
                 return fail("无法获取 IDirect3DDevice");
 
+            winrt::com_ptr<ID3D11Device5> device5;
+            winrt::com_ptr<ID3D11DeviceContext4> context4;
+            if (SUCCEEDED(context->device_->QueryInterface(__uuidof(ID3D11Device5), device5.put_void())) &&
+                SUCCEEDED(context->context_->QueryInterface(__uuidof(ID3D11DeviceContext4), context4.put_void()))) {
+                if (SUCCEEDED(device5->CreateFence(0, D3D11_FENCE_FLAG_NONE,
+                                                   __uuidof(ID3D11Fence), context->fence_.put_void()))) {
+                    context->context4_ = context4;
+                }
+            }
+
             context->print_hardware_info();
             return context;
         } catch (winrt::hresult_error const& e) {
@@ -123,6 +133,35 @@ namespace gamesnap {
         SPDLOG_INFO("显存: 专用 {:.2f} GB / 共享 {:.2f} GB",
                     static_cast<double>(desc.DedicatedVideoMemory) / (1024.0 * 1024.0 * 1024.0),
                     static_cast<double>(desc.SharedSystemMemory) / (1024.0 * 1024.0 * 1024.0));
+    }
+
+    std::uint64_t D3DContext::signal_fence_locked() {
+        if (!fence_ || !context4_)
+            return 0;
+        const std::uint64_t value = fence_value_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (FAILED(context4_->Signal(fence_.get(), value)))
+            return 0;
+        return value;
+    }
+
+    bool D3DContext::wait_fence(std::uint64_t value, std::chrono::milliseconds timeout,
+                                std::string& error) {
+        if (value == 0 || !fence_)
+            return true;
+        HANDLE event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (event == nullptr) {
+            error = "CreateEvent(fence) 失败";
+            return false;
+        }
+        const HRESULT set = fence_->SetEventOnCompletion(value, event);
+        const DWORD waited = SUCCEEDED(set) ? ::WaitForSingleObject(event, static_cast<DWORD>(timeout.count()))
+                                            : WAIT_FAILED;
+        ::CloseHandle(event);
+        if (waited != WAIT_OBJECT_0) {
+            error = "等待 GPU fence 超时";
+            return false;
+        }
+        return fence_->GetCompletedValue() >= value;
     }
 
 }  // namespace gamesnap

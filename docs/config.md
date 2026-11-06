@@ -21,6 +21,7 @@ YAML 先加载，命令行参数随后覆盖。仓库根的 [config.example.yaml
 | `format_hdr` | 字符串 | `avif` | HDR 容器，仅 `avif` / `heic` |
 | `format_sdr` | 字符串 | `webp` | SDR 格式：`bmp` / `png` / `jpeg` / `webp` / `avif` / `heic` |
 | `tone_map` | 字符串 | `spline` | HDR→SDR 算法：`spline` / `analysis` |
+| `tone_map_backend` | 字符串 | `auto` | HDR→SDR 计算后端：`auto` / `gpu` / `cpu` |
 | `png_compression` | 整数 0–9 | `6` | PNG 压缩级别，越高越慢/越小 |
 | `jpeg_quality` | 整数 1–100 | `95` | JPEG 质量 |
 | `webp_quality` | 整数 0–100 | `90` | WebP 质量 |
@@ -77,5 +78,5 @@ AVIF 支持 quality/lossless/speed；HEIC（x265）支持 quality/lossless/prese
 ## 输出格式
 HDR 截图固定写两份：`<名字>_HDR.<format_hdr>` 与 `<名字>_SDR.<format_sdr>`；非 HDR 只写 SDR。
 当 SDR 格式为 AVIF 时，SDR 文件内嵌 gain map（由 SDR 基图与 GPU 产出的 HDR PQ 帧计算）；HEIC 当前不写 gain map。
-BMP / PNG / WebP / AVIF 无损，JPEG quality=100；HEIC 为最高质量有损。
+默认：PNG 无损 compression=6；JPEG q95；WebP q90 有损；AVIF q90/speed=10 有损；HEIC q90/preset=fast。各格式质量/无损/速度可在 YAML 中配置。
 HDR 输出为 10-bit PQ / BT.2020（AVIF）；HEIC 在 x265 只有 8-bit 时自动退化为 8-bit PQ。

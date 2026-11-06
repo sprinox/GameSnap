@@ -275,8 +275,9 @@ namespace gamesnap {
 
     }  // namespace
 
-    OverlayThread::OverlayThread(std::shared_ptr<UiBridge> bridge)
-        : bridge_(std::move(bridge)), stop_event_(::CreateEventW(nullptr, TRUE, FALSE, nullptr)) {}
+    OverlayThread::OverlayThread(std::shared_ptr<UiBridge> bridge, MonitorChoice monitor)
+        : bridge_(std::move(bridge)), monitor_(monitor),
+          stop_event_(::CreateEventW(nullptr, TRUE, FALSE, nullptr)) {}
 
     OverlayThread::~OverlayThread() {
         try {
@@ -352,7 +353,12 @@ namespace gamesnap {
 
         MONITORINFO monitor_info{};
         monitor_info.cbSize = sizeof(monitor_info);
-        const HMONITOR monitor = ::MonitorFromWindow(::GetForegroundWindow(), MONITOR_DEFAULTTONEAREST);
+        // 和 capture 用同一套选屏规则：primary 就跟随主显示器，foreground 才跟随前台窗口。
+        // 否则默认截主屏时，面板会滑到游戏所在的副屏上。
+        const HMONITOR monitor =
+            monitor_ == MonitorChoice::Foreground
+                ? ::MonitorFromWindow(::GetForegroundWindow(), MONITOR_DEFAULTTONEAREST)
+                : ::MonitorFromPoint(POINT{.x = 0, .y = 0}, MONITOR_DEFAULTTOPRIMARY);
         ::GetMonitorInfoW(monitor, &monitor_info);
 
         HWND hwnd = ::CreateWindowExW(
@@ -498,6 +504,8 @@ namespace gamesnap {
                 if (snapshot.thumbnail)
                     device.set_thumbnail(snapshot.thumbnail->pixels, snapshot.thumbnail->width,
                                          snapshot.thumbnail->height);
+                else
+                    device.set_thumbnail({}, 0, 0);  // 新截图已开始但还没有缩略图：清掉上一张
             }
 
             io.DisplaySize = ImVec2(static_cast<float>(panel_width), static_cast<float>(panel_height));

@@ -48,6 +48,14 @@ namespace gamesnap {
     }
 
     void UiBridge::on_trigger() noexcept {
+        {
+            // 新截图还没有文件：立刻丢弃上一张的名字和缩略图，避免面板在 publish() 之前
+            // 继续显示旧文件名。trigger_serial 随后自增，overlay 靠它判断是新的一次触发。
+            std::scoped_lock lock(mutex_);
+            filename_.clear();
+            thumbnail_.reset();
+            ++info_serial_;
+        }
         trigger_serial_.fetch_add(1, std::memory_order_release);
         if (trigger_event_ != nullptr)
             ::SetEvent(trigger_event_);

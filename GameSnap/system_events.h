@@ -33,6 +33,9 @@ namespace gamesnap {
     private:
         void run();
         void post(CommandKind kind, ReloadReason reason);
+        // 合并短时间内的重复自检请求：WM_SETTINGCHANGE 在 Windows 上触发很频繁，
+        // 每次自检都要枚举 DXGI 输出并查询显示器配置。
+        void post_validate(ReloadReason reason);
 
         static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
         static void CALLBACK win_event_proc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
@@ -46,6 +49,8 @@ namespace gamesnap {
         HWND window_ = nullptr;
         HWINEVENTHOOK foreground_hook_ = nullptr;
         HMONITOR foreground_monitor_ = nullptr;
+        // 只在 system-events 线程读写；用来合并短时间内的重复 Validate。
+        SteadyClock::time_point last_validate_{};
     };
 
 }  // namespace gamesnap

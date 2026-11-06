@@ -138,7 +138,7 @@ namespace gamesnap {
     std::uint64_t D3DContext::signal_fence_locked() {
         if (!fence_ || !context4_)
             return 0;
-        const std::uint64_t value = fence_value_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        const std::uint64_t value = ++fence_value_;
         if (FAILED(context4_->Signal(fence_.get(), value)))
             return 0;
         return value;
@@ -150,18 +150,32 @@ namespace gamesnap {
             return true;
         HANDLE event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (event == nullptr) {
-            error = "CreateEvent(fence) 失败";
+            error = fmt::format("CreateEvent(fence) 失败: Win32 {}", ::GetLastError());
             return false;
         }
         const HRESULT set = fence_->SetEventOnCompletion(value, event);
-        const DWORD waited = SUCCEEDED(set) ? ::WaitForSingleObject(event, static_cast<DWORD>(timeout.count()))
-                                            : WAIT_FAILED;
-        ::CloseHandle(event);
-        if (waited != WAIT_OBJECT_0) {
-            error = "等待 GPU fence 超时";
+        if (FAILED(set)) {
+            ::CloseHandle(event);
+            error = fmt::format("SetEventOnCompletion 失败: {}", describe_hresult(set));
             return false;
         }
-        return fence_->GetCompletedValue() >= value;
+        const DWORD waited = ::WaitForSingleObject(event, static_cast<DWORD>(timeout.count()));
+        const DWORD wait_error = ::GetLastError();
+        ::CloseHandle(event);
+        if (waited == WAIT_TIMEOUT) {
+            error = fmt::format("等待 GPU fence 超时（{}ms）", timeout.count());
+            return false;
+        }
+        if (waited != WAIT_OBJECT_0) {
+            error = fmt::format("等待 GPU fence 失败: Win32 {}", wait_error);
+            return false;
+        }
+        if (fence_->GetCompletedValue() < value) {
+            error = fmt::format("GPU fence 完成值 {} 小于等待值 {}",
+                                fence_->GetCompletedValue(), value);
+            return false;
+        }
+        return true;
     }
 
 }  // namespace gamesnap

@@ -53,10 +53,10 @@ namespace gamesnap {
     class FrameSink {
     public:
         void arm(std::shared_ptr<ShotContext> shot);
+        // 停止接收新 shot。若已 arm 但还没被回调取走，则把它标记为失败并 release done，
+        // 让仍在等帧的调用方立刻返回，而不是白等满等帧超时。
         void disarm();
         void on_frame(winrt::Direct3D11CaptureFramePool const& pool);
-        // 停止接收新 shot，并等待在途回调退出；false = 超时。
-        [[nodiscard]] bool close_and_wait(std::chrono::milliseconds timeout);
         [[nodiscard]] bool wait_idle(std::chrono::milliseconds timeout);
 
     private:
@@ -84,8 +84,10 @@ namespace gamesnap {
         void prepare();
         void start_capture();
         void stop_capture() noexcept;
-        // 先注销 FrameArrived，阻止新回调投递；随后由 sink 等待在途回调退出。
-        void unregister_frame_arrived() noexcept;
+        // 收尾顺序的唯一实现：停止接收新 shot → 注销 FrameArrived → 等在途回调退出。
+        // 只有它在关闭会话和 pool 之前完成，Close() 才不会被在途回调撞上。
+        // false = 回调没有在 timeout 内退出。
+        [[nodiscard]] bool quiesce(std::chrono::milliseconds timeout);
         void close();
         // 回调卡死时放弃本代：只释放引用，不调用任何 Close()。
         void abandon() noexcept;
@@ -101,6 +103,8 @@ namespace gamesnap {
         // 这些方法只在 capture 线程调用，资源对象不需要锁。
         void create_pool();
         void create_session();
+        // 只注销 FrameArrived，不碰 sink；由 quiesce() 统一调用。
+        void unregister_frame_arrived() noexcept;
 
         winrt::IDirect3DDevice device_{nullptr};
         winrt::DirectXPixelFormat format_ = winrt::DirectXPixelFormat::B8G8R8A8UIntNormalized;

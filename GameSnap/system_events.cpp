@@ -8,6 +8,9 @@ namespace gamesnap {
         // 编译期字面量，不需要每次 run() 构造 std::wstring。
         constexpr wchar_t const* kWindowClassName = L"GameSnap.SystemEvents";
         constexpr wchar_t const* kWindowTitle = L"GameSnap";
+        // 两次以上廉价自检之间的最小间隔。WM_SETTINGCHANGE 会随主题、输入法、显示器设置
+        // 和各种应用广播频繁到来，每次自检都要枚举 DXGI 输出，必须合并。
+        constexpr auto kValidateThrottle = std::chrono::milliseconds(500);
 
         std::atomic<SystemEventThread*>& win_event_target() {
             static std::atomic<SystemEventThread*> target{nullptr};
@@ -128,6 +131,16 @@ namespace gamesnap {
         commands_->enqueue(command);
     }
 
+    void SystemEventThread::post_validate(ReloadReason reason) {
+        const auto now = SteadyClock::now();
+        if (last_validate_ != SteadyClock::time_point{} && now - last_validate_ < kValidateThrottle) {
+            SPDLOG_DEBUG("自检请求过于频繁，合并本次（{}ms 节流）", kValidateThrottle.count());
+            return;
+        }
+        last_validate_ = now;
+        post(CommandKind::Validate, reason);
+    }
+
     void CALLBACK SystemEventThread::win_event_proc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
                                                     LONG id_object, LONG id_child, DWORD thread_id, DWORD time) {
         (void)hook;
@@ -164,19 +177,19 @@ namespace gamesnap {
             case WM_DISPLAYCHANGE:
                 // 切全屏 / 改分辨率 / 切 HDR 都会广播；先自检，真变了才重建。
                 SPDLOG_DEBUG("收到 WM_DISPLAYCHANGE");
-                self->post(CommandKind::Validate, ReloadReason::DisplayChange);
+                self->post_validate(ReloadReason::DisplayChange);
                 return 0;
 
             case WM_SETTINGCHANGE:
                 SPDLOG_DEBUG("收到 WM_SETTINGCHANGE");
-                // HDR 开关等设置变化可能只走这里，做一次廉价自检即可。
-                self->post(CommandKind::Validate, ReloadReason::DisplayChange);
+                // HDR 开关等设置变化可能只走这里，做一次廉价自检即可（已节流）。
+                self->post_validate(ReloadReason::DisplayChange);
                 return 0;
 
             case WM_DEVICECHANGE:
                 SPDLOG_DEBUG("收到 WM_DEVICECHANGE");
                 // 显卡插拔 / 驱动重启：先自检，确认失效才重建，避免误重建。
-                self->post(CommandKind::Validate, ReloadReason::DeviceChange);
+                self->post_validate(ReloadReason::DeviceChange);
                 return TRUE;
 
             case WM_POWERBROADCAST:

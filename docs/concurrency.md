@@ -65,7 +65,10 @@ COM apartment：main、capture、input、system-events、overlay 各自在线程
 - capture 线程独占；`CaptureResources` 自身无锁。
 - 每个 pool/session 对应一个独立的 `FrameSink`，旧 pool 的迟到回调不会取走新 shot。
 - 重建时先建好新一代，全部成功后才替换 `resources_` / `d3d_`；旧代最后 `close()`。
-- `close()` 先 `sink_->disarm()`，再等待在途回调退出，最后关 pool/session。
+- 收尾顺序只有 `quiesce()` 一份实现：`sink_->disarm()` → 注销 `FrameArrived` → `wait_idle()`；
+  `close()` 和单张截图结束都走它，之后才 `Close()` 会话和 pool。
+- `disarm()` 若丢下一张已 arm 但没被回调取走的 shot，会把它标记失败并 `release done`，
+  避免调用方白等满等帧超时。
 - `abandon()` 是回调卡死时的保命路径：不调用 WGC `Close()`，有意延迟回收。
 
 ### 2.2 每张截图的纹理
@@ -92,11 +95,12 @@ struct TextureSlot {
 每次 `EncodeWorkers::encode()` 局部创建：
 
 ```cpp
-RawCopy raw;                       // CPU fallback / SDR Map
-Image sdr;                         // SDR 输出
-std::vector<std::uint16_t> hdr10;  // HDR 10-bit
+RawCopy raw;          // CPU fallback / SDR Map
+Image sdr;            // SDR 输出
+U16Buffer hdr10;      // HDR 10-bit
 ```
 
+三者都是 `UninitBuffer`（`resize()` 只分配、不置零），写满即整体覆盖，省掉 4K HDR 一张图近百 MiB 的 memset。
 函数返回即释放，不使用 `thread_local EncodeScratch`，也没有 ScratchPool。
 SDR 的 BGRA→BGRA 路径仍通过 `pixels.swap()` 避免一次整帧复制。
 
@@ -108,6 +112,9 @@ SDR 的 BGRA→BGRA 路径仍通过 `pixels.swap()` 避免一次整帧复制。
 - SDR output / readback（BGRA8，4B/像素）。
 
 `map()` 完成并编码后，`ToneMapper` 随 job 析构，纹理全部释放。
+**刻意不按线程复用**：复用等于把这 4 张全尺寸纹理（4K 下约 127 MiB）变成闲置常驻显存，
+而截图工具绝大多数时间处于闲置状态；`ensure_size()` 的尺寸缓存因此不会被命中，
+它只是给“同一个 mapper 服务多张图”留的实现细节，不构成复用路径。
 因此没有常驻 mapper，也没有 `mapper_mutex_` / `mapper_owner_` / 熔断状态。
 
 ### 2.5 16KB tone LUT
@@ -116,7 +123,7 @@ SDR 的 BGRA→BGRA 路径仍通过 `pixels.swap()` 避免一次整帧复制。
 `std::atomic<bool> empty{true}`：
 
 - 只在 HDR CPU 回退路径（FP16 逐像素转换）首次用到时构建；
-- HDR job 缓存，SDR job 结束时释放，保持旧行为；
+- HDR job 缓存，SDR job 结束时释放（HDR 期间常驻，闲置时不留）；
 - `empty` 为 true 时 `release_tone_lut()` 直接返回，不拿锁；只有表非空才进入 mutex；
 - `empty` 与 mutex 保护的 `current` 允许短暂不一致，不保证 100% 避免重复加锁/释放，
   只优化绝大多数 SDR job。
@@ -162,9 +169,10 @@ LUT 的 `current` 由 `ToneLutCache::mutex` 保护；`empty` 是快速路径原�
    - 在 `context_mutex` 内 `CopyResource`，随后 `signal_fence_locked()`；
    - 填 `EncodeJob`，入队；
    - 入队后 `shot.done.release()`。
-3. capture 线程等 `done`，再 `stop_capture()`；上一张结束后预创建下一套 pool/session。
+3. capture 线程等 `done`，再 `quiesce()`（disarm → 注销 → 等回调退出）→ `stop_capture()`；
+   上一张结束后预创建下一套 pool/session。
 4. 编码线程：
-   - HDR 且允许 GPU：临时 `ToneMapper::map()`，内部等 fence；
+   - HDR 且允许 GPU：本 job 现建 `ToneMapper`，`map()` 内部等 fence，map 完随 job 析构；
    - 否则 `map_to_cpu()`：先等 `gpu_fence`，再在 `context_mutex` 内 `Map` / `Unmap`；
    - CPU 行拷贝、转换、编码、写盘全部在锁外。
 5. `EncodeJob` 析构，纹理和缓冲释放。
@@ -180,7 +188,7 @@ LUT 的 `current` 由 `ToneLutCache::mutex` 保护；`empty` 是快速路径原�
   最后一个消费到哨兵的编码线程会清空残留任务，避免 Shutdown 时丢掉已入队的截图。
 - capture 初始化失败会设置 `fatal_error_` 并 `request_stop()`；主线程用 ready latch 退出等待。
 - 编码异常在 `worker_main()` 里捕获，单张失败不会杀死线程。
-- 回调 2 秒不退出：`close_and_wait()` 超时，资源走 `abandon()`，不调用 WGC `Close()`。
+- 回调 2 秒不退出：`quiesce()` 超时，资源走 `abandon()`，不调用 WGC `Close()`。
 - `std::bad_alloc` 由全局 new_handler 记录并 abort；不在每个分配点做恢复。
 
 ---
@@ -203,7 +211,7 @@ LUT 的 `current` 由 `ToneLutCache::mutex` 保护；`empty` 是快速路径原�
 
 代价：
 
-- 每张截图增加纹理创建、ToneMapper 初始化、vector 分配；
+- 每张截图增加纹理创建、ToneMapper 初始化、缓冲分配；
 - HDR 连拍时分配/释放更频繁；
 - 驱动分配器可能产生碎片或额外延迟。
 
@@ -219,11 +227,12 @@ LUT 的 `current` 由 `ToneLutCache::mutex` 保护；`empty` 是快速路径原�
 ## 7. 审查清单
 
 - [ ] `CaptureResources` 是否只在 capture 线程访问？
+- [ ] `close()` 与单张收尾是否都走 `quiesce()`，且在 `Close()` 之前等到回调退出？
 - [ ] 每张截图是否新建 `TextureSlot`，job 是否持有到编码结束？
-- [ ] 编码线程是否不再使用 `thread_local` 大缓冲？
-- [ ] `ToneMapper` 是否只在该 job 内使用，且不跨线程共享？
+- [ ] 编码线程是否不再使用 `thread_local` 大缓冲，大缓冲是否都是 `UninitBuffer`（不整帧清零）？
+- [ ] `ToneMapper` 是否仍然每个 HDR job 现建现用、不跨 job 复用（闲置显存）？
 - [ ] 16KB LUT 是否 HDR 缓存、SDR 释放，且空表时 atomic 快路径不拿锁？
 - [ ] `context_mutex` 内是否没有 fence 等待、CPU 行拷贝、编码或写盘？
 - [ ] `UiBridge` 是否只复制 `shared_ptr`/字符串，不复制缩略图像素？
-- [ ] `FrameSink::disarm()` 是否置 `accepting_ = false` 并等待在途回调？
+- [ ] `FrameSink::disarm()` 是否丢弃已 arm 的 shot 并唤醒等待方？
 - [ ] 队列积压时是否仍能通过 `stop` 哨兵正常退出？

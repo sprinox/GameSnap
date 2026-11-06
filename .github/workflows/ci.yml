@@ -39,15 +39,15 @@ jobs:
           path: |
             ${{ github.workspace }}\vcpkg-cache
             ${{ env.VCPKG_ROOT }}\downloads
-          key: vcpkg-bins-v3-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: vcpkg-bins-v3-${{ runner.os }}-
+          key: vcpkg-bins-v4-${{ runner.os }}-${{ env.ImageVersion }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: vcpkg-bins-v4-${{ runner.os }}-${{ env.ImageVersion }}-
 
       - name: Restore vcpkg installed cache
         id: vcpkg-installed
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}\vcpkg_installed
-          key: vcpkg-installed-v3-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-installed-v4-${{ runner.os }}-${{ env.ImageVersion }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
 
       - name: Refresh vcpkg stamp on cache hit
         shell: pwsh
@@ -62,6 +62,19 @@ jobs:
       - name: Restore NuGet packages
         shell: pwsh
         run: nuget restore GameSnap\packages.config -PackagesDirectory packages
+
+      - name: Toolchain info
+        shell: pwsh
+        run: |
+          # vcpkg 用 vswhere -latest 选 MSVC 构建依赖，工程不写死 PlatformToolset，
+          # 两边才都跟随“最新已安装”。这里把实际选中的版本打出来便于排查链接期的 STL 不匹配。
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            Write-Host "VS: $(& $vswhere -latest -property displayName) $(& $vswhere -latest -property installationVersion)"
+          }
+          Write-Host "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
+          Get-ChildItem "$env:ProgramFiles\Microsoft Visual Studio\*\VC\Tools\MSVC" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "MSVC toolset: $($_.Name)" }
 
       - name: Build Debug and Release x64
         shell: pwsh

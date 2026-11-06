@@ -128,11 +128,13 @@ namespace gamesnap {
     };
 
     // HDR 捕获的 FP16 原始帧；pq=true 表示码值是 BT.2020 PQ，否则是 scRGB 线性。
+    // bytes_per_pixel 用于校验源格式：`hdr_to_rgba10` 只接受 FP16 RGBA（8 字节/像素）。
     struct HdrFrame {
         std::uint8_t const* bytes = nullptr;
         std::uint32_t width = 0;
         std::uint32_t height = 0;
         std::uint32_t stride = 0;
+        std::uint32_t bytes_per_pixel = 8;
         bool pq = false;
         std::uint32_t sdr_white_nits = 80;
         ImageMetadata metadata;

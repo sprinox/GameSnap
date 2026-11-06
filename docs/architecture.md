@@ -23,6 +23,7 @@ flowchart LR
 | system-events | 隐藏的 top-level 窗口，接收显示 / 设备 / 电源广播并投递命令 |
 | capture | 捕获资源的唯一所有者：建 pool、`StartCapture`、等待完成、关闭 |
 | encode × N | `Map/Unmap` 取像素、格式转换、编码写盘 |
+| overlay | DirectComposition + ImGui + MP3：先出声，再建 UI；资源在触发后常驻 30s 再整体释放 |
 
 队列直接用 `moodycamel::BlockingConcurrentQueue`，不额外封装：
 
@@ -31,6 +32,19 @@ flowchart LR
 - 消息内的 `shared_ptr` 负责跨线程生命周期（`EncodeJob` 持有 staging 纹理与 D3D 设备）。
 
 文件名用 `std::chrono::system_clock`（`Clock`）；阶段耗时用 `std::chrono::steady_clock`（`SteadyClock`），系统时间校准不会让延迟出现负值。
+
+## 提示面板与提示音
+
+- 每次触发**先播放提示音**：首次触发时初始化 `MediaPlayer`、读取内嵌 MP3 并 `Play()`，之后才初始化窗口 /
+  D3D 设备 / 交换链 / DirectComposition / ImGui / 字体图集。声音不再排在 UI 初始化后面。
+- 一次触发把这些资源全部建好，面板收起后**继续保留 30 秒**（`kOverlayLinger`）：这段时间内再按热键直接复用，
+  只走动画与渲染；闲置超时才整体释放（窗口、设备、字体、播放器），回到“闲置不占显存/内存”。
+- 面板收起后窗口 `SW_HIDE` 且不再 `Present`，linger 期间不让 DWM 继续合成这个顶层表面；线程阻塞在事件上，
+  只在 linger 到期时醒一次。
+- 保留期间的可计算开销（100% DPI）：交换链 2 × 361 KiB、缩略图纹理 225 KiB、字体图集 0.25–1 MiB；
+  其余是 D3D 设备/驱动分配与 MediaPlayer（Media Foundation），属黑盒，需用 GPU 私有字节 + Private Bytes
+  在目标机上实测。
+- 面板选屏与截图使用同一套规则（`monitor: primary | foreground`），否则双屏时面板会滑到另一块屏上。
 
 ## 一次截图
 

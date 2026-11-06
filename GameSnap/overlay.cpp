@@ -30,6 +30,9 @@ namespace gamesnap {
 
         constexpr wchar_t kOverlayClass[] = L"GameSnap.Overlay";
         constexpr auto kMinShowTime = std::chrono::milliseconds(1200);
+        // 面板收起后继续保留窗口/设备/字体/播放器的时间：这段时间内再按热键直接复用，
+        // 超过就整体释放，回到“闲置不占显存/内存”。
+        constexpr auto kOverlayLinger = std::chrono::seconds(30);
         constexpr float kBasePanelWidth = 440.0F;
         constexpr float kBasePanelHeight = 210.0F;
         constexpr float kBaseMargin = 16.0F;
@@ -273,7 +276,56 @@ namespace gamesnap {
             return dpi == 0 ? 1.0F : static_cast<float>(dpi) / 96.0F;
         }
 
+        // 和 capture 用同一套选屏规则：primary 跟随主显示器，foreground 才跟随前台窗口。
+        HMONITOR pick_monitor(MonitorChoice choice) {
+            if (choice == MonitorChoice::Foreground) {
+                if (HWND foreground = ::GetForegroundWindow(); foreground != nullptr)
+                    return ::MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+            }
+            return ::MonitorFromPoint(POINT{.x = 0, .y = 0}, MONITOR_DEFAULTTOPRIMARY);
+        }
+
+        // 字体图集：固定文案 + 当前文件名的字形。文件名变化时重建（imgui 1.92 动态字体，
+        // 后端会在 NewFrame 里更新纹理）。
+        ImFont* build_font(float scale, std::wstring const& filename) {
+            ImGuiIO& io = ImGui::GetIO();
+            io.Fonts->Clear();
+            ImFontGlyphRangesBuilder builder;
+            builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
+            builder.AddText("GameSnap正在生成截图…剩余编码任务: 编码完成");
+            const std::string utf8_filename = wstring_to_utf8(filename);
+            if (!utf8_filename.empty())
+                builder.AddText(utf8_filename.c_str());
+            ImVector<ImWchar> ranges;
+            builder.BuildRanges(&ranges);
+
+            const std::filesystem::path font_path = L"C:\\Windows\\Fonts\\msyh.ttc";
+            ImFont* result = nullptr;
+            if (std::filesystem::exists(font_path)) {
+                result = io.Fonts->AddFontFromFileTTF(font_path.string().c_str(), 18.0F * scale, nullptr,
+                                                      ranges.Data);
+            }
+            if (result == nullptr)
+                result = io.Fonts->AddFontDefaultVector();
+            return result;
+        }
+
     }  // namespace
+
+    // 一次触发建好、linger 期间复用的 overlay 资源。窗口/设备/字体/播放器都在这里，
+    // state_ 为空即表示已整体释放。
+    struct OverlayState {
+        HINSTANCE instance = nullptr;
+        HWND hwnd = nullptr;
+        std::unique_ptr<OverlayDevice> device;
+        std::unique_ptr<AudioPlayer> audio;
+        bool imgui_ready = false;
+        ImFont* font = nullptr;
+        std::wstring font_filename;
+        float scale = 1.0F;
+        std::uint32_t panel_width = 0;
+        std::uint32_t panel_height = 0;
+    };
 
     OverlayThread::OverlayThread(std::shared_ptr<UiBridge> bridge, MonitorChoice monitor)
         : bridge_(std::move(bridge)), monitor_(monitor),
@@ -312,119 +364,200 @@ namespace gamesnap {
             thread_.join();
     }
 
+    void OverlayThread::play_audio() {
+        // 提示音优先：音频初始化（首次要读内嵌 MP3、建 MediaPlayer）与播放都排在
+        // 窗口/设备/ImGui/字体之前，所以“咔”声不必等 UI 初始化完成。
+        if (!state_)
+            state_ = std::make_unique<OverlayState>();
+        if (!state_->audio)
+            state_->audio = std::make_unique<AudioPlayer>();
+        state_->audio->play();
+    }
+
+    bool OverlayThread::ensure_ui() {
+        if (!state_)
+            state_ = std::make_unique<OverlayState>();
+
+        if (state_->hwnd == nullptr) {
+            const HINSTANCE instance = ::GetModuleHandleW(nullptr);
+            WNDCLASSEXW window_class{};
+            window_class.cbSize = sizeof(window_class);
+            window_class.lpfnWndProc = overlay_window_proc;
+            window_class.hInstance = instance;
+            window_class.lpszClassName = kOverlayClass;
+            if (::RegisterClassExW(&window_class) == 0 && ::GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+                SPDLOG_ERROR("注册 overlay 窗口类失败: {}", ::GetLastError());
+                return false;
+            }
+
+            MONITORINFO monitor_info{};
+            monitor_info.cbSize = sizeof(monitor_info);
+            ::GetMonitorInfoW(pick_monitor(monitor_), &monitor_info);
+
+            const HWND hwnd = ::CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+                    WS_EX_NOREDIRECTIONBITMAP,
+                kOverlayClass, L"GameSnap Overlay", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, instance, nullptr);
+            if (hwnd == nullptr) {
+                SPDLOG_ERROR("创建 overlay 窗口失败: {}", ::GetLastError());
+                ::UnregisterClassW(kOverlayClass, instance);
+                return false;
+            }
+            state_->instance = instance;
+            state_->hwnd = hwnd;
+            // 先把 1x1 窗口放到目标显示器再取 DPI，避免沿用主显示器/旧窗口的 DPI。
+            ::SetWindowPos(hwnd, HWND_TOPMOST, monitor_info.rcWork.right - 1, monitor_info.rcWork.bottom - 1, 1, 1,
+                           SWP_NOACTIVATE);
+            ::SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+        }
+
+        const float scale = dpi_scale(state_->hwnd);
+        const auto panel_width = static_cast<std::uint32_t>(kBasePanelWidth * scale);
+        const auto panel_height = static_cast<std::uint32_t>(kBasePanelHeight * scale);
+        if (state_->device && (scale != state_->scale || panel_width != state_->panel_width ||
+                               panel_height != state_->panel_height)) {
+            // 显示器或 DPI 变了：交换链和字体图集都要按新尺寸重建（窗口本身保留）。
+            release_ui();
+        }
+        state_->scale = scale;
+        state_->panel_width = panel_width;
+        state_->panel_height = panel_height;
+
+        if (!state_->device) {
+            auto device = std::make_unique<OverlayDevice>();
+            if (!device->initialize(state_->hwnd, panel_width, panel_height)) {
+                SPDLOG_ERROR("overlay D3D/DirectComposition 初始化失败，面板不可用（提示音不受影响）");
+                return false;
+            }
+            state_->device = std::move(device);
+        }
+
+        if (!state_->imgui_ready) {
+            IMGUI_CHECKVERSION();
+            ImGui::CreateContext();
+            ImGuiIO& io = ImGui::GetIO();
+            io.IniFilename = nullptr;
+            io.BackendPlatformName = "GameSnapOverlay";
+            if (!ImGui_ImplDX11_Init(state_->device->device(), state_->device->context())) {
+                SPDLOG_ERROR("ImGui DX11 backend 初始化失败");
+                ImGui::DestroyContext();
+                return false;
+            }
+            ImGui::GetStyle().FontSizeBase = 18.0F * state_->scale;
+            state_->imgui_ready = true;
+            state_->font_filename = bridge_->snapshot().filename;
+            state_->font = build_font(state_->scale, state_->font_filename);
+            SPDLOG_INFO("overlay 就绪（窗口/设备/字体/播放器常驻 {}s）", kOverlayLinger.count());
+        }
+        return true;
+    }
+
+    void OverlayThread::release_ui() {
+        if (!state_)
+            return;
+        if (state_->imgui_ready) {
+            ImGui_ImplDX11_Shutdown();
+            ImGui::DestroyContext();
+            state_->imgui_ready = false;
+        }
+        state_->font = nullptr;
+        state_->font_filename.clear();
+        if (state_->device) {
+            state_->device->shutdown();
+            state_->device.reset();
+        }
+    }
+
+    void OverlayThread::release_all() {
+        if (!state_)
+            return;
+        release_ui();
+        if (state_->hwnd != nullptr) {
+            ::DestroyWindow(state_->hwnd);  // 内部的 WM_DESTROY 会 PostQuitMessage，随后丢弃
+            state_->hwnd = nullptr;
+            MSG message;
+            while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) > 0) {
+            }
+        }
+        if (state_->instance != nullptr) {
+            ::UnregisterClassW(kOverlayClass, state_->instance);
+            state_->instance = nullptr;
+        }
+        state_.reset();  // 连同 AudioPlayer（MediaPlayer）一起释放
+    }
+
     void OverlayThread::run() {
+        // COM apartment 要覆盖整个线程：窗口、D3D、MediaPlayer 在 linger 期间一直活着。
+        ComApartment apartment;
+        if (!apartment.ok())
+            SPDLOG_WARN("overlay 线程初始化 COM 失败: {}", describe_hresult(apartment.result()));
+
         std::uint64_t last_trigger = bridge_->snapshot().trigger_serial;
+        auto idle_since = SteadyClock::now();
         while (!stop_.load(std::memory_order_acquire)) {
+            // 没有保留的 overlay 资源时无限等待；有就等到 linger 到期。
+            DWORD timeout = INFINITE;
+            if (state_) {
+                const auto idle = SteadyClock::now() - idle_since;
+                if (idle >= kOverlayLinger) {
+                    SPDLOG_INFO("overlay 闲置超过 {}s，释放窗口/设备/字体/播放器", kOverlayLinger.count());
+                    release_all();
+                    continue;
+                }
+                timeout = static_cast<DWORD>(
+                              std::chrono::duration_cast<std::chrono::milliseconds>(kOverlayLinger - idle).count()) +
+                          1;
+            }
+
             HANDLE handles[2]{bridge_->trigger_event(), stop_event_};
             const DWORD waited = (handles[0] != nullptr && stop_event_ != nullptr)
-                                     ? ::WaitForMultipleObjects(2, handles, FALSE, INFINITE)
+                                     ? ::WaitForMultipleObjects(2, handles, FALSE, timeout)
                                      : WAIT_FAILED;
             if (waited == WAIT_OBJECT_0 + 1)
                 break;
             if (stop_.load(std::memory_order_acquire))
                 break;
-            if (waited == WAIT_FAILED) {
+            if (waited == WAIT_TIMEOUT) {
+                SPDLOG_INFO("overlay 闲置超过 {}s，释放窗口/设备/字体/播放器", kOverlayLinger.count());
+                release_all();
+                continue;
+            }
+            if (waited != WAIT_OBJECT_0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 continue;
             }
+
             const UiBridge::Snapshot snapshot = bridge_->snapshot();
             if (snapshot.trigger_serial == last_trigger)
                 continue;
-            last_trigger = run_session(snapshot.trigger_serial);
+
+            play_audio();  // 先出声，再做 UI 初始化
+            if (!ensure_ui()) {
+                last_trigger = snapshot.trigger_serial;
+                idle_since = SteadyClock::now();
+                continue;
+            }
+            last_trigger = run_panel(snapshot.trigger_serial);
+            idle_since = SteadyClock::now();
         }
+
+        release_all();
     }
 
-    std::uint64_t OverlayThread::run_session(std::uint64_t trigger) {
-        ComApartment apartment;
-        if (!apartment.ok())
-            SPDLOG_WARN("overlay 线程初始化 COM 失败: {}", describe_hresult(apartment.result()));
-
-        const HINSTANCE instance = ::GetModuleHandleW(nullptr);
-        WNDCLASSEXW window_class{};
-        window_class.cbSize = sizeof(window_class);
-        window_class.lpfnWndProc = overlay_window_proc;
-        window_class.hInstance = instance;
-        window_class.lpszClassName = kOverlayClass;
-        if (::RegisterClassExW(&window_class) == 0 && ::GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-            SPDLOG_ERROR("注册 overlay 窗口类失败: {}", ::GetLastError());
-            return trigger;
-        }
-        auto unregister_class = ScopeExit{[&] { ::UnregisterClassW(kOverlayClass, instance); }};
+    std::uint64_t OverlayThread::run_panel(std::uint64_t trigger) {
+        // 进入这里时 state_ 一定是 ensure_ui() 建好的；本函数只画一次面板动画，不建不拆资源。
+        OverlayState& state = *state_;
 
         MONITORINFO monitor_info{};
         monitor_info.cbSize = sizeof(monitor_info);
-        // 和 capture 用同一套选屏规则：primary 就跟随主显示器，foreground 才跟随前台窗口。
-        // 否则默认截主屏时，面板会滑到游戏所在的副屏上。
-        const HMONITOR monitor =
-            monitor_ == MonitorChoice::Foreground
-                ? ::MonitorFromWindow(::GetForegroundWindow(), MONITOR_DEFAULTTONEAREST)
-                : ::MonitorFromPoint(POINT{.x = 0, .y = 0}, MONITOR_DEFAULTTOPRIMARY);
-        ::GetMonitorInfoW(monitor, &monitor_info);
+        ::GetMonitorInfoW(pick_monitor(monitor_), &monitor_info);
 
-        HWND hwnd = ::CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
-            kOverlayClass, L"GameSnap Overlay", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, instance, nullptr);
-        if (hwnd == nullptr) {
-            SPDLOG_ERROR("创建 overlay 窗口失败: {}", ::GetLastError());
-            return trigger;
-        }
-
-        // 先把 1x1 窗口放到目标显示器再取 DPI，避免沿用主显示器/旧窗口的 DPI。
-        ::SetWindowPos(hwnd, HWND_TOPMOST, monitor_info.rcWork.right - 1, monitor_info.rcWork.bottom - 1, 1, 1,
-                       SWP_NOACTIVATE);
-        ::SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
-        const float scale = dpi_scale(hwnd);
-        const std::uint32_t panel_width = static_cast<std::uint32_t>(kBasePanelWidth * scale);
-        const std::uint32_t panel_height = static_cast<std::uint32_t>(kBasePanelHeight * scale);
-
-        OverlayDevice device;
-        if (!device.initialize(hwnd, panel_width, panel_height)) {
-            SPDLOG_ERROR("overlay D3D/DirectComposition 初始化失败，面板和提示音不可用");
-            ::DestroyWindow(hwnd);
-            return trigger;
-        }
-
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
+        const float scale = state.scale;
+        const auto panel_width = state.panel_width;
+        const auto panel_height = state.panel_height;
         ImGuiIO& io = ImGui::GetIO();
-        io.IniFilename = nullptr;
-        io.BackendPlatformName = "GameSnapOverlay";
-        if (!ImGui_ImplDX11_Init(device.device(), device.context())) {
-            SPDLOG_ERROR("ImGui DX11 backend 初始化失败");
-            ImGui::DestroyContext();
-            device.shutdown();
-            ::DestroyWindow(hwnd);
-            return trigger;
-        }
-
-        const std::filesystem::path font_path = L"C:\\Windows\\Fonts\\msyh.ttc";
-        ImGui::GetStyle().FontSizeBase = 18.0F * scale;
-        std::wstring font_filename = bridge_->snapshot().filename;
-        std::string filename_utf8 = wstring_to_utf8(font_filename);
-        const auto build_font = [&](std::wstring const& filename) -> ImFont* {
-            io.Fonts->Clear();
-            ImFontGlyphRangesBuilder builder;
-            builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
-            builder.AddText("GameSnap正在生成截图…剩余编码任务: 编码完成");
-            const std::string utf8_filename = wstring_to_utf8(filename);
-            if (!utf8_filename.empty())
-                builder.AddText(utf8_filename.c_str());
-            ImVector<ImWchar> ranges;
-            builder.BuildRanges(&ranges);
-
-            ImFont* result = nullptr;
-            if (std::filesystem::exists(font_path)) {
-                result = io.Fonts->AddFontFromFileTTF(font_path.string().c_str(), 18.0F * scale, nullptr,
-                                                      ranges.Data);
-            }
-            if (result == nullptr)
-                result = io.Fonts->AddFontDefaultVector();
-            return result;
-        };
-        ImFont* font = build_font(font_filename);
-
-        SPDLOG_INFO("overlay 就绪: ImGui DX11 backend + DirectComposition");
-        AudioPlayer audio;
+        ImFont* font = state.font;
+        std::string filename_utf8 = wstring_to_utf8(state.font_filename);
 
         const float margin = kBaseMargin * scale;
         const float visible_x = static_cast<float>(monitor_info.rcWork.right - panel_width) - margin;
@@ -436,14 +569,13 @@ namespace gamesnap {
         bool animating = true;
         float anim_from = hidden_x;
         float anim_to = visible_x;
-        const auto session_start = std::chrono::steady_clock::now();
-        std::chrono::steady_clock::time_point anim_start = session_start;
+        const auto session_start = SteadyClock::now();
+        auto anim_start = session_start;
 
         std::uint64_t last_trigger = trigger;
         std::uint64_t last_info = 0;
         auto last_trigger_time = session_start;
         auto last_frame = session_start;
-        audio.play();
 
         while (!stop_.load(std::memory_order_acquire)) {
             MSG message;
@@ -452,7 +584,7 @@ namespace gamesnap {
                 ::DispatchMessageW(&message);
             }
 
-            const auto now = std::chrono::steady_clock::now();
+            const auto now = SteadyClock::now();
             const float delta = std::min(0.1F, std::chrono::duration<float>(now - last_frame).count());
             last_frame = now;
             const UiBridge::Snapshot snapshot = bridge_->snapshot();
@@ -466,7 +598,9 @@ namespace gamesnap {
                 anim_to = visible_x;
                 anim_start = now;
                 last_info = 0;
-                audio.play();
+                // 面板还开着时又按了热键：这一次触发的提示音在这里补上。
+                if (state.audio)
+                    state.audio->play();
             }
 
             const bool min_time_elapsed = now - last_trigger_time >= kMinShowTime;
@@ -490,22 +624,24 @@ namespace gamesnap {
             if (!want_visible && !shown && !animating && panel_x >= hidden_x - 1.0F)
                 break;
 
-            ::SetWindowPos(hwnd, HWND_TOPMOST, static_cast<int>(panel_x), panel_y,
+            ::SetWindowPos(state.hwnd, HWND_TOPMOST, static_cast<int>(panel_x), panel_y,
                            static_cast<int>(panel_width), static_cast<int>(panel_height),
                            SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
             if (snapshot.info_serial != last_info) {
                 last_info = snapshot.info_serial;
-                if (snapshot.filename != font_filename) {
-                    font_filename = snapshot.filename;
-                    filename_utf8 = wstring_to_utf8(font_filename);
-                    font = build_font(font_filename);
+                if (snapshot.filename != state.font_filename) {
+                    state.font_filename = snapshot.filename;
+                    filename_utf8 = wstring_to_utf8(state.font_filename);
+                    font = build_font(scale, state.font_filename);
+                    state.font = font;
                 }
-                if (snapshot.thumbnail)
-                    device.set_thumbnail(snapshot.thumbnail->pixels, snapshot.thumbnail->width,
-                                         snapshot.thumbnail->height);
-                else
-                    device.set_thumbnail({}, 0, 0);  // 新截图已开始但还没有缩略图：清掉上一张
+                if (snapshot.thumbnail) {
+                    state.device->set_thumbnail(snapshot.thumbnail->pixels, snapshot.thumbnail->width,
+                                                snapshot.thumbnail->height);
+                } else {
+                    state.device->set_thumbnail({}, 0, 0);  // 新截图已开始但还没有缩略图：清掉上一张
+                }
             }
 
             io.DisplaySize = ImVec2(static_cast<float>(panel_width), static_cast<float>(panel_height));
@@ -537,9 +673,9 @@ namespace gamesnap {
             const float thumb_width = 160.0F * scale;
             const float thumb_height = 90.0F * scale;
             ImGui::SetCursorPos(ImVec2(padding, padding));
-            if (device.thumbnail_view() != nullptr) {
+            if (state.device->thumbnail_view() != nullptr) {
                 ImGui::Image(ImTextureRef(static_cast<ImTextureID>(
-                                 reinterpret_cast<std::uintptr_t>(device.thumbnail_view()))),
+                                 reinterpret_cast<std::uintptr_t>(state.device->thumbnail_view()))),
                              ImVec2(thumb_width, thumb_height));
             } else {
                 ImGui::GetWindowDrawList()->AddRectFilled(
@@ -570,14 +706,12 @@ namespace gamesnap {
             ImGui::PopFont();
 
             ImGui::Render();
-            device.begin_frame();
-            device.end_frame();
+            state.device->begin_frame();
+            state.device->end_frame();
         }
 
-        ImGui_ImplDX11_Shutdown();
-        ImGui::DestroyContext();
-        device.shutdown();
-        ::DestroyWindow(hwnd);
+        // 收起后隐藏窗口：linger 期间不让 DWM 继续合成这个顶层表面，也不再 Present。
+        ::ShowWindow(state.hwnd, SW_HIDE);
         return last_trigger;
     }
 

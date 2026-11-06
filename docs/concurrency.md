@@ -48,7 +48,7 @@
 | input | `InputThread::run()` | 键盘钩子 + GameInput；只投递 `Command::Trigger` |
 | system-events | `SystemEventThread::run()` | 隐藏窗口 + WinEvent hook；投递 Validate/Reload |
 | encode × N | `EncodeWorkers::worker_main()` | 消费 `EncodeJob`；Map、转换、tone map、编码、写盘 |
-| overlay | `OverlayThread::run()` | DirectComposition + ImGui + MP3，按 trigger 开/关 session |
+| overlay | `OverlayThread::run()` | DirectComposition + ImGui + MP3；先出声再建 UI，资源在触发后常驻 30s 再整体释放 |
 | WGC 回调 | `FrameSink::on_frame()` | 取帧、创建本张纹理、`CopyResource`、入队、release `done` |
 | GameInput 回调 | `InputThread::reading_callback()` | 读 Xbox Share 键，投递 Trigger |
 | Ctrl+C | `console_ctrl_handler()` | 只对 `StopSource` 调 `request_stop()` |

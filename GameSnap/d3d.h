@@ -12,6 +12,8 @@
 
 #include "common.h"
 
+#include <d3d11_4.h>
+
 namespace gamesnap {
 
     class D3DContext {
@@ -24,6 +26,10 @@ namespace gamesnap {
         [[nodiscard]] winrt::IDirect3DDevice const& winrt_device() const noexcept { return winrt_device_; }
 
         std::mutex& context_mutex() noexcept { return context_mutex_; }
+
+        // 调用方必须持有 context_mutex；返回 0 表示不支持 fence。
+        std::uint64_t signal_fence_locked();
+        bool wait_fence(std::uint64_t value, std::chrono::milliseconds timeout, std::string& error);
 
         // DXGI 工厂失效：显示拓扑或适配器集合发生变化。
         [[nodiscard]] bool factory_current() const;
@@ -41,6 +47,9 @@ namespace gamesnap {
         winrt::com_ptr<IDXGIAdapter1> adapter_;
         winrt::IDirect3DDevice winrt_device_{nullptr};
         std::mutex context_mutex_;
+        winrt::com_ptr<ID3D11Fence> fence_;
+        winrt::com_ptr<ID3D11DeviceContext4> context4_;
+        std::atomic<std::uint64_t> fence_value_{0};
     };
 
 }  // namespace gamesnap

@@ -48,6 +48,33 @@ namespace gamesnap {
             }
         }
 
+        void fill_rgba(std::uint8_t* data, std::uint32_t row_pitch, std::uint32_t width,
+                       std::uint32_t height) {
+            for (std::uint32_t y = 0; y < height; ++y) {
+                for (std::uint32_t x = 0; x < width; ++x) {
+                    std::uint8_t r = 0;
+                    std::uint8_t g = 0;
+                    std::uint8_t b = 0;
+                    if (y < height / 2 && x < width / 2) {
+                        r = 255;
+                    } else if (y < height / 2) {
+                        g = 255;
+                    } else if (x < width / 2) {
+                        b = 255;
+                    } else {
+                        const auto v = static_cast<std::uint8_t>(x * 255 / (width - 1));
+                        r = g = b = v;
+                    }
+                    std::uint8_t* pixel = data + (static_cast<std::size_t>(y) * row_pitch) +
+                                          (static_cast<std::size_t>(x) * 4);
+                    pixel[0] = r;
+                    pixel[1] = g;
+                    pixel[2] = b;
+                    pixel[3] = 255;
+                }
+            }
+        }
+
         std::uint16_t float_to_half(float value) {
             if (!(value > 0.0F))
                 return 0;
@@ -143,6 +170,9 @@ namespace gamesnap {
                 auto* bytes = static_cast<std::uint8_t*>(mapped.pData);
                 if (test_case.format == DXGI_FORMAT_R16G16B16A16_FLOAT)
                     fill_pq(bytes, mapped.RowPitch, test_case.width, test_case.height);
+                else if (test_case.format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                         test_case.format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+                    fill_rgba(bytes, mapped.RowPitch, test_case.width, test_case.height);
                 else
                     fill_bgra(bytes, mapped.RowPitch, test_case.width, test_case.height);
                 d3d->context()->Unmap(source.get(), 0);
@@ -150,7 +180,7 @@ namespace gamesnap {
             }
 
             auto jobs = std::make_shared<EncodeQueue>();
-            EncodeWorkers workers(config.output_dir, jobs, config.codec, {});
+            EncodeWorkers workers(config.output_dir, jobs, config.codec, config.tone_map_backend, {});
             workers.start(1);
 
             std::error_code ec;
@@ -178,7 +208,6 @@ namespace gamesnap {
             job.timings.title_done = job.timings.input;
             job.timings.prepared = job.timings.input;
             job.timings.start_capture = job.timings.input;
-            job.timings.start_capture_done = job.timings.input;
             job.timings.frame_received = job.timings.input;
             job.timings.copied = job.timings.input;
 

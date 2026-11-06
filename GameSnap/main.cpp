@@ -24,18 +24,6 @@ namespace {
         return slot;
     }
 
-    // 槽位里的裸指针必须在 StopSource 存活期间有效；用 RAII 守卫保证异常路径也会清空。
-    struct StopSlot {
-        explicit StopSlot(gamesnap::StopSource* source) {
-            stop_source_slot().store(source, std::memory_order_release);
-        }
-        ~StopSlot() { stop_source_slot().store(nullptr, std::memory_order_release); }
-        StopSlot(StopSlot const&) = delete;
-        StopSlot& operator=(StopSlot const&) = delete;
-        StopSlot(StopSlot&&) = delete;
-        StopSlot& operator=(StopSlot&&) = delete;
-    };
-
     std::atomic<int>& ctrl_c_count() {
         static std::atomic<int> count{0};
         return count;
@@ -73,7 +61,9 @@ namespace {
         // 控制台处理函数在独立线程回调；让 StopSource 活到进程结束，避免
         // handler 拿到指针后对象被析构的竞态（进程退出时由 OS 回收）。
         auto stop = std::shared_ptr<gamesnap::StopSource>(new gamesnap::StopSource(), [](gamesnap::StopSource*) {});
-        const StopSlot slot_guard{stop.get()};
+        auto slot_guard = gamesnap::ScopeExit{
+            [&] { stop_source_slot().store(nullptr, std::memory_order_release); }};
+        stop_source_slot().store(stop.get(), std::memory_order_release);
         ::SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
 
         // 输入线程 / 系统事件线程 → 截图线程；截图线程 → 编码线程。
@@ -83,7 +73,7 @@ namespace {
         gamesnap::OverlayThread overlay(ui);
         overlay.start();
 
-        gamesnap::EncodeWorkers encoders(config.output_dir, jobs, config.codec, ui);
+        gamesnap::EncodeWorkers encoders(config.output_dir, jobs, config.codec, config.tone_map_backend, ui);
         encoders.start(config.encode_threads);
 
         gamesnap::InputThread input(config, commands, ui);
@@ -155,7 +145,7 @@ int wmain(int argc, wchar_t** argv) {
 
     gamesnap::install_terminate_handler();
     gamesnap::install_new_handler();
-    gamesnap::init_logging(false);
+    gamesnap::init_logging();
     if (!gamesnap::check_cpu_features()) {
         spdlog::shutdown();
         return 1;
@@ -163,8 +153,14 @@ int wmain(int argc, wchar_t** argv) {
 
     auto config = gamesnap::parse_command_line(argc, argv);
     if (!config) {
+        const bool help_requested =
+            std::ranges::any_of(std::span(argv, static_cast<std::size_t>(argc)),
+                                [](wchar_t const* arg) {
+                                    return arg != nullptr &&
+                                           (std::wcscmp(arg, L"--help") == 0 || std::wcscmp(arg, L"-h") == 0);
+                                });
         spdlog::shutdown();
-        return 0;
+        return help_requested ? 0 : 2;
     }
 
     if (config->verbose)

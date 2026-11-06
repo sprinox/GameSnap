@@ -200,9 +200,9 @@ namespace gamesnap {
         }
 
         bool is_known_config_key(std::string_view key) {
-            constexpr std::array<std::string_view, 20> keys{
+            constexpr std::array<std::string_view, 21> keys{
                 "output_dir", "encode_threads", "hotkey", "swallow", "monitor",
-                "format_hdr", "format_sdr", "tone_map", "verbose",
+                "format_hdr", "format_sdr", "tone_map", "tone_map_backend", "verbose",
                 "png_compression", "jpeg_quality",
                 "webp_quality", "webp_lossless", "webp_method",
                 "avif_quality", "avif_lossless", "avif_speed",
@@ -261,6 +261,17 @@ namespace gamesnap {
                         if (!algorithm)
                             throw ConfigError(fmt::format("无法识别的 tone_map: {}", *text));
                         parsed.tone_map = *algorithm;
+                    }
+                    if (const auto text = read_key<std::string>(root, "tone_map_backend"); text) {
+                        if (*text == "auto")
+                            parsed.tone_map_backend = ToneMapBackend::Auto;
+                        else if (*text == "gpu")
+                            parsed.tone_map_backend = ToneMapBackend::Gpu;
+                        else if (*text == "cpu")
+                            parsed.tone_map_backend = ToneMapBackend::Cpu;
+                        else
+                            throw ConfigError(
+                                fmt::format("tone_map_backend 只支持 auto/gpu/cpu，实际为 {}", *text));
                     }
                     const auto read_range = [&](char const* key, int min_value, int max_value,
                                                 int& target) {
@@ -415,7 +426,7 @@ namespace gamesnap {
             ::RoUninitialize();
     }
 
-    void init_logging(bool verbose) {
+    void init_logging() {
         std::vector<spdlog::sink_ptr> sinks;
         sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
 
@@ -427,7 +438,7 @@ namespace gamesnap {
         } else {
             try {
                 auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-                    log_path.string(), kLogFileSize, kLogFileCount);
+                    log_path.wstring(), kLogFileSize, kLogFileCount);
                 sinks.push_back(file_sink);
             } catch (std::exception const& e) {
                 const std::string message =
@@ -440,7 +451,7 @@ namespace gamesnap {
         }
 
         auto logger = std::make_shared<spdlog::logger>("gamesnap", sinks.begin(), sinks.end());
-        logger->set_level(verbose ? spdlog::level::debug : spdlog::level::info);
+        logger->set_level(spdlog::level::info);
         logger->set_pattern("[%T.%e] [%^%l%$] [%s:%# %!] %v");
         logger->flush_on(spdlog::level::warn);
         spdlog::set_default_logger(logger);
@@ -502,7 +513,8 @@ namespace gamesnap {
             } else {
                 SPDLOG_CRITICAL("std::terminate: 没有活动异常");
             }
-            spdlog::default_logger()->flush();
+            if (auto logger = spdlog::default_logger())
+                logger->flush();
             try {
                 cpptrace::generate_trace().print_with_snippets();
             } catch (...) {  // NOLINT(bugprone-empty-catch): terminate 路径里不能再次抛出
@@ -614,10 +626,12 @@ namespace gamesnap {
     std::filesystem::path default_output_dir() {
         PWSTR pictures = nullptr;
         std::filesystem::path base;
-        if (SUCCEEDED(::SHGetKnownFolderPath(FOLDERID_Pictures, KF_FLAG_DEFAULT, nullptr, &pictures)) && pictures != nullptr) {
+        const HRESULT pictures_hr =
+            ::SHGetKnownFolderPath(FOLDERID_Pictures, KF_FLAG_DEFAULT, nullptr, &pictures);
+        if (SUCCEEDED(pictures_hr) && pictures != nullptr)
             base = pictures;
+        if (pictures != nullptr)
             ::CoTaskMemFree(pictures);
-        }
         if (base.empty()) {
             std::error_code ec;
             base = std::filesystem::current_path(ec);
@@ -767,8 +781,12 @@ namespace gamesnap {
 
     void log_config(Config const& config) {
         SPDLOG_INFO("输出目录: {}", wstring_to_utf8(config.output_dir.wstring()));
-        SPDLOG_INFO("输出格式: HDR={} SDR={}，色调映射={}",
-                    to_string(config.hdr_format), to_string(config.sdr_format), to_string(config.tone_map));
+        const std::string_view backend = config.tone_map_backend == ToneMapBackend::Cpu ? "cpu"
+                                       : config.tone_map_backend == ToneMapBackend::Gpu ? "gpu"
+                                                                                       : "auto";
+        SPDLOG_INFO("输出格式: HDR={} SDR={}，色调映射={}，计算后端={}",
+                    to_string(config.hdr_format), to_string(config.sdr_format), to_string(config.tone_map),
+                    backend);
         SPDLOG_INFO("截图热键: {} ({}吞掉)",
                     hotkey_name({config.hotkey_vk, config.hotkey_modifiers}),
                     config.hotkey_swallow ? "" : "不");

@@ -28,6 +28,7 @@ Checks: >
   -cppcoreguidelines-pro-bounds-constant-array-index,
   -cppcoreguidelines-pro-type-reinterpret-cast,
   -cppcoreguidelines-pro-type-union-access,
+  -clang-analyzer-optin.core.EnumCastOutOfRange,
   modernize-*,
   -modernize-avoid-setjmp-longjmp,
   -modernize-use-trailing-return-type,

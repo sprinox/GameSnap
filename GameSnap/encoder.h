@@ -24,7 +24,8 @@ namespace gamesnap {
     class EncodeWorkers {
     public:
         EncodeWorkers(std::filesystem::path output_dir, std::shared_ptr<EncodeQueue> jobs,
-                      CodecOptions options, std::shared_ptr<UiBridge> ui);
+                      CodecOptions options, ToneMapBackend tone_map_backend,
+                      std::shared_ptr<UiBridge> ui);
         ~EncodeWorkers();
 
         EncodeWorkers(const EncodeWorkers&) = delete;
@@ -44,10 +45,12 @@ namespace gamesnap {
         std::shared_ptr<EncodeQueue> jobs_;
         std::shared_ptr<UiBridge> ui_;
         CodecOptions options_;
+        ToneMapBackend tone_map_backend_ = ToneMapBackend::Auto;
         std::vector<std::thread> threads_;
         std::mutex mapper_mutex_;
         std::unique_ptr<ToneMapper> mapper_;
         D3DContext* mapper_owner_ = nullptr;
+        std::atomic<std::int64_t> mapper_disabled_until_ns_{0};
     };
 
 }  // namespace gamesnap

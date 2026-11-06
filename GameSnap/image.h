@@ -22,6 +22,12 @@ namespace gamesnap {
         Heic,
     };
 
+    enum class ToneMapBackend : std::uint8_t {
+        Auto = 0,
+        Gpu,
+        Cpu,
+    };
+
     enum class ToneMapAlgorithm : std::uint8_t {
         Spline = 1,
         Analysis,

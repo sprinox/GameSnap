@@ -329,13 +329,11 @@ namespace gamesnap {
             const UiBridge::Snapshot snapshot = bridge_->snapshot();
             if (snapshot.trigger_serial == last_trigger)
                 continue;
-            last_trigger = snapshot.trigger_serial;
-            run_session();
-            last_trigger = bridge_->snapshot().trigger_serial;
+            last_trigger = run_session(snapshot.trigger_serial);
         }
     }
 
-    void OverlayThread::run_session() {
+    std::uint64_t OverlayThread::run_session(std::uint64_t trigger) {
         ComApartment apartment;
         if (!apartment.ok())
             SPDLOG_WARN("overlay 线程初始化 COM 失败: {}", describe_hresult(apartment.result()));
@@ -348,8 +346,9 @@ namespace gamesnap {
         window_class.lpszClassName = kOverlayClass;
         if (::RegisterClassExW(&window_class) == 0 && ::GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
             SPDLOG_ERROR("注册 overlay 窗口类失败: {}", ::GetLastError());
-            return;
+            return trigger;
         }
+        auto unregister_class = ScopeExit{[&] { ::UnregisterClassW(kOverlayClass, instance); }};
 
         MONITORINFO monitor_info{};
         monitor_info.cbSize = sizeof(monitor_info);
@@ -361,7 +360,7 @@ namespace gamesnap {
             kOverlayClass, L"GameSnap Overlay", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, instance, nullptr);
         if (hwnd == nullptr) {
             SPDLOG_ERROR("创建 overlay 窗口失败: {}", ::GetLastError());
-            return;
+            return trigger;
         }
 
         // 先把 1x1 窗口放到目标显示器再取 DPI，避免沿用主显示器/旧窗口的 DPI。
@@ -376,7 +375,7 @@ namespace gamesnap {
         if (!device.initialize(hwnd, panel_width, panel_height)) {
             SPDLOG_ERROR("overlay D3D/DirectComposition 初始化失败，面板和提示音不可用");
             ::DestroyWindow(hwnd);
-            return;
+            return trigger;
         }
 
         IMGUI_CHECKVERSION();
@@ -389,18 +388,34 @@ namespace gamesnap {
             ImGui::DestroyContext();
             device.shutdown();
             ::DestroyWindow(hwnd);
-            return;
+            return trigger;
         }
 
-        ImFont* font = nullptr;
         const std::filesystem::path font_path = L"C:\\Windows\\Fonts\\msyh.ttc";
-        if (std::filesystem::exists(font_path)) {
-            font = io.Fonts->AddFontFromFileTTF(font_path.string().c_str(), 18.0F * scale, nullptr,
-                                                io.Fonts->GetGlyphRangesChineseFull());
-        }
-        if (font == nullptr)
-            font = io.Fonts->AddFontDefaultVector();
         ImGui::GetStyle().FontSizeBase = 18.0F * scale;
+        std::wstring font_filename = bridge_->snapshot().filename;
+        std::string filename_utf8 = wstring_to_utf8(font_filename);
+        const auto build_font = [&](std::wstring const& filename) -> ImFont* {
+            io.Fonts->Clear();
+            ImFontGlyphRangesBuilder builder;
+            builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
+            builder.AddText("GameSnap正在生成截图…剩余编码任务: 编码完成");
+            const std::string utf8_filename = wstring_to_utf8(filename);
+            if (!utf8_filename.empty())
+                builder.AddText(utf8_filename.c_str());
+            ImVector<ImWchar> ranges;
+            builder.BuildRanges(&ranges);
+
+            ImFont* result = nullptr;
+            if (std::filesystem::exists(font_path)) {
+                result = io.Fonts->AddFontFromFileTTF(font_path.string().c_str(), 18.0F * scale, nullptr,
+                                                      ranges.Data);
+            }
+            if (result == nullptr)
+                result = io.Fonts->AddFontDefaultVector();
+            return result;
+        };
+        ImFont* font = build_font(font_filename);
 
         SPDLOG_INFO("overlay 就绪: ImGui DX11 backend + DirectComposition");
         AudioPlayer audio;
@@ -418,8 +433,7 @@ namespace gamesnap {
         const auto session_start = std::chrono::steady_clock::now();
         std::chrono::steady_clock::time_point anim_start = session_start;
 
-        const UiBridge::Snapshot initial_snapshot = bridge_->snapshot();
-        std::uint64_t last_trigger = initial_snapshot.trigger_serial;
+        std::uint64_t last_trigger = trigger;
         std::uint64_t last_info = 0;
         auto last_trigger_time = session_start;
         auto last_frame = session_start;
@@ -476,7 +490,14 @@ namespace gamesnap {
 
             if (snapshot.info_serial != last_info) {
                 last_info = snapshot.info_serial;
-                device.set_thumbnail(snapshot.thumbnail, snapshot.thumb_width, snapshot.thumb_height);
+                if (snapshot.filename != font_filename) {
+                    font_filename = snapshot.filename;
+                    filename_utf8 = wstring_to_utf8(font_filename);
+                    font = build_font(font_filename);
+                }
+                if (snapshot.thumbnail)
+                    device.set_thumbnail(snapshot.thumbnail->pixels, snapshot.thumbnail->width,
+                                         snapshot.thumbnail->height);
             }
 
             io.DisplaySize = ImVec2(static_cast<float>(panel_width), static_cast<float>(panel_height));
@@ -527,9 +548,7 @@ namespace gamesnap {
             ImGui::TextUnformatted("GameSnap");
             ImGui::PopStyleColor();
             ImGui::Spacing();
-            const std::string filename = snapshot.filename.empty()
-                                             ? "正在生成截图…"
-                                             : wstring_to_utf8(snapshot.filename);
+            const std::string filename = snapshot.filename.empty() ? "正在生成截图…" : filename_utf8;
             ImGui::PushTextWrapPos(static_cast<float>(panel_width) - padding);
             ImGui::TextWrapped("%s", filename.c_str());
             ImGui::PopTextWrapPos();
@@ -551,7 +570,7 @@ namespace gamesnap {
         ImGui::DestroyContext();
         device.shutdown();
         ::DestroyWindow(hwnd);
-        ::UnregisterClassW(kOverlayClass, instance);
+        return last_trigger;
     }
 
 }  // namespace gamesnap

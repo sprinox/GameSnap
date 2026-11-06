@@ -3,6 +3,7 @@
 #include "tonemap.h"
 #include "tonemap_cs.h"
 #include "d3d.h"
+#include <immintrin.h>
 #include <cstring>
 
 namespace gamesnap {
@@ -41,6 +42,45 @@ namespace gamesnap {
         return std::nullopt;
     }
 
+    namespace {
+
+        void unpack_r10_scalar(std::uint32_t packed, std::uint16_t* dst) {
+            dst[0] = static_cast<std::uint16_t>(packed & 0x3FFU);
+            dst[1] = static_cast<std::uint16_t>((packed >> 10) & 0x3FFU);
+            dst[2] = static_cast<std::uint16_t>((packed >> 20) & 0x3FFU);
+            dst[3] = 0x3FF;
+        }
+
+        void unpack_r10_4(__m128i packed, std::uint16_t* dst) {
+            const __m128i mask = _mm_set1_epi32(0x3FF);
+            const __m128i zero = _mm_setzero_si128();
+            const __m128i alpha = _mm_set1_epi16(0x3FF);
+            const __m128i r32 = _mm_and_si128(packed, mask);
+            const __m128i g32 = _mm_and_si128(_mm_srli_epi32(packed, 10), mask);
+            const __m128i b32 = _mm_and_si128(_mm_srli_epi32(packed, 20), mask);
+            const __m128i r16 = _mm_packus_epi32(r32, zero);
+            const __m128i g16 = _mm_packus_epi32(g32, zero);
+            const __m128i b16 = _mm_packus_epi32(b32, zero);
+            const __m128i rg = _mm_unpacklo_epi16(r16, g16);
+            const __m128i ba = _mm_unpacklo_epi16(b16, alpha);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), _mm_unpacklo_epi32(rg, ba));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 8), _mm_unpackhi_epi32(rg, ba));
+        }
+
+        void unpack_r10_avx2(std::uint32_t const* src, std::uint16_t* dst, std::uint32_t width) {
+            std::uint32_t x = 0;
+            for (; x + 8 <= width; x += 8) {
+                const __m256i packed = _mm256_loadu_si256(
+                    reinterpret_cast<__m256i const*>(src + x));
+                unpack_r10_4(_mm256_castsi256_si128(packed), dst + static_cast<std::size_t>(x) * 4);
+                unpack_r10_4(_mm256_extracti128_si256(packed, 1), dst + static_cast<std::size_t>(x + 4) * 4);
+            }
+            for (; x < width; ++x)
+                unpack_r10_scalar(src[x], dst + static_cast<std::size_t>(x) * 4);
+        }
+
+    }  // namespace
+
     ToneMapper::ToneMapper(std::shared_ptr<D3DContext> d3d) : d3d_(std::move(d3d)) {
         if (!d3d_ || d3d_->device() == nullptr) {
             error_ = "D3D 设备为空";
@@ -72,19 +112,11 @@ namespace gamesnap {
             error_ = "CreateFence 失败";
             return;
         }
-        fence_event_ = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (fence_event_ == nullptr) {
-            error_ = "CreateEvent(fence) 失败";
-            return;
-        }
         context4_ = context4;
         ok_ = true;
     }
 
-    ToneMapper::~ToneMapper() {
-        if (fence_event_ != nullptr)
-            ::CloseHandle(fence_event_);
-    }
+    ToneMapper::~ToneMapper() = default;
 
     void ToneMapper::release_resources() {
         output_view_ = nullptr;
@@ -139,7 +171,7 @@ namespace gamesnap {
         }
 
         D3D11_TEXTURE2D_DESC hdr_desc = input_desc;
-        hdr_desc.Format = DXGI_FORMAT_R16G16B16A16_UINT;
+        hdr_desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
         hdr_desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
         if (FAILED(d3d_->device()->CreateTexture2D(&hdr_desc, nullptr, hdr_output_.put()))) {
             error_ = "CreateTexture2D(hdr output) 失败";
@@ -241,9 +273,15 @@ namespace gamesnap {
 
         // 等 GPU 完成，但绝不持着 context 锁等：Map 是同步阻塞的，持锁会把
         // capture 回调和其他编码线程一起卡住。设备挂起但未 TDR 时必须超时回退。
-        ::ResetEvent(fence_event_);
-        if (FAILED(fence_->SetEventOnCompletion(fence_value_, fence_event_)) ||
-            ::WaitForSingleObject(fence_event_, 5000) != WAIT_OBJECT_0) {
+        const HANDLE fence_event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (fence_event == nullptr) {
+            error = "CreateEvent(tone map fence) 失败";
+            return false;
+        }
+        const HRESULT registered = fence_->SetEventOnCompletion(fence_value_, fence_event);
+        const DWORD waited = SUCCEEDED(registered) ? ::WaitForSingleObject(fence_event, 1000) : WAIT_FAILED;
+        ::CloseHandle(fence_event);
+        if (waited != WAIT_OBJECT_0 || fence_->GetCompletedValue() < fence_value_) {
             error = "等待 tone map GPU 超时";
             return false;
         }
@@ -267,10 +305,10 @@ namespace gamesnap {
             auto* dst = out.pixels.data() + y * out.stride;
             // shader 已经按 BGRA 写出且 alpha=255，这里只需整行复制。
             std::memcpy(dst, src, static_cast<std::size_t>(desc.Width) * 4);
-            auto const* src_hdr =
-                static_cast<std::uint16_t const*>(hdr_mapped.pData) + y * (hdr_mapped.RowPitch / 2);
+            auto const* src_hdr = reinterpret_cast<std::uint32_t const*>(
+                static_cast<std::uint8_t const*>(hdr_mapped.pData) + y * hdr_mapped.RowPitch);
             auto* dst_hdr = hdr10.data() + y * desc.Width * 4;
-            std::memcpy(dst_hdr, src_hdr, static_cast<std::size_t>(desc.Width) * 4 * sizeof(std::uint16_t));
+            unpack_r10_avx2(src_hdr, dst_hdr, desc.Width);
         }
 
         {

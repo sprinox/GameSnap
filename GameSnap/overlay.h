@@ -27,7 +27,7 @@ namespace gamesnap {
 
     private:
         void run();
-        void run_session();
+        std::uint64_t run_session(std::uint64_t trigger);
 
         std::shared_ptr<UiBridge> bridge_;
         std::thread thread_;

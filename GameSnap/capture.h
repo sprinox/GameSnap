@@ -29,17 +29,12 @@ namespace gamesnap {
     class CaptureResources;
     class UiBridge;
 
-    // 一张可复用的采集目标纹理；纹理与 busy 绑定在 TextureSlot 里，不会错配。
-    struct TextureCache {
-        std::shared_ptr<TextureSlot> slot;
-    };
-
     // 一次截图的上下文，由 FrameSink 持有当前 shot。
     struct ShotContext {
         std::shared_ptr<D3DContext> d3d;
         std::shared_ptr<EncodeQueue> jobs;
         std::shared_ptr<UiBridge> ui;
-        TextureCache cache;
+        std::shared_ptr<TextureSlot> texture_slot;
         std::binary_semaphore done{0};                    // 回调处理完（或失败）后 release
         std::shared_ptr<std::atomic<bool>> canceled;      // 超时取消标记，和 EncodeJob 共享
         std::atomic<bool> failed{false};                  // CopyResource / 设备移除失败
@@ -48,8 +43,8 @@ namespace gamesnap {
         SteadyClock::time_point title_done;
         SteadyClock::time_point prepared;
         SteadyClock::time_point start_call;
-        SteadyClock::time_point start_capture_done;
         std::uint64_t sequence = 0;
+        std::uint64_t gpu_fence = 0;
         std::wstring title;
         DXGI_COLOR_SPACE_TYPE color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         std::uint32_t sdr_white_nits = 80;
@@ -121,7 +116,6 @@ namespace gamesnap {
         winrt::event_token frame_token_{};
         winrt::Windows::Graphics::SizeInt32 size_{.Width = 0, .Height = 0};
         std::shared_ptr<FrameSink> sink_;
-        bool running_ = false;
         bool closed_ = false;
     };
 
@@ -143,7 +137,7 @@ namespace gamesnap {
 
     private:
         bool ensure_ready(ReloadReason reason);
-        bool rebuild(ReloadReason reason);
+        bool rebuild(ReloadReason reason, DisplayInfo const* known_display = nullptr);
         void handle_command(Command const& command);
         void shot(Command const& command);
 
@@ -157,7 +151,7 @@ namespace gamesnap {
         // 当前“资源代”，只由 capture 线程读写。
         std::shared_ptr<D3DContext> d3d_;
         std::shared_ptr<CaptureResources> resources_;
-        TextureCache texture_cache_;
+        std::shared_ptr<TextureSlot> texture_slot_;
         DisplayInfo display_{};
         HMONITOR monitor_ = nullptr;
         std::uint64_t generation_ = 0;

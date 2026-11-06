@@ -54,6 +54,9 @@
 #define SPDLOG_NO_EXCEPTIONS
 // 用 vcpkg 装的 fmt，而不是 spdlog 自带的 bundled fmt；必须和 spdlog.lib 的构建方式一致。
 #define SPDLOG_FMT_EXTERNAL
+// header-only 后由本工程实例化，避免和 vcpkg 窄字符 spdlog.lib 的 ABI 不一致。
+#define SPDLOG_HEADER_ONLY
+#define SPDLOG_WCHAR_FILENAMES
 // 让 SPDLOG_DEBUG/TRACE 宏在 Release 下也保留（运行时可再用日志级别过滤）
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
 // __func__ 比 __FUNCTION__ 干净：只给函数名，不带命名空间/签名
@@ -86,7 +89,7 @@ namespace gamesnap {
     std::wstring utf8_to_wstring(std::string_view str);
 
     // ── 日志 / 崩溃 ──────────────────────────────────────────────────────────
-    void init_logging(bool verbose);
+    void init_logging();
     void install_terminate_handler();
     void install_new_handler();
     // 启动时检查 AVX2 / F16C；不满足时记录原因并返回 false。
@@ -108,10 +111,36 @@ namespace gamesnap {
         SteadyClock::time_point title_done;      // 前台窗口标题读取完成
         SteadyClock::time_point prepared;        // frame pool / session 准备完成
         SteadyClock::time_point start_capture;   // 调用 StartCapture
-        SteadyClock::time_point start_capture_done;  // StartCapture 返回
         SteadyClock::time_point frame_received;  // 拿到帧的时刻
         SteadyClock::time_point copied;          // CopyResource 完成
     };
+
+    // 通用 scope guard；析构时执行，dismiss() 取消。
+    template <typename F>
+    class ScopeExit {
+    public:
+        explicit ScopeExit(F f) : f_(std::move(f)) {}
+        ~ScopeExit() noexcept {
+            if (!active_)
+                return;
+            try {
+                f_();
+            } catch (...) {  // NOLINT(bugprone-empty-catch): scope guard 不能抛
+            }
+        }
+        void dismiss() noexcept { active_ = false; }
+        ScopeExit(ScopeExit const&) = delete;
+        ScopeExit& operator=(ScopeExit const&) = delete;
+        ScopeExit(ScopeExit&&) = delete;
+        ScopeExit& operator=(ScopeExit&&) = delete;
+
+    private:
+        F f_;
+        bool active_ = true;
+    };
+
+    template <typename F>
+    ScopeExit(F) -> ScopeExit<F>;
 
     // ── COM 驻留 ─────────────────────────────────────────────────────────────
     // 每个使用 WinRT/D3D/GameInput 的线程都需要自己的 COM 公寓。
@@ -186,6 +215,7 @@ namespace gamesnap {
         ImageFormat hdr_format = ImageFormat::Avif;  // HDR 输出容器（仅 avif/heic）
         ImageFormat sdr_format = ImageFormat::Webp;  // SDR 输出格式
         ToneMapAlgorithm tone_map = ToneMapAlgorithm::Spline;
+        ToneMapBackend tone_map_backend = ToneMapBackend::Auto;
         CodecOptions codec;
         bool verbose = false;
         bool selftest = false;  // 不经过 WGC，用合成纹理验证编码链路

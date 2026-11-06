@@ -1,6 +1,8 @@
 Texture2D<float4> Hdr : register(t0);
+StructuredBuffer<uint> Peak : register(t1);   // 本帧峰值（10-bit PQ 码值），由 peak pass 写入
 RWTexture2D<float4> Out : register(u0);
 RWTexture2D<float4> HdrOut : register(u1);
+RWStructuredBuffer<uint> PeakOut : register(u2);
 
 cbuffer Params : register(b0)
 {
@@ -72,36 +74,87 @@ float3 linear_to_srgb(float3 c)
     return lerp(lo, hi, step(0.0031308, c));
 }
 
-// 单调三次 Hermite shoulder：
-//   x <= knee 时线性；knee..peak 用 Hermite 过渡到 1。
-// SDR 白点固定落在 0.8 左右，保留一点高光层次。
-float spline_shoulder(float x)
+// ── 色调映射：照 libplacebo（mpv 的 --tone-mapping=spline）────────────────────
+// 1) 线性 RGB 换到 IPT：只对感知亮度 I 做 tone map，色度用 hull 曲线收缩；
+// 2) tone map 本身是 libplacebo 的 "spline"：PQ 域、单支点、双曲段
+//    y = slope*(x-piv)/(1+Qk*(x-piv)) + piv（肩部） / 线性（趾部）。
+// 参数按 libplacebo 默认（knee_default=0.7、spline_contrast=0.5、slope_tuning=1），
+// 没有 HDR 元数据时 st2094_pick_knee 退化成“支点取输入 PQ 范围 70% 且输入输出同一支点”，
+// 即 slope=1、Pk=0，正是下面用的形式。
+
+static const float3x3 kRgbToLms709 = {
+    0.2957413, 0.6230997, 0.0811802,
+    0.1561450, 0.7272835, 0.1165603,
+    0.0350734, 0.1565968, 0.8082766,
+};
+static const float3x3 kLmsToIpt = {
+    0.4000000, 0.4000000, 0.2000000,
+    4.4550000, -4.8510000, 0.3960000,
+    0.8056000, 0.3572000, -1.1628000,
+};
+static const float3x3 kIptToLms = {
+    1.0000000, 0.0975689, 0.2052260,
+    1.0000000, -0.1138760, 0.1332170,
+    1.0000000, 0.0326151, -0.6768870,
+};
+static const float3x3 kLmsToRgb709 = {
+    6.1728843, -5.3203218, 0.1472545,
+    -1.3234594, 2.5597126, -0.2362089,
+    -0.0114500, -0.2650588, 1.2765739,
+};
+
+// libplacebo 的 spline 查找表：输入 PQ 码值，输出 PQ 码值。
+// 支点由 st2094_pick_knee 给出：无 HDR 元数据时 src_pivot = mix(in_min, in_max, 0.7)，
+// dst_pivot = mix(out_min, out_max, 0.7)，斜率为两者之比，再按 spline_contrast 微调；
+// 肩部/趾部是双曲段 y = slope*(x-piv)/(1+k*(x-piv)) + dst_piv。
+float tone_map_spline(float x, float in_max)
 {
-    const float knee = saturate(SdrWhite / max(PeakNits, 1.0));
-    const float white = 0.8;
-    float mapped = 0.0;
-    if (x <= 0.0)
-    {
-        mapped = 0.0;
-    }
-    else if (x <= knee)
-    {
-        mapped = x * (white / max(knee, 1e-4));
-    }
-    else if (x >= 1.0)
-    {
-        mapped = 1.0;
-    }
-    else
-    {
-        const float t = (x - knee) / max(1.0 - knee, 1e-4);
-        const float h00 = 2.0 * t * t * t - 3.0 * t * t + 1.0;
-        const float h10 = t * t * t - 2.0 * t * t + t;
-        const float h01 = -2.0 * t * t * t + 3.0 * t * t;
-        const float slope0 = (white / max(knee, 1e-4)) * (1.0 - knee);
-        mapped = h00 * white + h10 * slope0 + h01;
-    }
-    return mapped;
+    const float in_min = 0.0;
+    const float out_min = 0.0;
+    const float out_max = nits_to_pq(max(SdrWhite, 1.0));
+
+    // st2094_pick_knee（默认 knee=0.7，无场景平均亮度）
+    const float src_pivot = lerp(in_min, in_max, 0.7);
+    float dst_pivot = lerp(out_min, out_max, 0.7);
+    dst_pivot = clamp(dst_pivot, lerp(out_min, out_max, 0.1), lerp(out_min, out_max, 0.9));
+
+    // slope_tuning=1、slope_offset=0、spline_contrast=0.5
+    float slope = (dst_pivot - out_min) / max(src_pivot - in_min, 1e-6);
+    const float ratio = clamp(in_max / max(out_max, 1e-6) - 1.0, 0.0, 1.0);
+    slope = pow(max(slope, 1e-6), (1.0 - 0.5) * ratio);
+
+    const float in_span_min = in_min - src_pivot;
+    const float in_span_max = in_max - src_pivot;
+    const float out_span_min = out_min - dst_pivot;
+    const float out_span_max = out_max - dst_pivot;
+    const float pk = (slope * in_span_min - out_span_min) / (out_span_min * in_span_min);
+    const float qk = (slope * in_span_max - out_span_max) / (out_span_max * in_span_max);
+
+    const float d = x - src_pivot;
+    const float y = slope * d / (1.0 + (d > 0.0 ? qk : pk) * d) + dst_pivot;
+    return clamp(y, out_min, out_max);
+}
+
+// 线性 RGB（相对 100 nit 白）→ SDR 线性 RGB（显示白 = 1.0）。
+float3 tone_map_ipt(float3 rgb, float in_max)
+{
+    // 线性 → LMS → PQ → IPT
+    const float3 lms = mul(kRgbToLms709, rgb);
+    const float3 lmspq = nits_to_pq3(lms * 100.0);
+    float3 ipt = mul(kLmsToIpt, lmspq);
+
+    const float i_orig = ipt.x;
+    ipt.x = tone_map_spline(i_orig, in_max);
+
+    // libplacebo：提亮时别把饱和度一起抬起来，压暗时按色域体积收缩色度。
+    float2 hull = float2(i_orig, ipt.x);
+    hull = ((hull - 6.0) * hull + 9.0) * hull;
+    ipt.yz *= min(i_orig / max(ipt.x, 1e-6), hull.y / max(hull.x, 1e-9));
+
+    // IPT → PQ → LMS → 线性
+    const float3 lmspq2 = mul(kIptToLms, ipt);
+    const float3 lms2 = pq_to_nits3(saturate(lmspq2)) * 0.01;
+    return mul(kLmsToRgb709, lms2);
 }
 
 // analysis 的简化版：按亮度做 false color，方便看 HDR 分布。
@@ -157,10 +210,39 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
     }
 
-    float mapped = spline_shoulder(luma / max(PeakNits, 1.0));
-    float3 sdr = float3(0.0, 0.0, 0.0);
-    if (luma > 1e-6)
-        sdr = nits * (mapped / luma);
+    // 本帧峰值：peak pass 已经把 10-bit PQ 码值写进 Peak[0]，这里只做上限保护。
+    const float peak_pq = min(Peak[0] / 1023.0, nits_to_pq(max(PeakNits, 1.0)));
+    const float in_max = max(nits_to_pq(max(SdrWhite, 1.0)), peak_pq);
+
+    // tone map 走 libplacebo 的 IPT + spline + hull 这条链；输出线性 RGB（显示白 = 1.0）。
+    // tone_map_ipt 返回的是相对 100 nit 白的值，这里按显示器 SDR 白点归一化。
+    const float3 sdr = tone_map_ipt(nits * 0.01, in_max) * (100.0 / max(SdrWhite, 1.0));
     // 直接按 BGRA 写出，CPU 侧可以整行 memcpy，省一次全帧 swizzle。
     Out[tid.xy] = float4(linear_to_srgb(sdr).bgr, 1.0);
+}
+
+// ── 峰值归约 ─────────────────────────────────────────────────────────────────
+// 每个 8x8 线程组先在组内取最大，再由组 0 号线程做一次全局 InterlockedMax，
+// 避免 8.3M 次原子操作。结果留在 GPU 上，不回读 CPU（tone map 直接当 SRV 读）。
+groupshared uint g_peak;
+
+[numthreads(8, 8, 1)]
+void peak(uint3 tid : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+    if (gi == 0)
+        g_peak = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    uint v = 0;
+    if (tid.x < Width && tid.y < Height)
+    {
+        const float3 hdr = Hdr.Load(int3(tid.xy, 0)).rgb;
+        const float3 nits = Pq ? pq_to_nits3(hdr) : srgb_to_bt2020(hdr * 80.0);
+        const float m = max(max(nits.r, nits.g), nits.b);
+        v = uint(round(saturate(nits_to_pq(max(m, 0.0))) * 1023.0));
+    }
+    InterlockedMax(g_peak, v);
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0)
+        InterlockedMax(PeakOut[0], g_peak);
 }

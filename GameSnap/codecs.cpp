@@ -577,10 +577,11 @@ namespace gamesnap {
                 error = "avifImageCreate 失败";
                 return false;
             }
-            avif->yuvRange = AVIF_RANGE_FULL;
+            // 同 avif_from_rgba10：identity 矩阵的平面顺序有歧义，改用标准 YCbCr 矩阵。
+            avif->yuvRange = AVIF_RANGE_LIMITED;
             avif->colorPrimaries = hdr ? AVIF_COLOR_PRIMARIES_BT2020 : AVIF_COLOR_PRIMARIES_BT709;
             avif->transferCharacteristics = hdr ? AVIF_TRANSFER_CHARACTERISTICS_PQ : AVIF_TRANSFER_CHARACTERISTICS_SRGB;
-            avif->matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_IDENTITY;
+            avif->matrixCoefficients = hdr ? AVIF_MATRIX_COEFFICIENTS_BT2020_NCL : AVIF_MATRIX_COEFFICIENTS_BT709;
 
             avifRGBImage rgb;
             avifRGBImageSetDefaults(&rgb, avif);
@@ -642,10 +643,13 @@ namespace gamesnap {
                 error = "avifImageCreate 失败";
                 return false;
             }
-            avif->yuvRange = AVIF_RANGE_FULL;
+            // 不要用 AVIF_MATRIX_COEFFICIENTS_IDENTITY：identity 的平面顺序在 CICP/AV1 里是
+            // G,B,R，而 libavif 按 R,G,B 写，按规范解码的实现会把红蓝换过来。
+            // 标准 HDR10 AVIF 用 BT.2020 非恒定亮度矩阵 + 有限范围，解码器无歧义。
+            avif->yuvRange = AVIF_RANGE_LIMITED;
             avif->colorPrimaries = AVIF_COLOR_PRIMARIES_BT2020;
             avif->transferCharacteristics = AVIF_TRANSFER_CHARACTERISTICS_PQ;
-            avif->matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_IDENTITY;
+            avif->matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_BT2020_NCL;
 
             avifRGBImage rgb;
             avifRGBImageSetDefaults(&rgb, avif);

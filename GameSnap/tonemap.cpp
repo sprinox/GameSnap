@@ -2,6 +2,7 @@
 
 #include "tonemap.h"
 #include "tonemap_cs.h"
+#include "tonemap_peak_cs.h"
 #include "d3d.h"
 #include <immintrin.h>
 #include <cstring>
@@ -91,6 +92,13 @@ namespace gamesnap {
             error_ = "CreateComputeShader 失败";
             return;
         }
+        if (FAILED(d3d_->device()->CreateComputeShader(kPeakCS, sizeof(kPeakCS), nullptr, peak_shader_.put()))) {  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+            error_ = "CreateComputeShader(peak) 失败";
+            return;
+        }
+        if (!ensure_peak_buffer()) {
+            return;
+        }
 
         D3D11_BUFFER_DESC desc{};
         desc.ByteWidth = sizeof(Constants);
@@ -117,6 +125,42 @@ namespace gamesnap {
     }
 
     ToneMapper::~ToneMapper() = default;
+
+    // 1 个 uint 的峰值缓冲：UAV 写入、SRV 读取，全程留在 GPU 上。
+    bool ToneMapper::ensure_peak_buffer() {
+        if (peak_buffer_)
+            return true;
+
+        D3D11_BUFFER_DESC desc{};
+        desc.ByteWidth = sizeof(std::uint32_t);
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+        desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+        desc.StructureByteStride = sizeof(std::uint32_t);
+        if (FAILED(d3d_->device()->CreateBuffer(&desc, nullptr, peak_buffer_.put()))) {
+            error_ = "CreateBuffer(peak) 失败";
+            return false;
+        }
+
+        D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+        uav_desc.Format = DXGI_FORMAT_UNKNOWN;
+        uav_desc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        uav_desc.Buffer.NumElements = 1;
+        if (FAILED(d3d_->device()->CreateUnorderedAccessView(peak_buffer_.get(), &uav_desc, peak_uav_.put()))) {
+            error_ = "CreateUnorderedAccessView(peak) 失败";
+            return false;
+        }
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+        srv_desc.Format = DXGI_FORMAT_UNKNOWN;
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+        srv_desc.Buffer.NumElements = 1;
+        if (FAILED(d3d_->device()->CreateShaderResourceView(peak_buffer_.get(), &srv_desc, peak_srv_.put()))) {
+            error_ = "CreateShaderResourceView(peak) 失败";
+            return false;
+        }
+        return true;
+    }
 
     void ToneMapper::release_resources() {
         output_view_ = nullptr;
@@ -227,7 +271,7 @@ namespace gamesnap {
         constants.width = desc.Width;
         constants.height = desc.Height;
         constants.sdr_white = static_cast<float>(std::max<std::uint32_t>(sdr_white_nits, 1));
-        constants.peak_nits = 1000.0F;
+        constants.peak_nits = 10000.0F;  // 实测峰值只是被它夹住的上限
         constants.pq = (color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
                         color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020)
                            ? 1U
@@ -247,20 +291,36 @@ namespace gamesnap {
             std::scoped_lock lock(d3d_->context_mutex());
             auto* context = d3d_->context();
             context->UpdateSubresource(constants_.get(), 0, nullptr, &constants, 0, 0);
-            context->CSSetShader(shader_.get(), nullptr, 0);
             ID3D11Buffer* cbuf = constants_.get();
             context->CSSetConstantBuffers(0, 1, &cbuf);
+
+            // 1) 峰值归约：先清 0，再按 8x8 线程组做两级 max，结果留在 peak_buffer_。
+            const UINT clear[4]{};
+            context->ClearUnorderedAccessViewUint(peak_uav_.get(), clear);
+            context->CSSetShader(peak_shader_.get(), nullptr, 0);
+            ID3D11ShaderResourceView* peak_in = input_view.get();
+            context->CSSetShaderResources(0, 1, &peak_in);
+            ID3D11UnorderedAccessView* peak_uav = peak_uav_.get();
+            context->CSSetUnorderedAccessViews(0, 1, &peak_uav, nullptr);
+            context->Dispatch((desc.Width + 7) / 8, (desc.Height + 7) / 8, 1);
+            ID3D11UnorderedAccessView* no_uav = nullptr;
+            context->CSSetUnorderedAccessViews(0, 1, &no_uav, nullptr);
+
+            // 2) 色调映射：tone map 从 t1 读回本帧峰值，不回读 CPU。
+            context->CSSetShader(shader_.get(), nullptr, 0);
             ID3D11ShaderResourceView* srv = input_view.get();
             context->CSSetShaderResources(0, 1, &srv);
+            ID3D11ShaderResourceView* peak_srv = peak_srv_.get();
+            context->CSSetShaderResources(1, 1, &peak_srv);
             ID3D11UnorderedAccessView* uav = output_view_.get();
             context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
             ID3D11UnorderedAccessView* hdr_uav = hdr_output_view_.get();
             context->CSSetUnorderedAccessViews(1, 1, &hdr_uav, nullptr);
             context->Dispatch((desc.Width + 7) / 8, (desc.Height + 7) / 8, 1);
 
-            ID3D11ShaderResourceView* null_srv = nullptr;
+            std::array<ID3D11ShaderResourceView*, 2> null_srvs{};
             std::array<ID3D11UnorderedAccessView*, 2> null_uavs{};
-            context->CSSetShaderResources(0, 1, &null_srv);
+            context->CSSetShaderResources(0, 2, null_srvs.data());
             context->CSSetUnorderedAccessViews(0, 2, null_uavs.data(), nullptr);
             context->CopyResource(readback_.get(), output_.get());
             context->CopyResource(hdr_readback_.get(), hdr_output_.get());

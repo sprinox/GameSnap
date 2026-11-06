@@ -39,11 +39,17 @@ namespace gamesnap {
 
     private:
         bool ensure_size(std::uint32_t width, std::uint32_t height);
+        bool ensure_peak_buffer();
         void release_resources();
 
         std::shared_ptr<D3DContext> d3d_;
         winrt::com_ptr<ID3D11ComputeShader> shader_;
+        winrt::com_ptr<ID3D11ComputeShader> peak_shader_;
         winrt::com_ptr<ID3D11Buffer> constants_;
+        // 峰值归约结果：1 个 uint（10-bit PQ 码值）。GPU 内消费，不回读 CPU。
+        winrt::com_ptr<ID3D11Buffer> peak_buffer_;
+        winrt::com_ptr<ID3D11UnorderedAccessView> peak_uav_;
+        winrt::com_ptr<ID3D11ShaderResourceView> peak_srv_;
         winrt::com_ptr<ID3D11Fence> fence_;
         winrt::com_ptr<ID3D11DeviceContext4> context4_;
         std::uint64_t fence_value_ = 0;

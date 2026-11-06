@@ -195,6 +195,14 @@
       <VariableName>kTonemapCS</VariableName>
       <AdditionalOptions Condition="'$(Configuration)'=='Release'">/O3 %(AdditionalOptions)</AdditionalOptions>
     </FxCompile>
+    <FxCompile Include="tonemap_peak.hlsl">
+      <ShaderType>Compute</ShaderType>
+      <ShaderModel>5.0</ShaderModel>
+      <EntryPointName>peak</EntryPointName>
+      <HeaderFileOutput>$(TargetDir)tonemap_peak_cs.h</HeaderFileOutput>
+      <VariableName>kPeakCS</VariableName>
+      <AdditionalOptions Condition="'$(Configuration)'=='Release'">/O3 %(AdditionalOptions)</AdditionalOptions>
+    </FxCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="GameSnap.rc" />

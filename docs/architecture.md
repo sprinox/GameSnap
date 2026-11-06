@@ -122,8 +122,15 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 ## 编码与 HDR 输出
 
 - 非 HDR：捕获纹理转 BGRA8，按 `format_sdr` 编码 BMP / PNG / JPEG / WebP / AVIF / HEIC。
+- **帧的色彩空间是 scRGB，不是显示器的 PQ**。WGC 抓的是 DWM 的合成表面，FP16 帧用合成色彩空间
+  （CCCS）：BT.709 原色 + 线性伽马，**1.0 = 80 nits**，HDR 高光会超过 1.0（例如 12.5 = 1000 nits）。
+  `IDXGIOutput6::GetDesc1().ColorSpace`（G2084/P2020）描述的是屏幕的输出线格式，只用于判断是否 HDR
+  并打日志。把帧当 PQ 处理会把白点写成 10000 nits、把中间调压暗，还会被 `saturate()` 丢掉高光。
 - HDR：同一帧写 `_HDR.<format_hdr>`（10-bit PQ/BT.2020 AVIF 或 HEIC）和 `_SDR.<format_sdr>`。
-- HDR 的 PQ OETF 与 SDR 色调映射在同一个 D3D11 compute dispatch 完成：FP16 → BT.2020 nit → PQ（HDR）；
+- AVIF 用 **BT.2020 NCL + 有限范围 + 4:4:4** 写 YUV，不用 `matrixCoefficients = identity`：
+  identity 的平面顺序在 CICP/AV1 里是 G,B,R，而写入端按 R,G,B 排，按规范解码的软件会把红蓝换过来
+  （表现为整张图偏红）。
+- HDR 的 PQ OETF 与 SDR 色调映射在同一个 D3D11 compute dispatch 完成：scRGB × 80 nits → BT.2020 nit → PQ（HDR）；
   同一 texel → BT.709 亮度 → Hermite shoulder（spline）→ sRGB（SDR）。`analysis` 是 false color 调试算法。
 - 每个 HDR job 临时创建自己的 `ToneMapper`，map 完随 job 析构；GPU 用 `ID3D11Fence` + event 等待，
   等待期间不持 `context_mutex`，避免阻塞 capture 回调。不做跨 job 复用：它占 4 张全尺寸纹理

@@ -6,6 +6,8 @@
 
 #include <roapi.h>
 #include <shlobj.h>
+// ITaskbarList：把控制台窗口从任务栏摘掉/摘回。
+#include <shobjidl_core.h>
 
 #include <algorithm>
 #include <charconv>
@@ -200,13 +202,15 @@ namespace gamesnap {
         }
 
         bool is_known_config_key(std::string_view key) {
-            constexpr std::array<std::string_view, 21> keys{
+            constexpr std::array<std::string_view, 27> keys{
                 "output_dir", "encode_threads", "hotkey", "swallow", "monitor",
                 "format_hdr", "format_sdr", "tone_map", "tone_map_backend", "verbose",
                 "png_compression", "jpeg_quality",
                 "webp_quality", "webp_lossless", "webp_method",
                 "avif_quality", "avif_lossless", "avif_speed",
-                "heic_quality", "heic_lossless", "heic_preset"};
+                "heic_quality", "heic_lossless", "heic_preset",
+                "jxl_distance", "jxl_lossless", "jxl_effort",
+                "av1_encoder", "aom_cpu_used", "svt_preset"};
             return std::ranges::find(keys, key) != keys.end();
         }
 
@@ -247,7 +251,7 @@ namespace gamesnap {
                     if (const auto text = read_key<std::string>(root, "format_hdr"); text) {
                         const auto format = parse_image_format(*text);
                         if (!format || !format_supports_hdr(*format))
-                            throw ConfigError(fmt::format("format_hdr 只支持 avif / heic，实际为 {}", *text));
+                            throw ConfigError(fmt::format("format_hdr 只支持 avif / heic / jxl，实际为 {}", *text));
                         parsed.hdr_format = *format;
                     }
                     if (const auto text = read_key<std::string>(root, "format_sdr"); text) {
@@ -304,6 +308,24 @@ namespace gamesnap {
                     }
                     if (const auto value = read_key<bool>(root, "verbose"); value)
                         parsed.verbose = *value;
+                    // ── JXL ──
+                    if (const auto value = read_key<float>(root, "jxl_distance"); value) {
+                        if (!(*value >= 0.0F && *value <= 15.0F))
+                            throw ConfigError("jxl_distance 必须在 0..15 之间");
+                        parsed.codec.jxl_distance = *value;
+                    }
+                    if (const auto value = read_key<bool>(root, "jxl_lossless"); value)
+                        parsed.codec.jxl_lossless = *value;
+                    read_range("jxl_effort", 1, 10, parsed.codec.jxl_effort);
+                    // ── AV1 编码库 ──
+                    if (const auto text = read_key<std::string>(root, "av1_encoder"); text) {
+                        const auto encoder = parse_av1_encoder(*text);
+                        if (!encoder)
+                            throw ConfigError(fmt::format("av1_encoder 只支持 auto / aom / svt，实际为 {}", *text));
+                        parsed.codec.av1_encoder = *encoder;
+                    }
+                    read_range("aom_cpu_used", -1, 8, parsed.codec.aom_cpu_used);
+                    read_range("svt_preset", -1, 13, parsed.codec.svt_preset);
                     if (const auto text = read_key<std::string>(root, "monitor"); text) {
                         if (*text == "primary")
                             parsed.monitor = MonitorChoice::Primary;
@@ -795,9 +817,13 @@ namespace gamesnap {
         SPDLOG_INFO("编码参数: PNG compression={} JPEG quality={} WebP quality={} lossless={} method={}",
                     config.codec.png_compression, config.codec.jpeg_quality,
                     config.codec.webp_quality, config.codec.webp_lossless, config.codec.webp_method);
-        SPDLOG_INFO("编码参数: AVIF quality={} lossless={} speed={} HEIC quality={} lossless={} preset={}",
+        SPDLOG_INFO("编码参数: AVIF quality={} lossless={} speed={} 编码库={} aom_cpu_used={} svt_preset={}；"
+                    "HEIC quality={} lossless={} preset={}",
                     config.codec.avif_quality, config.codec.avif_lossless, config.codec.avif_speed,
+                    to_string(config.codec.av1_encoder), config.codec.aom_cpu_used, config.codec.svt_preset,
                     config.codec.heic_quality, config.codec.heic_lossless, config.codec.heic_preset);
+        SPDLOG_INFO("编码参数: JXL distance={:.2f} lossless={} effort={}",
+                    config.codec.jxl_distance, config.codec.jxl_lossless, config.codec.jxl_effort);
         SPDLOG_INFO("采集模式: 按需(热键时 StartCapture)，HDR 由目标显示器决定");
     }
 

@@ -74,6 +74,14 @@ namespace gamesnap {
         Webp,
         Avif,
         Heic,
+        Jxl,
+    };
+
+    // AVIF（AV1）可选的编码库：auto 交给 libavif 自己挑，其余强制指定。
+    enum class Av1Encoder : std::uint8_t {
+        Auto = 0,
+        Aom,
+        Svt,
     };
 
     enum class ToneMapBackend : std::uint8_t {
@@ -89,8 +97,10 @@ namespace gamesnap {
 
     std::string_view to_string(ImageFormat format);
     std::optional<ImageFormat> parse_image_format(std::string_view text);
+    std::string_view to_string(Av1Encoder encoder);
+    std::optional<Av1Encoder> parse_av1_encoder(std::string_view text);
     std::wstring_view image_extension(ImageFormat format);
-    // HDR 容器：AVIF / HEIC；其余格式只输出 SDR。
+    // HDR 容器：AVIF / HEIC / JXL；其余格式只输出 SDR。
     bool format_supports_hdr(ImageFormat format);
 
     // 各编码器的质量/无损/速度参数。BMP 固定无损，PNG 固定无损（compression 控制速度）。
@@ -110,6 +120,16 @@ namespace gamesnap {
         int heic_quality = 90;  // 0..100
         bool heic_lossless = false;
         std::string_view heic_preset = "fast";  // x265 preset
+
+        // JXL（libjxl）：distance 0 = 数学无损（还要 jxl_lossless），1.0 = 视觉无损；effort 越高越慢越小。
+        float jxl_distance = 1.0F;  // 0..15
+        bool jxl_lossless = false;
+        int jxl_effort = 7;  // 1..10
+
+        // AVIF 的 AV1 编码库与各库专属参数；-1 表示交给 avif_speed 推导。
+        Av1Encoder av1_encoder = Av1Encoder::Auto;
+        int aom_cpu_used = -1;  // 0..8，aom -cpu-used
+        int svt_preset = -1;    // 0..13，SVT-AV1 preset
     };
 
     // 写入 EXIF 的截图信息；时间格式为 YYYY:MM:DD HH:MM:SS。

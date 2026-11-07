@@ -7,11 +7,12 @@ Windows 上的整显示器截图工具，面向低延迟：按下热键时不做
 - 键盘全局热键（默认 F12，支持 Ctrl/Shift/Alt/Win 组合）与手柄 Xbox Share 键，全屏游戏内可用
 - 截图时播放内嵌提示音，右下角滑入半透明、鼠标穿透的 ImGui 信息面板
 - 每次截图新建 frame pool 与会话，D3D 设备、采集项、编码线程常驻
-- 每张图独立编码，多线程并行写盘；不依赖 WIC，编码使用 libavif / libwebp / libheif / spng / libjpeg-turbo
+- 每张图独立编码，多线程并行写盘；不依赖 WIC，编码使用 libavif / libwebp / libheif / libjxl / spng / libjpeg-turbo
+- 输出 AVIF / HEIC / JXL / WebP / PNG / JPEG / BMP；AVIF/HEIC/JXL 支持 HDR，AVIF 可选 aom 或 SVT-AV1 编码库
 - HDR 显示器以 FP16 捕获，同时输出 HDR + SDR 两份
 - HDR→SDR 使用 D3D11 compute shader（spline / analysis 调试），可选其它算法
 - 显示器拓扑变化、显卡热插拔、TDR 后自动重建
-- 输出 AVIF / HEIC / WebP / PNG / JPEG / BMP；AVIF/HEIC 支持 HDR
+- 托盘图标常驻：右键可退出；启动就绪后弹一条系统通知
 
 ## 运行
 

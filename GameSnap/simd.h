@@ -23,4 +23,11 @@ namespace gamesnap {
     void rgba_to_rgb_planes_row(std::uint8_t const* src, std::uint8_t* r, std::uint8_t* g,
                                 std::uint8_t* b, std::size_t pixels);
 
+    // BGRA8 → 紧凑 RGB8（丢掉 alpha）。AVX2 一次 8 像素，尾部走标量。
+    void bgra_to_rgb_row(std::uint8_t const* src, std::uint8_t* dst, std::size_t pixels);
+    // BGRA8 → 紧凑 BGR8（丢掉 alpha，保持 BMP 需要的字节序）。
+    void bgra_to_bgr_row(std::uint8_t const* src, std::uint8_t* dst, std::size_t pixels);
+    // RGBA16 → 紧凑 RGB16（丢掉 alpha），每像素 6 字节。AVX2 一次 4 像素。
+    void rgba16_to_rgb16_row(std::uint16_t const* src, std::uint16_t* dst, std::size_t pixels);
+
 }  // namespace gamesnap

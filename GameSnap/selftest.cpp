@@ -118,14 +118,11 @@ namespace gamesnap {
             std::uint32_t height = kHeight;
         };
 
-        std::shared_ptr<ID3D11Texture2D> create_gpu_texture(ID3D11Device* device, D3D11_TEXTURE2D_DESC const& desc) {
+        winrt::com_ptr<ID3D11Texture2D> create_gpu_texture(ID3D11Device* device, D3D11_TEXTURE2D_DESC const& desc) {
             winrt::com_ptr<ID3D11Texture2D> texture;
             if (FAILED(device->CreateTexture2D(&desc, nullptr, texture.put())))
                 return {};
-            return std::shared_ptr<ID3D11Texture2D>{texture.detach(), [](ID3D11Texture2D* p) {
-                if (p != nullptr)
-                    p->Release();
-            }};
+            return texture;
         }
 
         bool run_case(Config const& config, std::shared_ptr<D3DContext> const& d3d, Case const& test_case) {
@@ -189,10 +186,7 @@ namespace gamesnap {
                 before.push_back(entry.path());
 
             EncodeJob job;
-            auto texture_slot = std::make_shared<TextureSlot>();
-            texture_slot->texture = std::move(target);
-            texture_slot->hdr = hdr_target;
-            job.texture_slot = std::move(texture_slot);
+            job.texture = std::move(target);
             job.d3d = d3d;
             job.color_space = test_case.color_space;
             job.sdr_white_nits = test_case.sdr_white_nits;

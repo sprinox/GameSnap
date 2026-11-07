@@ -1,5 +1,10 @@
 #include "pch.h"
 
+#include <shellapi.h>
+
+// 托盘图标走 shell32。
+#pragma comment(lib, "shell32.lib")
+
 #include "system_events.h"
 
 namespace gamesnap {
@@ -12,6 +17,13 @@ namespace gamesnap {
         // 和各种应用广播频繁到来，每次自检都要枚举 DXGI 输出，必须合并。
         constexpr auto kValidateThrottle = std::chrono::milliseconds(500);
 
+        // 托盘：回调消息 + 菜单命令 ID。
+        constexpr UINT kTrayCallbackMessage = WM_APP + 1;
+        constexpr UINT kTrayNotifyReady = WM_APP + 2;
+        constexpr UINT kTrayIconId = 1;
+        constexpr UINT kMenuExit = 2;
+        constexpr wchar_t const* kTrayTip = L"GameSnap — 热键截图（右键菜单）";
+
         std::atomic<SystemEventThread*>& win_event_target() {
             static std::atomic<SystemEventThread*> target{nullptr};
             return target;
@@ -19,8 +31,9 @@ namespace gamesnap {
 
     }  // namespace
 
-    SystemEventThread::SystemEventThread(std::shared_ptr<CommandQueue> commands, MonitorChoice monitor)
-        : commands_(std::move(commands)), monitor_(monitor) {}
+    SystemEventThread::SystemEventThread(std::shared_ptr<CommandQueue> commands, MonitorChoice monitor,
+                                         std::shared_ptr<StopSource> stop_signal)
+        : commands_(std::move(commands)), stop_signal_(std::move(stop_signal)), monitor_(monitor) {}
 
     SystemEventThread::~SystemEventThread() {
         try {
@@ -61,6 +74,8 @@ namespace gamesnap {
     void SystemEventThread::run() {
         ::SetThreadDescription(::GetCurrentThread(), L"GameSnap.SystemEvents");
         const HINSTANCE instance = ::GetModuleHandleW(nullptr);
+        // explorer 重启后托盘图标会丢，需要靠这条广播消息重新添加。
+        taskbar_created_ = ::RegisterWindowMessageW(L"TaskbarCreated");
 
         WNDCLASSEXW window_class{};
         window_class.cbSize = sizeof(window_class);
@@ -87,9 +102,12 @@ namespace gamesnap {
         }
 
         thread_id_.store(::GetCurrentThreadId(), std::memory_order_release);
+        window_handle_.store(window_, std::memory_order_release);
         // 确保线程消息队列已建立，stop() 的 WM_QUIT 不会丢。
         MSG queue_probe{};
         ::PeekMessageW(&queue_probe, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+
+        add_tray_icon();
 
         win_event_target().store(this, std::memory_order_release);
         foreground_hook_ = ::SetWinEventHook(
@@ -114,6 +132,8 @@ namespace gamesnap {
             foreground_hook_ = nullptr;
         }
         win_event_target().store(nullptr, std::memory_order_release);
+        remove_tray_icon();
+        window_handle_.store(nullptr, std::memory_order_release);
 
         if (window_ != nullptr) {
             ::DestroyWindow(window_);
@@ -121,6 +141,72 @@ namespace gamesnap {
         }
         ::UnregisterClassW(kWindowClassName, instance);
         SPDLOG_INFO("system-events 线程退出");
+    }
+
+    void SystemEventThread::notify_ready() {
+        const HWND hwnd = window_handle_.load(std::memory_order_acquire);
+        if (hwnd != nullptr)
+            (void)::PostMessageW(hwnd, kTrayNotifyReady, 0, 0);
+    }
+
+    void SystemEventThread::add_tray_icon() {
+        if (tray_added_ || window_ == nullptr)
+            return;
+        tray_ = {};
+        tray_.cbSize = sizeof(tray_);
+        tray_.hWnd = window_;
+        tray_.uID = kTrayIconId;
+        tray_.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        tray_.uCallbackMessage = kTrayCallbackMessage;
+        tray_.hIcon = ::LoadIconW(nullptr, IDI_APPLICATION);
+        wcscpy_s(tray_.szTip, kTrayTip);
+        if (::Shell_NotifyIconW(NIM_ADD, &tray_) == FALSE) {
+            SPDLOG_WARN("添加托盘图标失败: {}", ::GetLastError());
+            return;
+        }
+        tray_added_ = true;
+    }
+
+    void SystemEventThread::remove_tray_icon() {
+        if (!tray_added_)
+            return;
+        ::Shell_NotifyIconW(NIM_DELETE, &tray_);
+        tray_added_ = false;
+    }
+
+    void SystemEventThread::show_balloon() {
+        if (!tray_added_)
+            return;
+        tray_.uFlags = NIF_INFO;
+        wcscpy_s(tray_.szInfoTitle, L"GameSnap");
+        wcscpy_s(tray_.szInfo, L"已就绪：按热键截图。右键托盘图标可切换控制台或退出。");
+        tray_.dwInfoFlags = NIIF_INFO;
+        tray_.uTimeout = 5000;
+        if (::Shell_NotifyIconW(NIM_MODIFY, &tray_) == FALSE)
+            SPDLOG_DEBUG("系统通知发送失败: {}", ::GetLastError());
+        tray_.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    }
+
+    void SystemEventThread::show_menu() {
+        HMENU menu = ::CreatePopupMenu();
+        if (menu == nullptr)
+            return;
+        ::AppendMenuW(menu, MF_STRING, kMenuExit, L"退出");
+
+        POINT point{};
+        ::GetCursorPos(&point);
+        // 必须先把窗口拿到前台，点菜单外部时菜单才会正常消失。
+        ::SetForegroundWindow(window_);
+        const UINT command = ::TrackPopupMenu(
+            menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, point.x, point.y, 0, window_, nullptr);
+        ::DestroyMenu(menu);
+        (void)::PostMessageW(window_, WM_NULL, 0, 0);
+
+        if (command == kMenuExit) {
+            SPDLOG_INFO("托盘菜单请求退出");
+            if (stop_signal_)
+                stop_signal_->request_stop();
+        }
     }
 
     void SystemEventThread::post(CommandKind kind, ReloadReason reason) {
@@ -174,6 +260,24 @@ namespace gamesnap {
 
         try {
             switch (message) {
+            case kTrayCallbackMessage:
+                switch (LOWORD(lparam)) {
+                case WM_RBUTTONUP:
+                case WM_CONTEXTMENU:
+                    self->show_menu();
+                    break;
+                case WM_LBUTTONDBLCLK:
+                    self->show_menu();
+                    break;
+                default:
+                    break;
+                }
+                return 0;
+
+            case kTrayNotifyReady:
+                self->show_balloon();
+                return 0;
+
             case WM_DISPLAYCHANGE:
                 // 切全屏 / 改分辨率 / 切 HDR 都会广播；先自检，真变了才重建。
                 SPDLOG_DEBUG("收到 WM_DISPLAYCHANGE");
@@ -207,6 +311,13 @@ namespace gamesnap {
             SPDLOG_ERROR("处理系统消息 0x{:04X} 时异常: {}", message, e.what());
         } catch (...) {
             SPDLOG_ERROR("处理系统消息 0x{:04X} 时异常", message);
+        }
+
+        // explorer 重启（TaskbarCreated）后补回托盘图标。
+        if (self->taskbar_created_ != 0 && message == self->taskbar_created_) {
+            self->tray_added_ = false;
+            self->add_tray_icon();
+            return 0;
         }
 
         return ::DefWindowProcW(hwnd, message, wparam, lparam);

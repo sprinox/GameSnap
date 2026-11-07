@@ -119,6 +119,20 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 自检失败时重建：重新选显示器 → 新 D3D 设备 → 新 item / pool / 会话。
 旧设备仍被在途编码任务持有时不会释放，只是不再使用。
 
+## 托盘图标
+
+系统事件线程的那个隐藏窗口同时是托盘图标的宿主（`Shell_NotifyIconW`）：
+
+- **右键菜单**：`退出`（`StopSource::request_stop()`，和 Ctrl+C 走同一条收尾路径）。双击图标也弹出这个菜单。
+- 收到 `TaskbarCreated` 广播（explorer 重启）时重新添加图标，否则图标会凭空消失。
+- 捕获资源初始化成功后调 `SystemEventThread::notify_ready()`：向窗口投递 `kTrayNotifyReady`，由线程用 `NIF_INFO` 气球通知（Win10+ 显示为系统通知）。
+- 控制台保持原样可见，不做隐藏/最小化（`SW_HIDE` 对 conhost 窗口不可靠，`FreeConsole` 又会连带丢掉 Ctrl+C，代价大于收益）。
+
+托盘相关操作全部在 system-events 线程内完成，跨线程只有一个 `std::atomic<HWND>` 和 `PostMessageW`。
+- 捕获资源初始化成功后调 `SystemEventThread::notify_ready()`：向窗口投递 `kTrayNotifyReady`，由线程用 `NIF_INFO` 气球通知（Win10+ 显示为系统通知）。
+
+托盘相关操作全部在 system-events 线程内完成，跨线程只有一个 `std::atomic<HWND>` 和 `PostMessageW`。
+
 ## 编码与 HDR 输出
 
 - 非 HDR：捕获纹理转 BGRA8，按 `format_sdr` 编码 BMP / PNG / JPEG / WebP / AVIF / HEIC。
@@ -127,9 +141,10 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
   `IDXGIOutput6::GetDesc1().ColorSpace`（G2084/P2020）描述的是屏幕的输出线格式，只用于判断是否 HDR
   并打日志。把帧当 PQ 处理会把白点写成 10000 nits、把中间调压暗，还会被 `saturate()` 丢掉高光。
 - HDR：同一帧写 `_HDR.<format_hdr>`（10-bit PQ/BT.2020 AVIF 或 HEIC）和 `_SDR.<format_sdr>`。
-- AVIF 用 **BT.2020 NCL + 有限范围 + 4:4:4** 写 YUV，不用 `matrixCoefficients = identity`：
+- AVIF 用 **BT.2020 NCL + 全范围(full range) + 4:4:4** 写 YUV，不用 `matrixCoefficients = identity`：
   identity 的平面顺序在 CICP/AV1 里是 G,B,R，而写入端按 R,G,B 排，按规范解码的软件会把红蓝换过来
-  （表现为整张图偏红）。
+  （表现为整张图偏红）。范围与 HEIC/JXL 统一为 full：444 + full 时 RGB↔YUV 往返只剩舍入误差
+  （实测无损 AVIF 与 PNG 的最大差从 limited 的 12 降到 1）。
 - HDR 的 PQ OETF 与 SDR 色调映射在同一个 D3D11 compute dispatch 完成：scRGB × 80 nits → BT.2020 nit → PQ（HDR）；
   同一 texel → BT.709 亮度 → Hermite shoulder（spline）→ sRGB（SDR）。`analysis` 是 false color 调试算法。
 - 每个 HDR job 临时创建自己的 `ToneMapper`，map 完随 job 析构；GPU 用 `ID3D11Fence` + event 等待，

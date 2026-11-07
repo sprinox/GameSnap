@@ -7,23 +7,26 @@
     "cxxopts",
     "fmt",
     {
+      "name": "imgui",
+      "features": [
+        "dx11-binding"
+      ]
+    },
+    {
       "name": "libavif",
       "features": [
-        "aom"
+        "aom",
+		"svt"
       ]
     },
     "libheif",
     "libjpeg-turbo",
+    "libjxl",
     "libspng",
     "libwebp",
     "spdlog",
     "x265",
     "yaml-cpp",
-    {
-      "name": "imgui",
-      "features": [
-        "dx11-binding"
-      ]
-    }
+    "svt-av1"
   ]
 }

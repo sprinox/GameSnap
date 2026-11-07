@@ -394,7 +394,11 @@ namespace gamesnap {
 
             MONITORINFO monitor_info{};
             monitor_info.cbSize = sizeof(monitor_info);
-            ::GetMonitorInfoW(pick_monitor(monitor_), &monitor_info);
+            if (::GetMonitorInfoW(pick_monitor(monitor_), &monitor_info) == FALSE) {
+                // 没有显示器（或句柄失效）：退化成屏幕尺寸，避免把窗口放到负坐标。
+                monitor_info.rcWork = RECT{0, 0, ::GetSystemMetrics(SM_CXSCREEN),
+                                           ::GetSystemMetrics(SM_CYSCREEN)};
+            }
 
             const HWND hwnd = ::CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
@@ -557,7 +561,11 @@ namespace gamesnap {
 
         MONITORINFO monitor_info{};
         monitor_info.cbSize = sizeof(monitor_info);
-        ::GetMonitorInfoW(pick_monitor(monitor_), &monitor_info);
+        if (::GetMonitorInfoW(pick_monitor(monitor_), &monitor_info) == FALSE) {
+            // 没有显示器时按屏幕尺寸兜底，面板位置仍有定义。
+            monitor_info.rcWork = RECT{0, 0, ::GetSystemMetrics(SM_CXSCREEN),
+                                       ::GetSystemMetrics(SM_CYSCREEN)};
+        }
 
         const float scale = state.scale;
         const auto panel_width = state.panel_width;
@@ -581,6 +589,7 @@ namespace gamesnap {
 
         std::uint64_t last_trigger = trigger;
         std::uint64_t last_info = 0;
+        std::shared_ptr<const UiBridge::Thumbnail> last_thumbnail;
         auto last_trigger_time = session_start;
         auto last_frame = session_start;
 
@@ -643,11 +652,16 @@ namespace gamesnap {
                     font = build_font(scale, state.font_filename);
                     state.font = font;
                 }
-                if (snapshot.thumbnail) {
-                    state.device->set_thumbnail(snapshot.thumbnail->pixels, snapshot.thumbnail->width,
-                                                snapshot.thumbnail->height);
-                } else {
-                    state.device->set_thumbnail({}, 0, 0);  // 新截图已开始但还没有缩略图：清掉上一张
+                // 缩略图和文件名是分两次发布的（先图、写盘后补文件名），
+                // 指针没变就不必重新上传纹理。
+                if (snapshot.thumbnail != last_thumbnail) {
+                    last_thumbnail = snapshot.thumbnail;
+                    if (snapshot.thumbnail) {
+                        state.device->set_thumbnail(snapshot.thumbnail->pixels, snapshot.thumbnail->width,
+                                                    snapshot.thumbnail->height);
+                    } else {
+                        state.device->set_thumbnail({}, 0, 0);  // 新截图已开始但还没有缩略图：清掉上一张
+                    }
                 }
             }
 

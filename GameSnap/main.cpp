@@ -86,7 +86,7 @@ namespace {
         gamesnap::InputThread input(config, commands, ui);
         input.start();
 
-        gamesnap::SystemEventThread system_events(commands, config.monitor);
+        gamesnap::SystemEventThread system_events(commands, config.monitor, stop);
         system_events.start();
 
         gamesnap::CaptureWorker capture(config, commands, jobs, stop, ui);
@@ -111,8 +111,13 @@ namespace {
         // 等启动阶段的捕获资源初始化结束，避免先打印“就绪”再报失败。
         capture.wait_ready();
         if (!capture.fatal_error()) {
-            SPDLOG_INFO("GameSnap {} 就绪：按 {} 截图（手柄 Share 键），Ctrl+C 退出。",
-                        kVersion, gamesnap::hotkey_name({config.hotkey_vk, config.hotkey_modifiers}));
+            if (capture.no_display()) {
+                SPDLOG_WARN("GameSnap {} 已启动，但当前没有可用显示器；接入后会自动开始工作。", kVersion);
+            } else {
+                SPDLOG_INFO("GameSnap {} 就绪：按 {} 截图（手柄 Share 键），Ctrl+C 退出。",
+                            kVersion, gamesnap::hotkey_name({config.hotkey_vk, config.hotkey_modifiers}));
+            }
+            system_events.notify_ready();
         }
 
         // 等到 Ctrl+C 等停止信号；StopSource 是事件，不需要轮询。

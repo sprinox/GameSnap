@@ -130,6 +130,8 @@ namespace gamesnap {
 
         // 启动时资源就创建失败（例如权限不足）：调用方应尽快退出。
         [[nodiscard]] bool fatal_error() const noexcept { return fatal_error_.load(std::memory_order_relaxed); }
+        // 一个显示器都没有：不算致命错误，接入显示器后由 WM_DISPLAYCHANGE 触发自动重建。
+        [[nodiscard]] bool no_display() const noexcept { return no_display_.load(std::memory_order_relaxed); }
         // 等待启动阶段的资源初始化结束（一次性门闩，初始化完成或失败都会放行）。
         void wait_ready() { ready_.wait(); }
 
@@ -154,6 +156,7 @@ namespace gamesnap {
         std::uint64_t generation_ = 0;
         std::uint64_t sequence_ = 0;
         std::atomic<bool> fatal_error_{false};
+        std::atomic<bool> no_display_{false};  // 启动时/运行中一个显示器都没有
         std::latch ready_{1};  // 一次性门闩：1 表示还没初始化完
     };
 

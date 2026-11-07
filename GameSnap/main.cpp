@@ -186,9 +186,15 @@ int wmain(int argc, wchar_t** argv) {
     gamesnap::log_config(*config);
 
     if (config->selftest) {
+#if GAMESNAP_SELFTEST
         const bool ok = gamesnap::run_selftest(*config);
         spdlog::shutdown();
         return ok ? 0 : 1;
+#else
+        SPDLOG_ERROR("这个构建没有编入自检（Release 默认关闭）；用 Debug 构建或 /DGAMESNAP_ENABLE_SELFTEST=1 重新编译");
+        spdlog::shutdown();
+        return 1;
+#endif
     }
 
     try {

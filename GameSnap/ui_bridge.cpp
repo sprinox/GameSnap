@@ -48,15 +48,10 @@ namespace gamesnap {
     }
 
     void UiBridge::on_trigger() noexcept {
-        {
-            // 新截图还没有文件：立刻丢弃上一张的名字和缩略图，避免面板在 publish() 之前
-            // 继续显示旧文件名。trigger_serial 随后自增，overlay 靠它判断是新的一次触发。
-            std::scoped_lock lock(mutex_);
-            filename_.clear();
-            thumbnail_.reset();
-            ++info_serial_;
-        }
-        trigger_serial_.fetch_add(1, std::memory_order_release);
+        // 这个函数在 WH_KEYBOARD_LL 钩子回调里被调用：超过 LowLevelHooksTimeout（默认 1s）
+        // 系统会静默摘掉钩子。所以这里只做递增 + SetEvent，不拿互斥量、不释放堆内存。
+        // 丢弃上一张文件名/缩略图的工作挪到 overlay 线程的 snapshot() 里惰性完成。
+        trigger_serial_.fetch_add(1, std::memory_order_acq_rel);
         if (trigger_event_ != nullptr)
             ::SetEvent(trigger_event_);
     }
@@ -78,6 +73,12 @@ namespace gamesnap {
         // 这样多编码线程乱序完成时，旧截图不会覆盖新截图的显示。
         std::shared_ptr<Thumbnail> thumbnail;
         if (image != nullptr && !image->pixels.empty()) {
+            {
+                // 先探一次：晚到的旧作业就别白算一次 320x180 采样了。
+                std::scoped_lock lock(mutex_);
+                if (sequence < published_sequence_)
+                    return;
+            }
             thumbnail = std::make_shared<Thumbnail>();
             make_thumbnail(*image, thumbnail->pixels, thumbnail->width, thumbnail->height);
         }
@@ -92,12 +93,23 @@ namespace gamesnap {
         ++info_serial_;
     }
 
-    UiBridge::Snapshot UiBridge::snapshot() const {
+    UiBridge::Snapshot UiBridge::snapshot() {
         Snapshot result;
         result.trigger_serial = trigger_serial_.load(std::memory_order_acquire);
         result.remaining = remaining_.load(std::memory_order_acquire);
         {
             std::scoped_lock lock(mutex_);
+            // 惰性丢弃上一张：新触发已经发生、但还没有比它更新的结果发布出来时，
+            // 清掉旧文件名/缩略图，避免面板在 publish() 之前继续显示上一张。
+            // 每次触发只清一次（cleared_trigger_），否则每帧都会把 info_serial_ 顶上去。
+            if (result.trigger_serial > cleared_trigger_ && published_sequence_ < result.trigger_serial) {
+                cleared_trigger_ = result.trigger_serial;
+                if (!filename_.empty() || thumbnail_) {
+                    filename_.clear();
+                    thumbnail_.reset();
+                    ++info_serial_;
+                }
+            }
             result.info_serial = info_serial_;
             result.filename = filename_;
             result.thumbnail = thumbnail_;

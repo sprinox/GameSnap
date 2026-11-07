@@ -214,12 +214,21 @@ namespace gamesnap {
     }
 
     // BMP 的像素字节序是 B,G,R：不能复用 bgra_to_rgb_row，否则红蓝颠倒。
+    // 和 bgra_to_rgb_row 同一套打包手法，只是掩码保留 B,G,R 原序。
     void bgra_to_bgr_row(std::uint8_t const* __restrict src, std::uint8_t* __restrict dst,
                          std::size_t pixels) {
-        for (std::size_t i = 0; i < pixels; ++i, src += 4, dst += 3) {
-            dst[0] = src[0];
-            dst[1] = src[1];
-            dst[2] = src[2];
+        const __m256i pack = _mm256_setr_epi8(
+            0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1,
+            0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1);
+        std::size_t x = 0;
+        for (; x + 8 <= pixels; x += 8) {
+            const __m256i v = _mm256_loadu_si256(reinterpret_cast<__m256i const*>(src + x * 4));
+            store24(dst + x * 3, _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(v, pack), kPackPerm));
+        }
+        for (; x < pixels; ++x) {
+            dst[x * 3 + 0] = src[x * 4 + 0];
+            dst[x * 3 + 1] = src[x * 4 + 1];
+            dst[x * 3 + 2] = src[x * 4 + 2];
         }
     }
 

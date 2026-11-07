@@ -46,7 +46,8 @@ namespace gamesnap {
         // filename 留空表示"文件名还没确定"，等写盘成功后再调一次补上。
         void publish(std::uint64_t sequence, std::wstring filename, Image const* image);
 
-        [[nodiscard]] Snapshot snapshot() const;
+        // 非 const：会在里面惰性丢弃上一张的文件名/缩略图（on_trigger() 不拿锁）。
+        [[nodiscard]] Snapshot snapshot();
         [[nodiscard]] HANDLE trigger_event() const noexcept { return trigger_event_; }
 
     private:
@@ -55,6 +56,8 @@ namespace gamesnap {
         std::shared_ptr<const Thumbnail> thumbnail_;
         std::uint64_t info_serial_ = 0;
         std::uint64_t published_sequence_ = 0;  // 已发布的最新截图序号
+        // 已经做过"惰性清空"的触发序号：on_trigger() 不拿锁，清空改在 snapshot() 里做。
+        std::uint64_t cleared_trigger_ = 0;
         std::atomic<std::uint64_t> trigger_serial_{0};
         HANDLE trigger_event_ = nullptr;
         std::atomic<int> remaining_{0};

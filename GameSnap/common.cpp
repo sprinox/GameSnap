@@ -697,8 +697,8 @@ namespace gamesnap {
             ("threads", "编码线程数 1..8", cxxopts::value<int>())
             ("monitor", "primary / foreground", cxxopts::value<std::string>())
             ("swallow", "吞掉热键（游戏收不到）")
-            ("format-hdr", "HDR 容器 avif / heic", cxxopts::value<std::string>())
-            ("format-sdr", "SDR 格式 bmp/png/jpeg/webp/avif/heic", cxxopts::value<std::string>())
+            ("format-hdr", "HDR 容器 avif / heic / jxl", cxxopts::value<std::string>())
+            ("format-sdr", "SDR 格式 bmp/png/jpeg/webp/avif/heic/jxl", cxxopts::value<std::string>())
             ("tone-map", "色调映射 spline / analysis", cxxopts::value<std::string>())
             ("verbose", "输出调试日志")
             ("selftest", "用合成纹理跑编码链路自检")
@@ -780,7 +780,7 @@ namespace gamesnap {
         if (result.count("format-hdr") != 0) {
             const auto format = parse_image_format(result["format-hdr"].as<std::string>());
             if (!format || !format_supports_hdr(*format)) {
-                SPDLOG_ERROR("--format-hdr 只支持 avif / heic");
+                SPDLOG_ERROR("--format-hdr 只支持 avif / heic / jxl");
                 return std::nullopt;
             }
             config.hdr_format = *format;

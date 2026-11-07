@@ -80,9 +80,9 @@ namespace gamesnap {
             if (image.width == 0 || image.height == 0 || image.stride != image.width * 4)
                 return false;
             rgb.resize(static_cast<std::size_t>(image.width) * image.height * 3);
-            for (std::uint32_t y = 0; y < image.height; ++y) {
-                auto const* src = image.pixels.data() + static_cast<std::size_t>(y) * image.stride;
-                auto* dst = rgb.data() + static_cast<std::size_t>(y) * image.width * 3;
+            for (std::size_t y = 0; y < image.height; ++y) {
+                auto const* src = image.pixels.data() + y * image.stride;
+                auto* dst = rgb.data() + y * image.width * 3;
                 bgra_to_rgb_row(src, dst, image.width);
             }
             return true;
@@ -92,9 +92,9 @@ namespace gamesnap {
             if (image.width == 0 || image.height == 0 || image.stride != image.width * 4)
                 return false;
             rgba.resize(static_cast<std::size_t>(image.width) * image.height * 4);
-            for (std::uint32_t y = 0; y < image.height; ++y) {
-                auto const* src = image.pixels.data() + static_cast<std::size_t>(y) * image.stride;
-                auto* dst = rgba.data() + static_cast<std::size_t>(y) * image.width * 4;
+            for (std::size_t y = 0; y < image.height; ++y) {
+                auto const* src = image.pixels.data() + y * image.stride;
+                auto* dst = rgba.data() + y * image.width * 4;
                 bgra_to_rgba_row(src, dst, image.width);
             }
             return true;
@@ -247,7 +247,8 @@ namespace gamesnap {
             return make_exif(metadata, true);
         }
 
-        std::vector<std::uint8_t> add_jpeg_exif(std::vector<std::uint8_t> jpeg,
+        // 入参用 const&：4K PNG/JPEG 有十几 MB，按值传会白做一次整块拷贝。
+        std::vector<std::uint8_t> add_jpeg_exif(std::vector<std::uint8_t> const& jpeg,
                                                 ImageMetadata const& metadata) {
             const auto exif = make_exif_payload(metadata);
             if (jpeg.size() < 2 || jpeg[0] != 0xFF || jpeg[1] != 0xD8)
@@ -262,7 +263,7 @@ namespace gamesnap {
             return out;
         }
 
-        std::vector<std::uint8_t> add_png_exif(std::vector<std::uint8_t> png,
+        std::vector<std::uint8_t> add_png_exif(std::vector<std::uint8_t> const& png,
                                                ImageMetadata const& metadata) {
             if (png.size() < 12)
                 return png;
@@ -278,13 +279,18 @@ namespace gamesnap {
                           static_cast<uInt>(4 + tiff.size()));
             write_u32_be(chunk_data + 8 + tiff.size(), static_cast<std::uint32_t>(crc));
 
-            // IEND 固定为最后 12 字节：length=0 + "IEND" + crc。
+            // IEND 固定为最后 12 字节：length=0 + "IEND" + crc。直接在 out 里拼好，
+            // 不走"按值入参 + insert"那套（4K PNG 那是 20 MB 级的两趟 memcpy）。
             const std::size_t insert_at = png.size() - 12;
-            png.insert(png.begin() + static_cast<std::ptrdiff_t>(insert_at), chunk.begin(), chunk.end());
-            return png;
+            std::vector<std::uint8_t> out;
+            out.reserve(png.size() + chunk.size());
+            out.insert(out.end(), png.begin(), png.begin() + static_cast<std::ptrdiff_t>(insert_at));
+            out.insert(out.end(), chunk.begin(), chunk.end());
+            out.insert(out.end(), png.begin() + static_cast<std::ptrdiff_t>(insert_at), png.end());
+            return out;
         }
 
-        std::vector<std::uint8_t> add_webp_exif(std::vector<std::uint8_t> webp,
+        std::vector<std::uint8_t> add_webp_exif(std::vector<std::uint8_t> const& webp,
                                                 ImageMetadata const& metadata) {
             if (webp.size() < 12 || std::memcmp(webp.data(), "RIFF", 4) != 0 ||
                 std::memcmp(webp.data() + 8, "WEBP", 4) != 0) {
@@ -308,6 +314,7 @@ namespace gamesnap {
                 WebPMuxDelete(mux);
                 return webp;
             }
+            // 直接从 mux 的缓冲写盘，不再拷贝进 vector。
             std::vector<std::uint8_t> out(assembled.bytes, assembled.bytes + assembled.size);
             WebPDataClear(&assembled);
             WebPMuxDelete(mux);
@@ -346,8 +353,8 @@ namespace gamesnap {
             ByteBuffer row;
             row.resize(row_bytes);
             std::memset(row.data(), 0, row_bytes);  // 行尾 4 字节对齐的填充保持为 0
-            for (std::uint32_t y = 0; y < image.height; ++y) {
-                auto const* src = image.pixels.data() + static_cast<std::size_t>(y) * image.stride;
+            for (std::size_t y = 0; y < image.height; ++y) {
+                auto const* src = image.pixels.data() + y * image.stride;
                 bgra_to_bgr_row(src, row.data(), image.width);
                 file.write(reinterpret_cast<char const*>(row.data()), static_cast<std::streamsize>(row_bytes));
             }
@@ -661,8 +668,10 @@ namespace gamesnap {
             return AVIF_PIXEL_FORMAT_YUV444;
         }
 
-        bool avif_from_bgra(std::filesystem::path const& path, Image const& image, bool hdr, std::string& error) {
-            const std::uint32_t depth = hdr ? 10 : 8;
+        // 只处理 8-bit SDR：Image 恒为 BGRA8，HDR 走 avif_from_rgba10()。
+        // 曾经这里有个 hdr 形参会把 depth 设成 10，而缓冲仍是 8-bit 的——一用就按 uint16 越界读。
+        bool avif_from_bgra(std::filesystem::path const& path, Image const& image, std::string& error) {
+            constexpr std::uint32_t depth = 8;
             avifImage* avif = avifImageCreate(image.width, image.height, depth, avif_yuv_format());
             if (avif == nullptr) {
                 error = "avifImageCreate 失败";
@@ -671,9 +680,9 @@ namespace gamesnap {
             // 同 avif_from_rgba10：identity 矩阵的平面顺序有歧义，改用标准 YCbCr 矩阵。
             // 范围统一用 full（与 HEIC/JXL 一致）：444 + full 时 RGB↔YUV 往返几乎无损失。
             avif->yuvRange = AVIF_RANGE_FULL;
-            avif->colorPrimaries = hdr ? AVIF_COLOR_PRIMARIES_BT2020 : AVIF_COLOR_PRIMARIES_BT709;
-            avif->transferCharacteristics = hdr ? AVIF_TRANSFER_CHARACTERISTICS_PQ : AVIF_TRANSFER_CHARACTERISTICS_SRGB;
-            avif->matrixCoefficients = hdr ? AVIF_MATRIX_COEFFICIENTS_BT2020_NCL : AVIF_MATRIX_COEFFICIENTS_BT709;
+            avif->colorPrimaries = AVIF_COLOR_PRIMARIES_BT709;
+            avif->transferCharacteristics = AVIF_TRANSFER_CHARACTERISTICS_SRGB;
+            avif->matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_BT709;
 
             avifRGBImage rgb;
             avifRGBImageSetDefaults(&rgb, avif);
@@ -703,15 +712,15 @@ namespace gamesnap {
             U16Buffer rgba;
             rgba.resize(static_cast<std::size_t>(frame.width) * frame.height * 4);
             std::vector<float> row_floats(static_cast<std::size_t>(frame.width) * 4);
-            for (std::uint32_t y = 0; y < frame.height; ++y) {
+            for (std::size_t y = 0; y < frame.height; ++y) {
                 auto const* row16 =
-                    reinterpret_cast<std::uint16_t const*>(frame.bytes + static_cast<std::size_t>(y) * frame.stride);
+                    reinterpret_cast<std::uint16_t const*>(frame.bytes + y * frame.stride);
                 half_to_float_row(row16, row_floats.data(), static_cast<std::size_t>(frame.width) * 4);
-                for (std::uint32_t x = 0; x < frame.width; ++x) {
-                    RgbLinear rgb{.r = row_floats[static_cast<std::size_t>(x) * 4 + 0],
-                                  .g = row_floats[static_cast<std::size_t>(x) * 4 + 1],
-                                  .b = row_floats[static_cast<std::size_t>(x) * 4 + 2]};
-                    auto* p = rgba.data() + (static_cast<std::size_t>(y) * frame.width + x) * 4;
+                for (std::size_t x = 0; x < frame.width; ++x) {
+                    RgbLinear rgb{.r = row_floats[x * 4 + 0],
+                                  .g = row_floats[x * 4 + 1],
+                                  .b = row_floats[x * 4 + 2]};
+                    auto* p = rgba.data() + (y * frame.width + x) * 4;
                     if (frame.pq) {
                         // 输入本身就是 PQ 码值，直接量化，避免 nits→PQ 的恒等往返。
                         const auto quantize = [](float value) {
@@ -895,14 +904,12 @@ namespace gamesnap {
             return write_bytes(path, output.bytes.data(), output.bytes.size(), error);
         }
 
-        heif_encoder* make_heif_encoder(heif_context* ctx, std::string& error) {
-            heif_encoder* encoder = nullptr;
-            const heif_error result = heif_context_get_encoder_for_format(ctx, heif_compression_HEVC, &encoder);
-            if (result.code != heif_error_Ok || encoder == nullptr) {
-                error = fmt::format("HEVC 编码器不可用: {}", result.message ? result.message : "unknown");
-                return nullptr;
-            }
-            // libheif 的这些 setter 失败不影响编码能否继续，但会让配置悄悄不生效，所以记录一次。
+        // SDR 与 HDR 两条 HEIC 路径共用：把 heic_* 配置应用到编码器。
+        // libheif 的这些 setter 失败不影响编码能否继续，但会让配置悄悄不生效（比如 preset 拼错），
+        // 所以统一记录日志，避免"配了 slower 却没变小"这种无迹可查的情况。
+        void apply_heic_encoder_options(heif_encoder* encoder) {
+            if (encoder == nullptr)
+                return;
             const auto check = [](heif_error const& result, char const* what) {
                 if (result.code != heif_error_Ok)
                     SPDLOG_WARN("HEIC 设置 {} 失败: {}", what, result.message ? result.message : "unknown");
@@ -913,6 +920,16 @@ namespace gamesnap {
                   "preset");
             if (codec_options.heic_lossless)
                 check(heif_encoder_set_lossless(encoder, 1), "lossless");
+        }
+
+        heif_encoder* make_heif_encoder(heif_context* ctx, std::string& error) {
+            heif_encoder* encoder = nullptr;
+            const heif_error result = heif_context_get_encoder_for_format(ctx, heif_compression_HEVC, &encoder);
+            if (result.code != heif_error_Ok || encoder == nullptr) {
+                error = fmt::format("HEVC 编码器不可用: {}", result.message ? result.message : "unknown");
+                return nullptr;
+            }
+            apply_heic_encoder_options(encoder);
             return encoder;
         }
 
@@ -980,11 +997,11 @@ namespace gamesnap {
                 error = "heif_image_get_plane2 失败";
                 return false;
             }
-            for (std::uint32_t y = 0; y < image.height; ++y) {
-                auto const* src = image.pixels.data() + static_cast<std::size_t>(y) * image.stride;
-                bgra_to_rgb_planes_row(src, plane_r + static_cast<std::size_t>(y) * stride_r,
-                                       plane_g + static_cast<std::size_t>(y) * stride_g,
-                                       plane_b + static_cast<std::size_t>(y) * stride_b, image.width);
+            for (std::size_t y = 0; y < image.height; ++y) {
+                auto const* src = image.pixels.data() + y * image.stride;
+                bgra_to_rgb_planes_row(src, plane_r + y * stride_r,
+                                       plane_g + y * stride_g,
+                                       plane_b + y * stride_b, image.width);
             }
 
             heif_color_profile_nclx* nclx = heif_nclx_color_profile_alloc();
@@ -1051,12 +1068,12 @@ namespace gamesnap {
             }
             if (bit_depth > 8) {
                 auto const* src = static_cast<std::uint16_t const*>(pixels);
-                for (std::uint32_t y = 0; y < height; ++y) {
-                    auto* r = reinterpret_cast<std::uint16_t*>(plane_r + static_cast<std::size_t>(y) * stride_r);
-                    auto* g = reinterpret_cast<std::uint16_t*>(plane_g + static_cast<std::size_t>(y) * stride_g);
-                    auto* b = reinterpret_cast<std::uint16_t*>(plane_b + static_cast<std::size_t>(y) * stride_b);
-                    for (std::uint32_t x = 0; x < width; ++x) {
-                        const auto* p = src + (static_cast<std::size_t>(y) * width + x) * 4;
+                for (std::size_t y = 0; y < height; ++y) {
+                    auto* r = reinterpret_cast<std::uint16_t*>(plane_r + y * stride_r);
+                    auto* g = reinterpret_cast<std::uint16_t*>(plane_g + y * stride_g);
+                    auto* b = reinterpret_cast<std::uint16_t*>(plane_b + y * stride_b);
+                    for (std::size_t x = 0; x < width; ++x) {
+                        const auto* p = src + (y * width + x) * 4;
                         r[x] = p[0];
                         g[x] = p[1];
                         b[x] = p[2];
@@ -1064,11 +1081,11 @@ namespace gamesnap {
                 }
             } else {
                 auto const* src = static_cast<std::uint8_t const*>(pixels);
-                for (std::uint32_t y = 0; y < height; ++y) {
-                    rgba_to_rgb_planes_row(src + static_cast<std::size_t>(y) * width * 4,
-                                           plane_r + static_cast<std::size_t>(y) * stride_r,
-                                           plane_g + static_cast<std::size_t>(y) * stride_g,
-                                           plane_b + static_cast<std::size_t>(y) * stride_b, width);
+                for (std::size_t y = 0; y < height; ++y) {
+                    rgba_to_rgb_planes_row(src + y * width * 4,
+                                           plane_r + y * stride_r,
+                                           plane_g + y * stride_g,
+                                           plane_b + y * stride_b, width);
                 }
             }
 
@@ -1090,11 +1107,8 @@ namespace gamesnap {
                                     got_encoder.message ? got_encoder.message : "unknown");
                 return false;
             }
-            heif_encoder_set_lossy_quality(encoder, codec_options.heic_quality);
-            heif_encoder_set_parameter_string(encoder, "chroma", "444");
-            heif_encoder_set_parameter_string(encoder, "preset", std::string(codec_options.heic_preset).c_str());
-            if (codec_options.heic_lossless)
-                heif_encoder_set_lossless(encoder, 1);
+            // 与 SDR 路径共用参数应用逻辑（含失败日志），避免 HDR 这边静默丢配置。
+            apply_heic_encoder_options(encoder);
 
             const bool ok = write_heic_impl(path, ctx, img, encoder, metadata, error);
             free_heif(ctx, img, encoder);
@@ -1353,8 +1367,10 @@ namespace gamesnap {
         const std::size_t count = static_cast<std::size_t>(width) * height * 4;
         ByteBuffer rgba8;
         rgba8.resize(count);
-        for (std::size_t i = 0; i < count; ++i)
-            rgba8[i] = static_cast<std::uint8_t>(rgba10[i] >> 2);
+        for (std::size_t i = 0; i < count; ++i) {
+            // 10-bit → 8-bit 按比例四舍五入（1023→255）；直接 >>2 会整体偏暗半级。
+            rgba8[i] = static_cast<std::uint8_t>((static_cast<std::uint32_t>(rgba10[i]) * 255U + 511U) / 1023U);
+        }
         return heif_encode_rgba(path, rgba8.data(), width, height, 8,
                                 heif_compression_HEVC, true, metadata, error);
     }
@@ -1381,7 +1397,7 @@ namespace gamesnap {
         case ImageFormat::Webp:
             return write_webp_impl(path, image, error);
         case ImageFormat::Avif:
-            return avif_from_bgra(path, image, false, error);
+            return avif_from_bgra(path, image, error);
         case ImageFormat::Heic:
             return heic_from_bgra(path, image, error);
         case ImageFormat::Jxl: {

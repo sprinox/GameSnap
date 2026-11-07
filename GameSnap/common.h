@@ -31,6 +31,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>

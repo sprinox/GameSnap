@@ -27,7 +27,8 @@
    `D3DContext::context_mutex()` 串行化。
 
 3. **跨线程对象一律用 `shared_ptr` 保活。**
-   `EncodeJob` 持有 `TextureSlot`、`D3DContext` 和 `UiBridge`；capture 和编码线程之间不传裸指针。
+   `EncodeJob` 持有 `winrt::com_ptr<ID3D11Texture2D>`（纹理独占，job 只可移动）和
+   `shared_ptr<D3DContext>`；`UiBridge` 由 `EncodeWorkers` 持有。capture 和编码线程之间不传裸指针。
 
 4. **队列无界，积压不丢。**
    `CommandQueue` / `EncodeQueue` 都是 `moodycamel::BlockingConcurrentQueue`。
@@ -78,17 +79,18 @@ COM apartment：main、capture、input、system-events、overlay 各自在线程
 - SDR：`D3D11_USAGE_STAGING` + `CPU_ACCESS_READ`，4B/像素；
 - HDR：`DEFAULT` + `D3D11_BIND_SHADER_RESOURCE`，FP16，8B/像素。
 
-纹理包装在 `TextureSlot` 里，由 `EncodeJob` 持有：
+纹理直接在 `EncodeJob` 里按值持有（独占、不可拷贝）：
 
 ```cpp
-struct TextureSlot {
-    std::shared_ptr<ID3D11Texture2D> texture;
-    bool hdr = false;
+struct EncodeJob {
+    winrt::com_ptr<ID3D11Texture2D> texture;   // 只能移动
+    std::shared_ptr<D3DContext> d3d;
+    ...
 };
 ```
 
-没有 `busy` 标记、没有 `texture_cache_`、没有 capture 侧主纹理。
-`TextureSlot` 的最后一个 `shared_ptr` 在编码 job 结束时释放纹理。
+没有 `TextureSlot` 包装、没有 `busy` 标记、没有 `texture_cache_`、也没有 capture 侧主纹理。
+`com_ptr` 在 job 析构（或队列消费完）时释放纹理。
 
 ### 2.3 编码 job 的缓冲
 
@@ -165,7 +167,7 @@ LUT 的 `current` 由 `ToneLutCache::mutex` 保护；`empty` 是快速路径原�
 1. capture 线程 `arm(shot)`，`StartCapture()`。
 2. WGC 回调：
    - 从 pool 取 frame；
-   - 新建 `TextureSlot` 和纹理；
+   - 新建目标纹理（`com_ptr`，在捕获回调内独占）；
    - 在 `context_mutex` 内 `CopyResource`，随后 `signal_fence_locked()`；
    - 填 `EncodeJob`，入队；
    - 入队后 `shot.done.release()`。
@@ -228,7 +230,7 @@ LUT 的 `current` 由 `ToneLutCache::mutex` 保护；`empty` 是快速路径原�
 
 - [ ] `CaptureResources` 是否只在 capture 线程访问？
 - [ ] `close()` 与单张收尾是否都走 `quiesce()`，且在 `Close()` 之前等到回调退出？
-- [ ] 每张截图是否新建 `TextureSlot`，job 是否持有到编码结束？
+- [ ] 每张截图是否新建纹理，job 是否用 `com_ptr` 独占持有到编码结束？
 - [ ] 编码线程是否不再使用 `thread_local` 大缓冲，大缓冲是否都是 `UninitBuffer`（不整帧清零）？
 - [ ] `ToneMapper` 是否仍然每个 HDR job 现建现用、不跨 job 复用（闲置显存）？
 - [ ] 16KB LUT 是否 HDR 缓存、SDR 释放，且空表时 atomic 快路径不拿锁？

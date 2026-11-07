@@ -146,7 +146,7 @@ namespace gamesnap {
 
     ToneMapper::~ToneMapper() = default;
 
-    // 1 个 uint 的峰值缓冲：UAV 写入、SRV 读取，全程留在 GPU 上。
+    // 峰值缓冲：UAV 写入、SRV 读取，全程留在 GPU 上。[0] 是峰值，[1..7] 是曲线参数。
     bool ToneMapper::ensure_peak_buffer() {
         if (peak_buffer_)
             return true;
@@ -339,7 +339,8 @@ namespace gamesnap {
                 ID3D11UnorderedAccessView* no_uav = nullptr;
                 context->CSSetUnorderedAccessViews(kPeakUavSlot, 1, &no_uav, nullptr);
 
-                // 2) 色调映射：tone map 从 t1 读回本帧峰值，不回读 CPU。
+                // 2) 色调映射：t1 提供本帧峰值；spline 曲线参数由 shader 在每个
+                //    8x8 线程组里算一次（groupshared），不再逐像素重算支点/斜率。
                 context->CSSetShader(shader_.get(), nullptr, 0);
                 ID3D11ShaderResourceView* srv = input_view.get();
                 context->CSSetShaderResources(0, 1, &srv);
@@ -353,9 +354,9 @@ namespace gamesnap {
             }
 
             std::array<ID3D11ShaderResourceView*, 2> null_srvs{};
-            std::array<ID3D11UnorderedAccessView*, 2> null_uavs{};
-            context->CSSetShaderResources(0, 2, null_srvs.data());
-            context->CSSetUnorderedAccessViews(0, 2, null_uavs.data(), nullptr);
+            std::array<ID3D11UnorderedAccessView*, 3> null_uavs{};
+            context->CSSetShaderResources(0, static_cast<UINT>(null_srvs.size()), null_srvs.data());
+            context->CSSetUnorderedAccessViews(0, static_cast<UINT>(null_uavs.size()), null_uavs.data(), nullptr);
             context->CopyResource(readback_.get(), output_.get());
             context->CopyResource(hdr_readback_.get(), hdr_output_.get());
             const HRESULT signaled = context4_->Signal(fence_.get(), ++fence_value_);

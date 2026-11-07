@@ -7,11 +7,11 @@
 
 namespace gamesnap {
 
-    // 每个编码线程在进入编码前设置；底层编码器只读取本线程的选项。
+    // 进程级共享的编码选项：在编码线程启动前设置一次，之后只读（线程安全）。
+    // 不是"每个线程各一份"，改之前请先看 codecs.cpp 里的 codec_options 定义。
     void set_codec_options(CodecOptions const& options);
 
     // 所有编码函数都走内存缓冲（大图写盘也集中一次），失败时 error 带原因。
-
 
     // GPU 已经算好的 10-bit PQ / BT.2020 RGBA（每通道 0..1023），直接封装。
     bool encode_avif_hdr10(std::filesystem::path const& path, std::uint16_t const* rgba10,

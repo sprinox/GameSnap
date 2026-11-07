@@ -19,7 +19,8 @@ namespace gamesnap {
     class D3DContext {
     public:
         // 优先在目标显示器所属的适配器上创建（多显卡笔记本上很重要）。
-        static std::shared_ptr<D3DContext> create(HMONITOR monitor, std::string* error);
+        // adapter_hint 非空时直接用它，省掉一次 DXGI 枚举（select_monitor 已经找过了）。
+        static std::shared_ptr<D3DContext> create(HMONITOR monitor, IDXGIAdapter1* adapter_hint, std::string* error);
 
         [[nodiscard]] ID3D11Device* device() const noexcept { return device_.get(); }
         [[nodiscard]] ID3D11DeviceContext* context() const noexcept { return context_.get(); }

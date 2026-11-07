@@ -5,20 +5,20 @@
 // Release 不编自检（见 selftest.h 的 GAMESNAP_SELFTEST）。
 #if GAMESNAP_SELFTEST
 
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <filesystem>
-#include <vector>
+#    include <algorithm>
+#    include <cmath>
+#    include <cstdint>
+#    include <cstdio>
+#    include <cstring>
+#    include <filesystem>
+#    include <vector>
 
-#include <spng.h>
+#    include <spng.h>
 
-#include "d3d.h"
-#include "display.h"
-#include "encoder.h"
-#include "messages.h"
+#    include "d3d.h"
+#    include "display.h"
+#    include "encoder.h"
+#    include "messages.h"
 
 namespace gamesnap {
     namespace {
@@ -272,6 +272,7 @@ namespace gamesnap {
             job.timings.copied = job.timings.input;
 
             const bool hdr_job = job.hdr;
+            const ImageFormat sdr_format = job.sdr_format;  // move 之后 job 的成员值不再可信
             if (!jobs->enqueue(std::move(job))) {
                 SPDLOG_ERROR("自检失败: 编码队列入队失败");
                 return false;
@@ -319,7 +320,7 @@ namespace gamesnap {
             // 像素级校验：光看"文件存在且非空"抓不到色调映射绑错槽位这类问题
             // （曲线退化成硬裁剪时文件照样正常）。HDR 用例的 SDR 伴生文件固定是 PNG（见上），
             // 所以这里的条件与格式无关，默认配置也会执行。
-            if (hdr_job && job.sdr_format == ImageFormat::Png) {
+            if (hdr_job && sdr_format == ImageFormat::Png) {
                 for (const auto& path : produced) {
                     if (path.filename().wstring().find(L"_SDR.") == std::wstring::npos)
                         continue;
@@ -357,7 +358,7 @@ namespace gamesnap {
         }
 
         std::string error;
-        auto d3d = D3DContext::create(display.monitor, &error);
+        auto d3d = D3DContext::create(display.monitor, display.dxgi.adapter.get(), &error);
         if (!d3d) {
             SPDLOG_ERROR("自检失败: 无法创建 D3D 设备: {}", error);
             return false;

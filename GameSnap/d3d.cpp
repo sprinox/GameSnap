@@ -21,7 +21,8 @@ namespace gamesnap {
 
     }  // namespace
 
-    std::shared_ptr<D3DContext> D3DContext::create(HMONITOR monitor, std::string* error) {  // error cannot be nullptr
+    std::shared_ptr<D3DContext> D3DContext::create(HMONITOR monitor, IDXGIAdapter1* adapter_hint,
+                                                   std::string* error) {  // error cannot be nullptr
         auto fail = [error](std::string message) -> std::shared_ptr<D3DContext> {
             *error = std::move(message);
             return nullptr;
@@ -35,7 +36,10 @@ namespace gamesnap {
                 return fail(hresult_text("CreateDXGIFactory1", factory_hr));
 
             // 目标显示器所在的适配器。WGC 的帧来自这个适配器，用同一张卡最省事。
-            if (const auto output = find_dxgi_output(monitor); output.adapter)
+            // 调用方已经枚举过时直接用，省掉一次 CreateDXGIFactory + EnumAdapters/EnumOutputs。
+            if (adapter_hint != nullptr)
+                context->adapter_.copy_from(adapter_hint);
+            else if (const auto output = find_dxgi_output(monitor); output.adapter)
                 context->adapter_ = output.adapter;
 
             D3D_FEATURE_LEVEL feature_level = D3D_FEATURE_LEVEL_11_0;
@@ -161,11 +165,14 @@ namespace gamesnap {
         }
         const DWORD waited = ::WaitForSingleObject(event, static_cast<DWORD>(timeout.count()));
         const DWORD wait_error = ::GetLastError();
-        ::CloseHandle(event);
         if (waited == WAIT_TIMEOUT) {
+            // 超时时不能 CloseHandle：fence 仍然注册在这个事件上，之后 GPU 一完成就会
+            // 对同一个句柄值再 Signal 一次（句柄被复用就是给别人的对象发信号）。
+            // 这条路径说明设备已经挂起，进程马上要放弃这个 job，故意漏一个句柄比踩悬垂句柄安全。
             error = fmt::format("等待 GPU fence 超时（{}ms）", timeout.count());
             return false;
         }
+        ::CloseHandle(event);
         if (waited != WAIT_OBJECT_0) {
             error = fmt::format("等待 GPU fence 失败: Win32 {}", wait_error);
             return false;

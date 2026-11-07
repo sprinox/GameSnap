@@ -16,7 +16,7 @@ namespace gamesnap {
     class D3DContext;
 
     enum class ReloadReason : std::uint8_t {
-        Startup,  // 首次创建
+        Startup,         // 首次创建
         DisplayChange,   // 分辨率 / 显示器拓扑 / HDR 切换
         DeviceChange,    // 显卡插拔、驱动重启导致 DXGI 工厂失效
         DeviceRemoved,   // GetDeviceRemovedReason 失败（TDR 等）
@@ -55,7 +55,7 @@ namespace gamesnap {
 
         bool stop = false;  // 编码线程的停止哨兵
         winrt::com_ptr<ID3D11Texture2D> texture;
-        std::shared_ptr<D3DContext> d3d;             // 保活设备 + 提供 context 锁
+        std::shared_ptr<D3DContext> d3d;              // 保活设备 + 提供 context 锁
         std::shared_ptr<std::atomic<bool>> canceled;  // 超时取消标记
         bool hdr = false;
         ImageFormat hdr_format = ImageFormat::Avif;

@@ -11,7 +11,8 @@ namespace gamesnap {
     namespace {
 
         constexpr int kFramePoolBuffers = 1;
-        constexpr auto kFrameWait = std::chrono::milliseconds(500);
+        // 500 ms 在 4K HDR + 繁忙 GPU 上偏紧（首帧偶尔要 600~700 ms），放宽到 1 s。
+        constexpr auto kFrameWait = std::chrono::milliseconds(1000);
         constexpr auto kCallbackWait = std::chrono::seconds(2);
 
         winrt::GraphicsCaptureItem create_item_for_monitor(HMONITOR monitor) {
@@ -159,11 +160,13 @@ namespace gamesnap {
             if (shot.canceled->load(std::memory_order_acquire))
                 return;
 
-            SPDLOG_DEBUG("[#{:04}] 采集 {}x{}: 命令排队 {:.2f}ms，StartCapture→首帧 {:.2f}ms，GPU 拷贝 {:.2f}ms",
-                         shot.sequence, desc.Width, desc.Height,
-                         duration_ms(shot.timings.start_capture - shot.timings.input),
-                         duration_ms(received - shot.timings.start_capture),
-                         duration_ms(copied - received));
+            if (spdlog::should_log(spdlog::level::debug)) {
+                SPDLOG_DEBUG("[#{:04}] 采集 {}x{}: 命令排队 {:.2f}ms，StartCapture→首帧 {:.2f}ms，GPU 拷贝 {:.2f}ms",
+                             shot.sequence, desc.Width, desc.Height,
+                             duration_ms(shot.timings.start_capture - shot.timings.input),
+                             duration_ms(received - shot.timings.start_capture),
+                             duration_ms(copied - received));
+            }
 
             EncodeJob job;
             job.texture = std::move(target);
@@ -447,7 +450,6 @@ namespace gamesnap {
         // 否则 dismiss() 会把 count_down 一起取消，主线程永远卡在 ready_.wait() 上。
         auto ready_guard = ScopeExit{[&] { ready_.count_down(); }};
 
-
         // COM apartment 必须覆盖整个 run()：之后还会创建 pool/会话并关闭 WinRT 对象。
         ComApartment apartment;
         if (!apartment.ok())
@@ -580,7 +582,7 @@ namespace gamesnap {
         // CreateForMonitor 都可能因为驱动/HDR 全屏而长时间不返回。
         SPDLOG_INFO("重建捕获资源: 创建 D3D 设备…");
         std::string error;
-        auto d3d = D3DContext::create(display.monitor, &error);
+        auto d3d = D3DContext::create(display.monitor, display.dxgi.adapter.get(), &error);
         if (!d3d) {
             SPDLOG_ERROR("创建 D3D 设备失败: {}", error);
             return false;
@@ -663,8 +665,11 @@ namespace gamesnap {
         sink->arm(shot);
         try {
             resources_->start_capture();
-            SPDLOG_DEBUG("[#{:04}] StartCapture 调用 {:.2f}ms", shot->sequence,
-                         duration_ms(SteadyClock::now() - shot->timings.start_capture));
+            // duration_ms 里两次调 SteadyClock::now()，debug 没开时不必付这个代价。
+            if (spdlog::should_log(spdlog::level::debug)) {
+                SPDLOG_DEBUG("[#{:04}] StartCapture 调用 {:.2f}ms", shot->sequence,
+                             duration_ms(SteadyClock::now() - shot->timings.start_capture));
+            }
         } catch (winrt::hresult_error const& e) {
             SPDLOG_ERROR("StartCapture 失败: {}", describe_hresult(e.code()));
             resources_->close();

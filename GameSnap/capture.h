@@ -34,10 +34,10 @@ namespace gamesnap {
         std::shared_ptr<D3DContext> d3d;
         std::shared_ptr<EncodeQueue> jobs;
         std::shared_ptr<UiBridge> ui;
-        std::binary_semaphore done{0};                    // 回调处理完（或失败）后 release
-        std::shared_ptr<std::atomic<bool>> canceled;      // 超时取消标记，和 EncodeJob 共享
-        std::atomic<bool> failed{false};                  // CopyResource / 设备移除失败
-        ShotTimings timings;                              // 各阶段时刻，随 EncodeJob 一起传递
+        std::binary_semaphore done{0};                // 回调处理完（或失败）后 release
+        std::shared_ptr<std::atomic<bool>> canceled;  // 超时取消标记，和 EncodeJob 共享
+        std::atomic<bool> failed{false};              // CopyResource / 设备移除失败
+        ShotTimings timings;                          // 各阶段时刻，随 EncodeJob 一起传递
         std::uint64_t sequence = 0;
         std::wstring title;
         DXGI_COLOR_SPACE_TYPE color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
@@ -157,7 +157,7 @@ namespace gamesnap {
         std::uint64_t sequence_ = 0;
         std::atomic<bool> fatal_error_{false};
         std::atomic<bool> no_display_{false};  // 启动时/运行中一个显示器都没有
-        std::latch ready_{1};  // 一次性门闩：1 表示还没初始化完
+        std::latch ready_{1};                  // 一次性门闩：1 表示还没初始化完
     };
 
 }  // namespace gamesnap

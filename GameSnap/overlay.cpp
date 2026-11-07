@@ -345,14 +345,41 @@ namespace gamesnap {
             ImVector<ImWchar> ranges;
             builder.BuildRanges(&ranges);
 
-            const std::filesystem::path font_path = L"C:\\Windows\\Fonts\\msyh.ttc";
+            // 字体路径不能写死 C: —— 系统盘可能不是 C:，非中文版 Windows 也未必有微软雅黑。
+            // 按"有 CJK 字形优先"的顺序找；Segoe UI 只作为最后的中文缺字兜底，必须打 warning。
+            std::filesystem::path font_path;
+            bool cjk_capable = false;
+            std::array<wchar_t, MAX_PATH> windows_dir{};
+            if (::GetWindowsDirectoryW(windows_dir.data(), MAX_PATH) > 0) {
+                const std::filesystem::path fonts_dir = std::filesystem::path(windows_dir.data()) / L"Fonts";
+                for (const wchar_t* name : {L"msyh.ttc", L"msyhbd.ttc", L"simhei.ttf", L"simsun.ttc", L"segoeui.ttf"}) {
+                    const std::filesystem::path candidate = fonts_dir / name;
+                    std::error_code ec;
+                    if (std::filesystem::exists(candidate, ec)) {
+                        font_path = candidate;
+                        cjk_capable = candidate.filename() != L"segoeui.ttf";
+                        break;
+                    }
+                }
+            }
+
             ImFont* result = nullptr;
-            if (std::filesystem::exists(font_path)) {
+            if (!font_path.empty()) {
                 result = io.Fonts->AddFontFromFileTTF(font_path.string().c_str(), 18.0F * scale, nullptr,
                                                       ranges.Data);
+                if (result != nullptr) {
+                    SPDLOG_INFO("overlay 字体: {}", wstring_to_utf8(font_path.wstring()));
+                    if (!cjk_capable) {
+                        SPDLOG_WARN("{} 不含中文字形，overlay 的中文文案会显示为方框"
+                                    "（装一次微软雅黑/黑体/宋体即可）",
+                                    wstring_to_utf8(font_path.filename().wstring()));
+                    }
+                }
             }
-            if (result == nullptr)
+            if (result == nullptr) {
+                SPDLOG_WARN("加载字体失败（试过 微软雅黑/黑体/宋体/Segoe UI），overlay 中文可能显示为方框");
                 result = io.Fonts->AddFontDefaultVector();
+            }
             remember_glyphs(covered, filename, ranges);
             return result;
         }
@@ -378,8 +405,7 @@ namespace gamesnap {
     };
 
     OverlayThread::OverlayThread(std::shared_ptr<UiBridge> bridge, MonitorChoice monitor)
-        : bridge_(std::move(bridge)), monitor_(monitor),
-          stop_event_(::CreateEventW(nullptr, TRUE, FALSE, nullptr)) {}
+        : bridge_(std::move(bridge)), monitor_(monitor), stop_event_(::CreateEventW(nullptr, TRUE, FALSE, nullptr)) {}
 
     OverlayThread::~OverlayThread() {
         try {
@@ -448,8 +474,10 @@ namespace gamesnap {
                                            ::GetSystemMetrics(SM_CYSCREEN)};
             }
 
+            // DirectComposition 负责合成：只需要 NOREDIRECTIONBITMAP，不要再叠 WS_EX_LAYERED
+            // + LWA_ALPHA(255)，两者混用在部分 Windows 版本上会影响合成/透明度行为。
             const HWND hwnd = ::CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+                WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
                     WS_EX_NOREDIRECTIONBITMAP,
                 kOverlayClass, L"GameSnap Overlay", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, instance, nullptr);
             if (hwnd == nullptr) {
@@ -467,7 +495,6 @@ namespace gamesnap {
             // 先把 1x1 窗口放到目标显示器再取 DPI，避免沿用主显示器/旧窗口的 DPI。
             ::SetWindowPos(hwnd, HWND_TOPMOST, monitor_info.rcWork.right - 1, monitor_info.rcWork.bottom - 1, 1, 1,
                            SWP_NOACTIVATE);
-            ::SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
         }
 
         const float scale = dpi_scale(state_->hwnd);
@@ -734,11 +761,9 @@ namespace gamesnap {
             ImGui::NewFrame();
 
             ImDrawList* background = ImGui::GetBackgroundDrawList();
-            background->AddRectFilled(ImVec2(0, 0), ImVec2(static_cast<float>(panel_width),
-                                                        static_cast<float>(panel_height)),
+            background->AddRectFilled(ImVec2(0, 0), ImVec2(static_cast<float>(panel_width), static_cast<float>(panel_height)),
                                       IM_COL32(18, 20, 26, 205), 14.0F * scale);
-            background->AddRect(ImVec2(1, 1), ImVec2(static_cast<float>(panel_width) - 1,
-                                                       static_cast<float>(panel_height) - 1),
+            background->AddRect(ImVec2(1, 1), ImVec2(static_cast<float>(panel_width) - 1, static_cast<float>(panel_height) - 1),
                                 IM_COL32(255, 255, 255, 32), 14.0F * scale, 0, 1.0F);
 
             const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |

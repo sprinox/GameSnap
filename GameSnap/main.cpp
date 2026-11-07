@@ -1,8 +1,11 @@
 #include "pch.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <cwchar>
 #include <exception>
 #include <process.h>
+#include <span>
 
 #include "capture.h"
 #include "overlay.h"
@@ -58,7 +61,6 @@ namespace {
     }
 
     int run(gamesnap::Config const& config) {
-
         gamesnap::ComApartment apartment;
         if (!apartment.ok()) {
             SPDLOG_CRITICAL("初始化 COM apartment 失败: {}", gamesnap::describe_hresult(apartment.result()));

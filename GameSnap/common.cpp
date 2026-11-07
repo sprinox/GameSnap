@@ -655,14 +655,12 @@ namespace gamesnap {
     }
 
     std::filesystem::path default_output_dir() {
-        PWSTR pictures = nullptr;
+        // 用 SHGetFolderPathW 而不是 SHGetKnownFolderPath：这个函数在解析命令行时就会调用，
+        // 那时 COM 还没初始化（ComApartment 在 run() 里），后者会直接失败回退到当前目录。
+        std::array<wchar_t, MAX_PATH> pictures{};
         std::filesystem::path base;
-        const HRESULT pictures_hr =
-            ::SHGetKnownFolderPath(FOLDERID_Pictures, KF_FLAG_DEFAULT, nullptr, &pictures);
-        if (SUCCEEDED(pictures_hr) && pictures != nullptr)
-            base = pictures;
-        if (pictures != nullptr)
-            ::CoTaskMemFree(pictures);
+        if (SUCCEEDED(::SHGetFolderPathW(nullptr, CSIDL_MYPICTURES, nullptr, SHGFP_TYPE_CURRENT, pictures.data())))
+            base = pictures.data();
         if (base.empty()) {
             std::error_code ec;
             base = std::filesystem::current_path(ec);
@@ -812,9 +810,9 @@ namespace gamesnap {
 
     void log_config(Config const& config) {
         SPDLOG_INFO("输出目录: {}", wstring_to_utf8(config.output_dir.wstring()));
-        const std::string_view backend = config.tone_map_backend == ToneMapBackend::Cpu ? "cpu"
-                                       : config.tone_map_backend == ToneMapBackend::Gpu ? "gpu"
-                                                                                       : "auto";
+        const std::string_view backend = config.tone_map_backend == ToneMapBackend::Cpu   ? "cpu"
+                                         : config.tone_map_backend == ToneMapBackend::Gpu ? "gpu"
+                                                                                          : "auto";
         SPDLOG_INFO("输出格式: HDR={} SDR={}，色调映射={}，计算后端={}",
                     to_string(config.hdr_format), to_string(config.sdr_format), to_string(config.tone_map),
                     backend);
@@ -826,12 +824,13 @@ namespace gamesnap {
         SPDLOG_INFO("编码参数: PNG compression={} JPEG quality={} WebP quality={} lossless={} method={}",
                     config.codec.png_compression, config.codec.jpeg_quality,
                     config.codec.webp_quality, config.codec.webp_lossless, config.codec.webp_method);
-        SPDLOG_INFO("编码参数: AVIF quality={} lossless={} speed={} 编码库={} aom_cpu_used={} svt_preset={}；"
-                    "HEIC quality={} lossless={} preset={}；色度采样={}",
-                    config.codec.avif_quality, config.codec.avif_lossless, config.codec.avif_speed,
-                    to_string(config.codec.av1_encoder), config.codec.aom_cpu_used, config.codec.svt_preset,
-                    config.codec.heic_quality, config.codec.heic_lossless, config.codec.heic_preset,
-                    to_string(config.codec.chroma));
+        SPDLOG_INFO(
+            "编码参数: AVIF quality={} lossless={} speed={} 编码库={} aom_cpu_used={} svt_preset={}；"
+            "HEIC quality={} lossless={} preset={}；色度采样={}",
+            config.codec.avif_quality, config.codec.avif_lossless, config.codec.avif_speed,
+            to_string(config.codec.av1_encoder), config.codec.aom_cpu_used, config.codec.svt_preset,
+            config.codec.heic_quality, config.codec.heic_lossless, config.codec.heic_preset,
+            to_string(config.codec.chroma));
         SPDLOG_INFO("编码参数: JXL distance={:.2f} lossless={} effort={}",
                     config.codec.jxl_distance, config.codec.jxl_lossless, config.codec.jxl_effort);
         SPDLOG_INFO("采集模式: 按需(热键时 StartCapture)，HDR 由目标显示器决定");

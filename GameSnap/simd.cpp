@@ -6,23 +6,6 @@
 
 namespace gamesnap {
 
-    void bgra_to_rgba_row(std::uint8_t const* src, std::uint8_t* dst, std::size_t pixels) {
-        const __m256i shuffle = _mm256_setr_epi8(
-            2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15,
-            2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15);
-        std::size_t x = 0;
-        for (; x + 8 <= pixels; x += 8) {
-            const __m256i bgra = _mm256_loadu_si256(reinterpret_cast<__m256i const*>(src + x * 4));
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + x * 4), _mm256_shuffle_epi8(bgra, shuffle));
-        }
-        for (; x < pixels; ++x) {
-            dst[x * 4 + 0] = src[x * 4 + 2];
-            dst[x * 4 + 1] = src[x * 4 + 1];
-            dst[x * 4 + 2] = src[x * 4 + 0];
-            dst[x * 4 + 3] = src[x * 4 + 3];
-        }
-    }
-
     // F16C 半精度转换；辅助标量只用于尾部。
     namespace {
 
@@ -220,7 +203,7 @@ namespace gamesnap {
         // 注意 packus_epi32 在 256 位下按 128 位 lane 打包，顺序会错，所以要 permute4x64 重排；
         // 重排后每 16 位元素只有低字节有效，再用 shuffle_epi8 抽出 16 个字节拼成一次 16B 写。
         void rgba10_to_rgba8_avx2(std::uint16_t const* __restrict src, std::uint8_t* __restrict dst,
-                                 std::size_t count) {
+                                  std::size_t count) {
             const __m256i kMax = _mm256_set1_epi32(1023);
             const __m256 kInv = _mm256_set1_ps(1.0F / 1023.0F);
             // 每个 16 位元素取低字节（每 lane 8 个）。

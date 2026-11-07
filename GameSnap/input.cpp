@@ -87,9 +87,10 @@ namespace gamesnap {
         if (FAILED(gameinput_hr)) {
             // E_NOINTERFACE 表示机器上的 GameInput 运行时比 SDK 头旧（缺 v4 接口）：
             // 常见于未安装随包分发的 GameInputRedist.msi 的 Win10。
-            SPDLOG_WARN("GameInput 初始化失败，手柄 Share 键不可用（键盘热键不受影响）: {}；"
-                        "需要手柄热键时请安装随包分发的 GameInputRedist.msi 或更新 Windows",
-                        describe_hresult(gameinput_hr));
+            SPDLOG_WARN(
+                "GameInput 初始化失败，手柄 Share 键不可用（键盘热键不受影响）: {}；"
+                "需要手柄热键时请安装随包分发的 GameInputRedist.msi 或更新 Windows",
+                describe_hresult(gameinput_hr));
         } else {
             // 手柄用 GameInput 读数回调；回调在 GameInput 的派发线程上执行，context 传 this。
             const HRESULT register_hr = game_input_->RegisterReadingCallback(

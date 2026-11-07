@@ -148,7 +148,7 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 - HDR 的 PQ OETF 与 SDR 色调映射在同一个 D3D11 compute dispatch 完成：scRGB × 80 nits → BT.2020 nit → PQ（HDR）；
   同一 texel → BT.709 亮度 → Hermite shoulder（spline）→ sRGB（SDR）。`analysis` 是 false color
 调试算法：100 nit 以下灰阶，以上按 lilium 的 ReShade HDR analysis 配色
-（绿 → 黄 → 红 → 粉 → 蓝，档位 100/203/400/1000/4000/10000 nit）。
+（灰 → 蓝绿 → 绿 → 黄 → 红 → 粉 → 蓝，档位 100/203/400/1000/4000/10000 nit，100 nit 处是硬分界）。
 - 每个 HDR job 临时创建自己的 `ToneMapper`，map 完随 job 析构；GPU 用 `ID3D11Fence` + event 等待，
   等待期间不持 `context_mutex`，避免阻塞 capture 回调。不做跨 job 复用：它占 4 张全尺寸纹理
   （4K 下约 127 MiB），而这个工具绝大多数时间是闲置的，闲置常驻不划算。

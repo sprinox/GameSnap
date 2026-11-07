@@ -146,7 +146,7 @@ namespace gamesnap {
 
     ToneMapper::~ToneMapper() = default;
 
-    // 峰值缓冲：UAV 写入、SRV 读取，全程留在 GPU 上。[0] 是峰值，[1..7] 是曲线参数。
+    // 1 个 uint 的峰值缓冲：UAV 写入、SRV 读取，全程留在 GPU 上，不回读 CPU。
     bool ToneMapper::ensure_peak_buffer() {
         if (peak_buffer_)
             return true;

@@ -178,10 +178,12 @@ float3 tone_map_ipt(float3 rgb)
     return mul(kLmsToRgb709, lms2);
 }
 
-// analysis 的 false color：100 nit 以下灰阶，以上按nit 连续变色。
+// analysis 的 false color：100 nit 以下灰阶，以上按 nit 连续变色。
 // 分档和配色照抄 lilium 的 ReShade_HDR_shaders（lilium__include/hdr_and_sdr_analysis/
 // luminance.fxh 的 HeatmapRgbValues，10000 nit 档）：
-//   灰 → 绿 → 黄 → 红 → 粉 → 蓝，档位 100 / 203 / 400 / 1000 / 4000 / 10000 nit，档间线性插值。
+//   灰 → 蓝绿(青) → 绿 → 黄 → 红 → 粉 → 蓝，
+//   档位 100 / 203 / 400 / 1000 / 4000 / 10000 nit，档间线性插值；
+//   100 nit 处是硬跳变（灰 #898989 → 青 #00FFFF），没有过渡带。
 // 注意：输出目标是 UNORM，>10000 nit 的溢出标记（6.25 红）会被钳成纯红。
 float heatmap_fade_in(float y, float from, float to)
 {
@@ -218,8 +220,9 @@ float3 analysis_colormap(float nits)
 void main(uint3 tid : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 {
     // 曲线参数每个线程组只算一次（组内共享）。
-    // 注意：同步必须放在任何提前 return 之前，否则组内会有一部分线程跳过屏障。
-    if (gi == 0)
+    // analysis 分支根本不用曲线，而且那时 Peak 根本没绑（peak pass 被跳过了），
+    // 所以用 Algo 这个 uniform 做一致分支，整组一起跳过。
+    if (gi == 0 && Algo == 0)
         compute_spline_curve();
     GroupMemoryBarrierWithGroupSync();
 

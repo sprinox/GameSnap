@@ -39,6 +39,7 @@ YAML 先加载，命令行参数随后覆盖。仓库根的 [config.example.yaml
 | `av1_encoder` | 字符串 | `auto` | AVIF 用哪个 AV1 编码库：`auto`（libavif 自选）/ `aom` / `svt` |
 | `aom_cpu_used` | 整数 -1–8 | `-1` | aom 的 `-cpu-used`；-1 表示由 `avif_speed` 推导 |
 | `svt_preset` | 整数 -1–13 | `-1` | SVT-AV1 的 preset；-1 表示由 `avif_speed` 推导 |
+| `chroma_subsampling` | 字符串 | `auto` | YUV 色度采样：`auto`（= 444）/ `444` / `422` / `420`，对 AVIF、HEIC、JPEG 生效 |
 | `verbose` | 布尔 | `false` | 输出 debug 级别日志 |
 
 布尔值使用 yaml-cpp 的规则：`true/false`、`yes/no`、`on/off`、`y/n`（不区分大小写），不接受 `1/0`。

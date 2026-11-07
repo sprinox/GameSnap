@@ -54,6 +54,13 @@ av1_encoder: auto
 aom_cpu_used: -1   # 0..8，越高越快
 svt_preset: -1     # 0..13，越高越快
 
+# YUV 色度采样（AVIF / HEIC / JPEG 生效）：auto / 444 / 422 / 420
+# auto 与 444 相同（保留 UI 文字和细线）；420 文件更小但会糊掉彩色细节。
+# PNG / BMP / JXL / WebP 无损走 RGB，WebP 有损固定 4:2:0，均不受此项影响。
+# 无损模式（avif_lossless / heic_lossless）会强制 4:4:4，否则等于先丢色度再谈无损。
+# SVT-AV1 只接受 4:2:0，选它时本项被忽略。
+chroma_subsampling: auto
+
 # HDR→SDR 色调映射算法：spline（默认，Hermite shoulder）或 analysis（调试 false color）。
 tone_map: spline
 

@@ -60,9 +60,9 @@ namespace gamesnap {
                                clock.minutes().count(), clock.seconds().count());
         }
 
-        std::filesystem::path make_output_path(std::filesystem::path const& dir, Clock::time_point time,
-                                               std::wstring title, std::uint64_t sequence,
-                                               std::wstring_view extension, std::wstring_view suffix) {
+        // 输出文件的基本名：<标题>_<时间戳>_<序号>，不含 _HDR/_SDR 与扩展名。
+        // 面板在编码开始前就先显示这个名字，写盘成功后再补上后缀和扩展名。
+        std::wstring make_base_name(std::wstring const& title, Clock::time_point time, std::uint64_t sequence) {
             // fmt 没有 zoned_time 的 formatter，用 C++20 chrono 拆出本地日期/时间再格式化。
             const auto local = std::chrono::zoned_time(std::chrono::current_zone(), time).get_local_time();
             const auto days = std::chrono::floor<std::chrono::days>(local);
@@ -75,7 +75,13 @@ namespace gamesnap {
                 static_cast<int>(date.year()), static_cast<unsigned>(date.month()), static_cast<unsigned>(date.day()),
                 clock.hours().count(), clock.minutes().count(), clock.seconds().count(),
                 millis, static_cast<unsigned>(sequence % 10000U));
-            std::wstring name = sanitize_filename(std::move(title)) + L"_" + utf8_to_wstring(stamp);
+            return sanitize_filename(title) + L"_" + utf8_to_wstring(stamp);
+        }
+
+        std::filesystem::path make_output_path(std::filesystem::path const& dir, Clock::time_point time,
+                                               std::wstring title, std::uint64_t sequence,
+                                               std::wstring_view extension, std::wstring_view suffix) {
+            std::wstring name = make_base_name(title, time, sequence);
             if (!suffix.empty()) {
                 name += L"_";
                 name += suffix;
@@ -181,7 +187,7 @@ namespace gamesnap {
             D3D11_TEXTURE2D_DESC desc{};
             texture->GetDesc(&desc);
 
-            std::shared_ptr<ID3D11Texture2D> readback;
+            winrt::com_ptr<ID3D11Texture2D> readback;
             if (desc.Usage != D3D11_USAGE_STAGING) {
                 D3D11_TEXTURE2D_DESC read_desc = desc;
                 read_desc.Usage = D3D11_USAGE_STAGING;
@@ -358,20 +364,15 @@ namespace gamesnap {
 
     // ── staging 纹理 ─────────────────────────────────────────────────────────
 
-    // 只有一块主 staging 纹理；被编码线程占用时，截图线程用这个函数临时再建一块。
-    std::shared_ptr<ID3D11Texture2D> create_staging_texture(ID3D11Device* device, D3D11_TEXTURE2D_DESC const& desc) {
+    // 纹理都是“谁持有谁释放”，用 com_ptr 表达独占（不可拷贝，只能移动）。
+    winrt::com_ptr<ID3D11Texture2D> create_staging_texture(ID3D11Device* device, D3D11_TEXTURE2D_DESC const& desc) {
         if (device == nullptr)
-            return nullptr;
-
+            return {};
         winrt::com_ptr<ID3D11Texture2D> texture;
         if (FAILED(device->CreateTexture2D(&desc, nullptr, texture.put())))
-            return nullptr;
-
+            return {};
         // job 析构时立刻 Release，临时纹理不会留下。
-        return {texture.detach(), [](ID3D11Texture2D* raw) {
-                    if (raw != nullptr)
-                        raw->Release();
-                }};
+        return texture;
     }
 
     // ── EncodeWorkers ────────────────────────────────────────────────────────
@@ -413,8 +414,11 @@ namespace gamesnap {
         // 每个线程一个哨兵。注意 MPMC 队列只在同一生产者内保序，主线程投递的哨兵
         // 可能越过 capture 线程此前投递的任务；worker_main() 里由最后一个拿到哨兵
         // 的线程清空残留任务，保证退出时不丢图。
-        for (std::size_t i = 0; i < threads_.size(); ++i)
-            jobs_->enqueue(EncodeJob{.stop = true});
+        for (std::size_t i = 0; i < threads_.size(); ++i) {
+            EncodeJob sentinel;
+            sentinel.stop = true;
+            jobs_->enqueue(std::move(sentinel));
+        }
         for (auto& thread : threads_) {
             if (thread.joinable())
                 thread.join();
@@ -473,7 +477,7 @@ namespace gamesnap {
 
         if (job.canceled && job.canceled->load(std::memory_order_acquire))
             return;
-        if (!job.d3d || !job.texture_slot || !job.texture_slot->texture) {
+        if (!job.d3d || !job.texture) {
             SPDLOG_WARN("[#{:04}] 非法的编码任务", job.sequence);
             return;
         }
@@ -491,7 +495,13 @@ namespace gamesnap {
         }};
         std::string error;
         D3D11_TEXTURE2D_DESC texture_desc{};
-        job.texture_slot->texture->GetDesc(&texture_desc);
+        job.texture->GetDesc(&texture_desc);
+
+        // 一进编码就先把基本名推给面板（不含 _HDR/_SDR 与扩展名）：
+        // 文件名和时间戳在开拍时就定了，没必要等编码完。
+        const std::wstring base_name = make_base_name(job.title, job.local_time, job.sequence);
+        if (ui_)
+            ui_->publish(job.sequence, base_name, nullptr);
 
         // HDR 优先走 GPU：mapper 直接采样 DEFAULT+SRV 纹理，fence/event 等待 GPU 完成。
         // 只有它失败时才把 DEFAULT 纹理回读到 staging，再走 CPU 回退。
@@ -504,7 +514,7 @@ namespace gamesnap {
             if (!mapper->ok()) {
                 SPDLOG_WARN("tone mapper 初始化失败: {}", mapper->init_error());
             } else {
-                gpu_ok = mapper->map(job.texture_slot->texture.get(), job.color_space,
+                gpu_ok = mapper->map(job.texture.get(), job.color_space,
                                      job.sdr_white_nits, job.tone_map, sdr, hdr10, error);
                 if (!gpu_ok)
                     SPDLOG_WARN("[#{:04}] compute tone map 失败，回退 CPU: {}", job.sequence, error);
@@ -512,7 +522,7 @@ namespace gamesnap {
         }
 
         if (!gpu_ok) {
-            if (!map_to_cpu(*job.d3d, job.texture_slot->texture.get(), job.gpu_fence, raw, error)) {
+            if (!map_to_cpu(*job.d3d, job.texture.get(), job.gpu_fence, raw, error)) {
                 SPDLOG_ERROR("[#{:04}] 取像素失败: {}", job.sequence, error);
                 return;
             }
@@ -530,6 +540,16 @@ namespace gamesnap {
 
         if (job.hdr) {
             ImageFormat hdr_format = format_supports_hdr(job.hdr_format) ? job.hdr_format : ImageFormat::Avif;
+
+            // 先把 SDR 像素转出来并立刻发布缩略图：面板马上显示这一张，
+            // 不用等 HDR 那 1 秒多的编码（文件名等写盘成功后再补）。
+            if (!gpu_ok && !convert_pixels(raw, job.color_space, job.sdr_white_nits, sdr)) {
+                SPDLOG_ERROR("[#{:04}] 不支持的像素格式 {}", job.sequence, static_cast<int>(raw.format));
+                return;
+            }
+            if (ui_)
+                ui_->publish(job.sequence, base_name, &sdr);
+
             const auto hdr_path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
                                                    image_extension(hdr_format), L"HDR");
             bool hdr_ok = false;
@@ -553,10 +573,6 @@ namespace gamesnap {
                 written.push_back(hdr_path);
             }
 
-            if (!gpu_ok && !convert_pixels(raw, job.color_space, job.sdr_white_nits, sdr)) {
-                SPDLOG_ERROR("[#{:04}] 不支持的像素格式 {}", job.sequence, static_cast<int>(raw.format));
-                return;
-            }
             if (job.sdr_format == ImageFormat::Heic)
                 SPDLOG_WARN("[#{:04}] libheif 不支持 gain map，HEIC SDR 不包含 HDR 重建信息", job.sequence);
             const auto sdr_path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
@@ -570,14 +586,15 @@ namespace gamesnap {
             } else {
                 written.push_back(sdr_path);
             }
-            // 只在文件真正写成功之后更新面板，避免显示一个没写出来的文件名。
-            if (ui_ && !sdr.pixels.empty() && !written.empty())
-                ui_->publish(job.sequence, written.front().filename().wstring(), sdr);
         } else {
             if (!convert_pixels(raw, job.color_space, job.sdr_white_nits, sdr)) {
                 SPDLOG_ERROR("[#{:04}] 不支持的像素格式 {}", job.sequence, static_cast<int>(raw.format));
                 return;
             }
+            // 同上：写盘之前就先把缩略图推给面板。
+            if (ui_)
+                ui_->publish(job.sequence, base_name, &sdr);
+
             const auto path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
                                                image_extension(job.sdr_format), {});
             if (!write_sdr(path, job.sdr_format, sdr, error)) {
@@ -585,9 +602,6 @@ namespace gamesnap {
                 return;
             }
             written.push_back(path);
-            // 写成功后才更新面板（同上）。
-            if (ui_ && !sdr.pixels.empty())
-                ui_->publish(job.sequence, path.filename().wstring(), sdr);
             width = static_cast<int>(sdr.width);
             height = static_cast<int>(sdr.height);
         }
@@ -595,6 +609,10 @@ namespace gamesnap {
         const auto encoded_at = SteadyClock::now();
         if (written.empty())
             return;
+
+        // 文件已落盘：补上真实文件名（缩略图早就在上面发布过了，这里不再重算）。
+        if (ui_)
+            ui_->publish(job.sequence, written.front().filename().wstring(), nullptr);
 
         std::string paths;
         for (auto const& path : written) {

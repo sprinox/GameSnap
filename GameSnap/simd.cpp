@@ -142,4 +142,85 @@ namespace gamesnap {
         rgb_planes_row(src, r, g, b, pixels, 0, 1, 2);
     }
 
+    // ── 4→3 通道打包（丢 alpha） ───────────────────────────────────────────
+    // AVX2 没有“按 3 字节紧凑”的指令，做法是：先在 128-bit 通道内用 shuffle 把
+    // 每 4 像素（8-bit）或 2 像素（16-bit）的 RGB 排成 12 字节，正好 3 个 dword；
+    // 再用 permutevar8x32 把两个通道的 3 个 dword 拼到低 6 个 dword，写 24 字节。
+    namespace {
+
+        // 8-bit：每个 128-bit 通道 4 像素 → 12 字节；16-bit：每个通道 2 像素 → 12 字节。
+        const __m256i kPack8 = _mm256_setr_epi8(
+            2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, -1, -1, -1, -1,
+            2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, -1, -1, -1, -1);
+        const __m256i kPack16 = _mm256_setr_epi8(
+            0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, -1, -1, -1, -1,
+            0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, -1, -1, -1, -1);
+        // 两个通道各 3 个 dword → 低 6 个 dword 连续。
+        const __m256i kPackPerm = _mm256_setr_epi32(0, 1, 2, 4, 5, 6, 0, 0);
+
+        inline void store24(std::uint8_t* dst, __m256i v) {
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), _mm256_castsi256_si128(v));
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 16), _mm256_extracti128_si256(v, 1));
+        }
+
+        void bgra_to_rgb_row_scalar(std::uint8_t const* __restrict src, std::uint8_t* __restrict dst,
+                                    std::size_t pixels) {
+            for (std::size_t i = 0; i < pixels; ++i, src += 4, dst += 3) {
+                dst[0] = src[2];
+                dst[1] = src[1];
+                dst[2] = src[0];
+            }
+        }
+
+        void bgra_to_rgb_row_avx2(std::uint8_t const* __restrict src, std::uint8_t* __restrict dst,
+                                  std::size_t pixels) {
+            std::size_t x = 0;
+            for (; x + 8 <= pixels; x += 8) {
+                const __m256i v = _mm256_loadu_si256(reinterpret_cast<__m256i const*>(src + x * 4));
+                const __m256i packed = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(v, kPack8), kPackPerm);
+                store24(dst + x * 3, packed);
+            }
+            bgra_to_rgb_row_scalar(src + x * 4, dst + x * 3, pixels - x);
+        }
+
+        void rgba16_to_rgb16_row_scalar(std::uint16_t const* __restrict src, std::uint16_t* __restrict dst,
+                                        std::size_t pixels) {
+            for (std::size_t i = 0; i < pixels; ++i, src += 4, dst += 3) {
+                dst[0] = src[0];
+                dst[1] = src[1];
+                dst[2] = src[2];
+            }
+        }
+
+        void rgba16_to_rgb16_row_avx2(std::uint16_t const* __restrict src, std::uint16_t* __restrict dst,
+                                      std::size_t pixels) {
+            std::size_t x = 0;
+            for (; x + 4 <= pixels; x += 4) {
+                const __m256i v = _mm256_loadu_si256(reinterpret_cast<__m256i const*>(src + x * 4));
+                const __m256i packed = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(v, kPack16), kPackPerm);
+                store24(reinterpret_cast<std::uint8_t*>(dst + x * 3), packed);
+            }
+            rgba16_to_rgb16_row_scalar(src + x * 4, dst + x * 3, pixels - x);
+        }
+
+    }  // namespace
+
+    void bgra_to_rgb_row(std::uint8_t const* src, std::uint8_t* dst, std::size_t pixels) {
+        bgra_to_rgb_row_avx2(src, dst, pixels);
+    }
+
+    void rgba16_to_rgb16_row(std::uint16_t const* src, std::uint16_t* dst, std::size_t pixels) {
+        rgba16_to_rgb16_row_avx2(src, dst, pixels);
+    }
+
+    // BMP 的像素字节序是 B,G,R：不能复用 bgra_to_rgb_row，否则红蓝颠倒。
+    void bgra_to_bgr_row(std::uint8_t const* __restrict src, std::uint8_t* __restrict dst,
+                         std::size_t pixels) {
+        for (std::size_t i = 0; i < pixels; ++i, src += 4, dst += 3) {
+            dst[0] = src[0];
+            dst[1] = src[1];
+            dst[2] = src[2];
+        }
+    }
+
 }  // namespace gamesnap

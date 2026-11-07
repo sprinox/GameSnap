@@ -14,7 +14,7 @@
 encode_threads: 2
 
 # HDR 由目标显示器动态决定；HDR 显示器保存 HDR 容器 + SDR 两份。
-# format_hdr 仅支持 avif / heic；format_sdr 支持 bmp / png / jpeg / webp / avif / heic。
+# format_hdr 仅支持 avif / heic / jxl；format_sdr 支持 bmp / png / jpeg / webp / avif / heic / jxl。
 format_hdr: avif
 format_sdr: webp
 
@@ -40,6 +40,19 @@ avif_speed: 10
 heic_quality: 90
 heic_lossless: false
 heic_preset: fast
+
+# JXL（libjxl）：distance 0..15，0 表示数学无损（还要 jxl_lossless: true），1.0 = 视觉无损
+jxl_distance: 1.0
+jxl_lossless: false
+# effort 1..10，越高越慢、文件越小
+jxl_effort: 7
+
+# AVIF 的 AV1 编码库：auto（libavif 自己挑）/ aom / svt
+# 注意：SVT-AV1 只接受 4:2:0，会退化为色度抽样，并跳过 SDR AVIF 内嵌的 gain map
+av1_encoder: auto
+# 各库专属参数；-1 = 由 avif_speed 推导
+aom_cpu_used: -1   # 0..8，越高越快
+svt_preset: -1     # 0..13，越高越快
 
 # HDR→SDR 色调映射算法：spline（默认，Hermite shoulder）或 analysis（调试 false color）。
 tone_map: spline

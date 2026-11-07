@@ -10,6 +10,7 @@
 #include <avif/avif.h>
 #include <zlib.h>
 #include <jpeglib.h>
+#include <jxl/encode.h>
 #include <libheif/heif.h>
 #include <spng.h>
 #include <webp/encode.h>
@@ -46,6 +47,8 @@ namespace gamesnap {
                 return "avif";
             case ImageFormat::Heic:
                 return "heic";
+            case ImageFormat::Jxl:
+                return "jxl";
             }
             return "unknown";
         }
@@ -63,6 +66,19 @@ namespace gamesnap {
                 std::filesystem::remove(path, ec);
                 error = "写文件失败";
                 return false;
+            }
+            return true;
+        }
+
+        // 所有输出都是不透明图像：编码前统一丢掉 alpha（实现见 simd.cpp 的 AVX2 版）。
+        bool to_rgb(Image const& image, ByteBuffer& rgb) {
+            if (image.width == 0 || image.height == 0 || image.stride != image.width * 4)
+                return false;
+            rgb.resize(static_cast<std::size_t>(image.width) * image.height * 3);
+            for (std::uint32_t y = 0; y < image.height; ++y) {
+                auto const* src = image.pixels.data() + static_cast<std::size_t>(y) * image.stride;
+                auto* dst = rgb.data() + static_cast<std::size_t>(y) * image.width * 3;
+                bgra_to_rgb_row(src, dst, image.width);
             }
             return true;
         }
@@ -299,7 +315,8 @@ namespace gamesnap {
                 error = "空图像";
                 return false;
             }
-            const std::uint32_t row_bytes = image.width * 4;
+            // 24bpp：截图不透明，alpha 字节没有意义，写了只是徒增 1/4 体积。
+            const std::uint32_t row_bytes = (image.width * 3 + 3) & ~std::uint32_t{3};
             BITMAPFILEHEADER file_header{};
             file_header.bfType = 0x4D42;
             file_header.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
@@ -310,7 +327,7 @@ namespace gamesnap {
             info_header.biWidth = static_cast<LONG>(image.width);
             info_header.biHeight = -static_cast<LONG>(image.height);
             info_header.biPlanes = 1;
-            info_header.biBitCount = 32;
+            info_header.biBitCount = 24;
             info_header.biCompression = BI_RGB;
             info_header.biSizeImage = row_bytes * image.height;
 
@@ -321,7 +338,14 @@ namespace gamesnap {
             }
             file.write(reinterpret_cast<char const*>(&file_header), sizeof(file_header));
             file.write(reinterpret_cast<char const*>(&info_header), sizeof(info_header));
-            file.write(reinterpret_cast<char const*>(image.pixels.data()), static_cast<std::streamsize>(image.pixels.size()));
+            ByteBuffer row;
+            row.resize(row_bytes);
+            std::memset(row.data(), 0, row_bytes);  // 行尾 4 字节对齐的填充保持为 0
+            for (std::uint32_t y = 0; y < image.height; ++y) {
+                auto const* src = image.pixels.data() + static_cast<std::size_t>(y) * image.stride;
+                bgra_to_bgr_row(src, row.data(), image.width);
+                file.write(reinterpret_cast<char const*>(row.data()), static_cast<std::streamsize>(row_bytes));
+            }
             file.flush();
             if (!file.good()) {
                 error = "写 BMP 失败";
@@ -337,9 +361,9 @@ namespace gamesnap {
 
         // ── PNG（libspng，最高压缩） ─────────────────────────────────────────
         bool write_png_impl(std::filesystem::path const& path, Image const& image, std::string& error) {
-            // PNG 转换缓冲只在本次编码期间存在；空闲时不占内存。
-            ByteBuffer rgba;
-            if (!to_rgba(image, rgba)) {
+            // 不透明图像用 TRUECOLOR（3 通道），省掉恒为 255 的 alpha 通道。
+            ByteBuffer rgb;
+            if (!to_rgb(image, rgb)) {
                 error = "PNG 需要 BGRA8 紧凑图像";
                 return false;
             }
@@ -355,7 +379,7 @@ namespace gamesnap {
             ihdr.width = image.width;
             ihdr.height = image.height;
             ihdr.bit_depth = 8;
-            ihdr.color_type = SPNG_COLOR_TYPE_TRUECOLOR_ALPHA;
+            ihdr.color_type = SPNG_COLOR_TYPE_TRUECOLOR;
             ihdr.compression_method = 0;
             ihdr.filter_method = 0;
             ihdr.interlace_method = 0;
@@ -365,7 +389,7 @@ namespace gamesnap {
                 return false;
             }
             const int encode_result =
-                spng_encode_image(ctx, rgba.data(), rgba.size(), SPNG_FMT_PNG, SPNG_ENCODE_FINALIZE);
+                spng_encode_image(ctx, rgb.data(), rgb.size(), SPNG_FMT_PNG, SPNG_ENCODE_FINALIZE);
             if (encode_result != 0) {
                 error = fmt::format("spng_encode_image 失败: {} ({})", spng_strerror(encode_result), encode_result);
                 spng_ctx_free(ctx);
@@ -498,8 +522,11 @@ namespace gamesnap {
             }
             picture.width = static_cast<int>(image.width);
             picture.height = static_cast<int>(image.height);
+            // 直接用原生 BGRA 导入（libwebp 内部转 ARGB，走 lossless 的精确 RGB 路径）；
+            // alpha 全 255 时它不会写 alpha 通道，所以不会多出无用通道。
             picture.use_argb = 1;
-            if (WebPPictureImportBGRA(&picture, image.pixels.data(), static_cast<int>(image.stride)) == 0) {
+            if (WebPPictureImportBGRA(&picture, image.pixels.data(),
+                                      static_cast<int>(image.stride)) == 0) {
                 WebPPictureFree(&picture);
                 error = "WebPPictureImportBGRA 失败";
                 return false;
@@ -549,6 +576,34 @@ namespace gamesnap {
             encoder->quality = avif_quality;
             encoder->qualityAlpha = avif_quality;
             encoder->qualityGainMap = avif_quality;
+
+            // AV1 编码库：配置指定了就用它，但库里没编进去时回落到 AUTO，而不是整张图失败。
+            switch (codec_options.av1_encoder) {
+            case Av1Encoder::Aom:
+                encoder->codecChoice = AVIF_CODEC_CHOICE_AOM;
+                break;
+            case Av1Encoder::Svt:
+                encoder->codecChoice = AVIF_CODEC_CHOICE_SVT;
+                break;
+            case Av1Encoder::Auto:
+                break;
+            }
+            if (encoder->codecChoice != AVIF_CODEC_CHOICE_AUTO &&
+                avifCodecName(encoder->codecChoice, AVIF_CODEC_FLAG_CAN_ENCODE) == nullptr) {
+                SPDLOG_WARN("libavif 未内置 AV1 编码器 {}，回退 auto", to_string(codec_options.av1_encoder));
+                encoder->codecChoice = AVIF_CODEC_CHOICE_AUTO;
+            }
+            // 各库专属参数；-1 表示交给 avif_speed（libavif 会映射成 cpu-used / preset）。
+            if (codec_options.aom_cpu_used >= 0) {
+                const std::string value = std::to_string(codec_options.aom_cpu_used);
+                if (avifEncoderSetCodecSpecificOption(encoder, "cpu-used", value.c_str()) != AVIF_RESULT_OK)
+                    SPDLOG_WARN("aom 不接受 cpu-used={}", value);
+            }
+            if (codec_options.svt_preset >= 0) {
+                const std::string value = std::to_string(codec_options.svt_preset);
+                if (avifEncoderSetCodecSpecificOption(encoder, "preset", value.c_str()) != AVIF_RESULT_OK)
+                    SPDLOG_WARN("svt 不接受 preset={}", value);
+            }
             if (codec_options.avif_lossless) {
                 encoder->minQuantizer = AVIF_QUANTIZER_LOSSLESS;
                 encoder->maxQuantizer = AVIF_QUANTIZER_LOSSLESS;
@@ -570,15 +625,22 @@ namespace gamesnap {
             return ok;
         }
 
+        // libavif 的 SVT 插件只接受 4:2:0；选 svt 时降到 420，其余情况保持无损的 4:4:4。
+        avifPixelFormat avif_yuv_format() {
+            return codec_options.av1_encoder == Av1Encoder::Svt ? AVIF_PIXEL_FORMAT_YUV420
+                                                               : AVIF_PIXEL_FORMAT_YUV444;
+        }
+
         bool avif_from_bgra(std::filesystem::path const& path, Image const& image, bool hdr, std::string& error) {
             const std::uint32_t depth = hdr ? 10 : 8;
-            avifImage* avif = avifImageCreate(image.width, image.height, depth, AVIF_PIXEL_FORMAT_YUV444);
+            avifImage* avif = avifImageCreate(image.width, image.height, depth, avif_yuv_format());
             if (avif == nullptr) {
                 error = "avifImageCreate 失败";
                 return false;
             }
             // 同 avif_from_rgba10：identity 矩阵的平面顺序有歧义，改用标准 YCbCr 矩阵。
-            avif->yuvRange = AVIF_RANGE_LIMITED;
+            // 范围统一用 full（与 HEIC/JXL 一致）：444 + full 时 RGB↔YUV 往返几乎无损失。
+            avif->yuvRange = AVIF_RANGE_FULL;
             avif->colorPrimaries = hdr ? AVIF_COLOR_PRIMARIES_BT2020 : AVIF_COLOR_PRIMARIES_BT709;
             avif->transferCharacteristics = hdr ? AVIF_TRANSFER_CHARACTERISTICS_PQ : AVIF_TRANSFER_CHARACTERISTICS_SRGB;
             avif->matrixCoefficients = hdr ? AVIF_MATRIX_COEFFICIENTS_BT2020_NCL : AVIF_MATRIX_COEFFICIENTS_BT709;
@@ -645,15 +707,15 @@ namespace gamesnap {
         bool avif_from_rgba10(std::filesystem::path const& path, std::uint16_t const* rgba,
                               std::uint32_t width, std::uint32_t height,
                               ImageMetadata const& metadata, std::string& error) {
-            avifImage* avif = avifImageCreate(width, height, 10, AVIF_PIXEL_FORMAT_YUV444);
+            avifImage* avif = avifImageCreate(width, height, 10, avif_yuv_format());
             if (avif == nullptr) {
                 error = "avifImageCreate 失败";
                 return false;
             }
             // 不要用 AVIF_MATRIX_COEFFICIENTS_IDENTITY：identity 的平面顺序在 CICP/AV1 里是
             // G,B,R，而 libavif 按 R,G,B 写，按规范解码的实现会把红蓝换过来。
-            // 标准 HDR10 AVIF 用 BT.2020 非恒定亮度矩阵 + 有限范围，解码器无歧义。
-            avif->yuvRange = AVIF_RANGE_LIMITED;
+            // 用 BT.2020 非恒定亮度矩阵；范围与其它容器统一为 full。
+            avif->yuvRange = AVIF_RANGE_FULL;
             avif->colorPrimaries = AVIF_COLOR_PRIMARIES_BT2020;
             avif->transferCharacteristics = AVIF_TRANSFER_CHARACTERISTICS_PQ;
             avif->matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_BT2020_NCL;
@@ -681,7 +743,7 @@ namespace gamesnap {
                 return false;
             }
 
-            avifImage* base = avifImageCreate(width, height, 8, AVIF_PIXEL_FORMAT_YUV444);
+            avifImage* base = avifImageCreate(width, height, 8, avif_yuv_format());
             if (base == nullptr) {
                 error = "avifImageCreate(base) 失败";
                 return false;
@@ -689,7 +751,8 @@ namespace gamesnap {
             base->yuvRange = AVIF_RANGE_FULL;
             base->colorPrimaries = AVIF_COLOR_PRIMARIES_BT709;
             base->transferCharacteristics = AVIF_TRANSFER_CHARACTERISTICS_SRGB;
-            base->matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_IDENTITY;
+            // identity 矩阵要求 4:4:4，且平面顺序有歧义；和 write_sdr 保持一致用 BT.709 NCL。
+            base->matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_BT709;
 
             avifRGBImage base_rgb{};
             base_rgb.width = width;
@@ -969,14 +1032,157 @@ namespace gamesnap {
             return ok;
         }
 
+        // ── JXL（libjxl） ────────────────────────────────────────────────────
+        // pixels 是紧凑 RGB：8-bit 用 JXL_TYPE_UINT8，10-bit PQ 用 JXL_TYPE_UINT16
+        // 且通过 JXL_BIT_DEPTH_FROM_CODESTREAM 声明“未缩放”（值域 0..1023）。
+        // 截图不透明，所以不写 alpha extra channel。
+        bool write_jxl_impl(std::filesystem::path const& path, void const* pixels,
+                            std::uint32_t width, std::uint32_t height, bool hdr,
+                            ImageMetadata const& metadata, std::string& error) {
+            JxlEncoder* enc = JxlEncoderCreate(nullptr);
+            if (enc == nullptr) {
+                error = "JxlEncoderCreate 失败";
+                return false;
+            }
+            auto guard = ScopeExit{[&] { JxlEncoderDestroy(enc); }};
+
+            JxlBasicInfo info{};
+            JxlEncoderInitBasicInfo(&info);
+            info.xsize = width;
+            info.ysize = height;
+            info.num_color_channels = 3;
+            info.bits_per_sample = hdr ? 10 : 8;
+            info.exponent_bits_per_sample = 0;
+            // 不透明图像：不声明 alpha，也不加 extra channel。
+            info.num_extra_channels = 0;
+            info.alpha_bits = 0;
+            // 保留我们写入的色彩编码（PQ/BT.2020 或 sRGB），不让编码器换成 ICC。
+            info.uses_original_profile = JXL_TRUE;
+            if (hdr)
+                info.intensity_target = 1000.0F;
+            if (JxlEncoderSetBasicInfo(enc, &info) != JXL_ENC_SUCCESS) {
+                error = "JxlEncoderSetBasicInfo 失败";
+                return false;
+            }
+
+            JxlColorEncoding color{};
+            if (hdr) {
+                color.color_space = JXL_COLOR_SPACE_RGB;
+                color.white_point = JXL_WHITE_POINT_D65;
+                color.primaries = JXL_PRIMARIES_2100;
+                color.transfer_function = JXL_TRANSFER_FUNCTION_PQ;
+                color.rendering_intent = JXL_RENDERING_INTENT_RELATIVE;
+            } else {
+                JxlColorEncodingSetToSRGB(&color, JXL_FALSE);
+            }
+            if (JxlEncoderSetColorEncoding(enc, &color) != JXL_ENC_SUCCESS) {
+                error = "JxlEncoderSetColorEncoding 失败";
+                return false;
+            }
+
+            JxlEncoderFrameSettings* frame = JxlEncoderFrameSettingsCreate(enc, nullptr);
+            if (frame == nullptr) {
+                error = "JxlEncoderFrameSettingsCreate 失败";
+                return false;
+            }
+            if (codec_options.jxl_lossless) {
+                JxlEncoderSetFrameLossless(frame, JXL_TRUE);
+                JxlEncoderSetFrameDistance(frame, 0.0F);
+            } else {
+                JxlEncoderSetFrameDistance(frame, std::clamp(codec_options.jxl_distance, 0.0F, 15.0F));
+            }
+            JxlEncoderFrameSettingsSetOption(frame, JXL_ENC_FRAME_SETTING_EFFORT,
+                                             std::clamp(codec_options.jxl_effort, 1, 10));
+
+            if (hdr) {
+                JxlBitDepth depth{};
+                depth.type = JXL_BIT_DEPTH_FROM_CODESTREAM;
+                depth.bits_per_sample = 10;
+                depth.exponent_bits_per_sample = 0;
+                JxlEncoderSetFrameBitDepth(frame, &depth);
+            }
+
+            // EXIF 用独立 box，内容是裸 TIFF（不带 "Exif\0\0" 前缀）。
+            if (!metadata.title.empty() || !metadata.date_time.empty()) {
+                JxlEncoderUseBoxes(enc);
+                const auto exif = make_exif_tiff(metadata);
+                if (!exif.empty())
+                    JxlEncoderAddBox(enc, "Exif", exif.data(), exif.size(), JXL_FALSE);
+            }
+
+            JxlPixelFormat format{
+                .num_channels = 3,
+                .data_type = hdr ? JXL_TYPE_UINT16 : JXL_TYPE_UINT8,
+                .endianness = JXL_NATIVE_ENDIAN,
+                .align = 0,
+            };
+            const std::size_t bytes_per_pixel = hdr ? 6 : 3;
+            const std::size_t size = static_cast<std::size_t>(width) * height * bytes_per_pixel;
+            if (JxlEncoderAddImageFrame(frame, &format, pixels, size) != JXL_ENC_SUCCESS) {
+                error = "JxlEncoderAddImageFrame 失败";
+                return false;
+            }
+            JxlEncoderCloseInput(enc);
+
+            std::vector<std::uint8_t> out(1 << 16);
+            std::uint8_t* next_out = out.data();
+            std::size_t avail = out.size();
+            for (;;) {
+                const JxlEncoderStatus status = JxlEncoderProcessOutput(enc, &next_out, &avail);
+                if (status == JXL_ENC_SUCCESS)
+                    break;
+                if (status != JXL_ENC_NEED_MORE_OUTPUT) {
+                    error = "JxlEncoderProcessOutput 失败";
+                    return false;
+                }
+                const std::size_t used = static_cast<std::size_t>(next_out - out.data());
+                out.resize(out.size() * 2);
+                next_out = out.data() + used;
+                avail = out.size() - used;
+            }
+            return write_bytes(path, out.data(), static_cast<std::size_t>(next_out - out.data()), error);
+        }
+
     }  // namespace
 
     void set_codec_options(CodecOptions const& options) {
         codec_options = options;
+        // 启动时把 libavif 实际编进去的 AV1 编码器打出来，避免配置选了 svt 却悄悄回落。
+        const auto name_of = [](avifCodecChoice choice) -> std::string_view {
+            const char* name = avifCodecName(choice, AVIF_CODEC_FLAG_CAN_ENCODE);
+            return name != nullptr ? std::string_view(name) : std::string_view();
+        };
+        const auto aom = name_of(AVIF_CODEC_CHOICE_AOM);
+        const auto svt = name_of(AVIF_CODEC_CHOICE_SVT);
+        SPDLOG_INFO("AV1 编码器: libavif 支持 aom={} svt={}（默认 auto={}），配置选择 {}",
+                    aom.empty() ? "否" : "是", svt.empty() ? "否" : "是",
+                    name_of(AVIF_CODEC_CHOICE_AUTO), to_string(options.av1_encoder));
     }
 
     std::string_view to_string(ImageFormat format) {
         return format_name(format);
+    }
+
+    std::string_view to_string(Av1Encoder encoder) {
+        switch (encoder) {
+        case Av1Encoder::Auto:
+            return "auto";
+        case Av1Encoder::Aom:
+            return "aom";
+        case Av1Encoder::Svt:
+            return "svt";
+        }
+        return "unknown";
+    }
+
+    std::optional<Av1Encoder> parse_av1_encoder(std::string_view text) {
+        if (text == "auto")
+            return Av1Encoder::Auto;
+        if (text == "aom")
+            return Av1Encoder::Aom;
+        if (text == "svt" || text == "svt-av1" || text == "svtav1")
+            return Av1Encoder::Svt;
+        return std::nullopt;
     }
 
     std::optional<ImageFormat> parse_image_format(std::string_view text) {
@@ -992,6 +1198,8 @@ namespace gamesnap {
             return ImageFormat::Avif;
         if (text == "heic" || text == "heif")
             return ImageFormat::Heic;
+        if (text == "jxl" || text == "jpegxl" || text == "jpeg-xl")
+            return ImageFormat::Jxl;
         return std::nullopt;
     }
 
@@ -1009,12 +1217,14 @@ namespace gamesnap {
             return L".avif";
         case ImageFormat::Heic:
             return L".heic";
+        case ImageFormat::Jxl:
+            return L".jxl";
         }
         return L".bin";
     }
 
     bool format_supports_hdr(ImageFormat format) {
-        return format == ImageFormat::Avif || format == ImageFormat::Heic;
+        return format == ImageFormat::Avif || format == ImageFormat::Heic || format == ImageFormat::Jxl;
     }
 
     bool encode_avif_hdr10(std::filesystem::path const& path, std::uint16_t const* rgba10,
@@ -1050,6 +1260,11 @@ namespace gamesnap {
     bool encode_avif_gainmap(std::filesystem::path const& path, Image const& sdr,
                              std::uint16_t const* hdr10,
                              std::uint32_t width, std::uint32_t height, std::string& error) {
+        // SVT 只接受 4:2:0，gain map 的 base/alt 需要 4:4:4 语义，这里退化成普通 SDR AVIF。
+        if (codec_options.av1_encoder == Av1Encoder::Svt) {
+            SPDLOG_WARN("SVT-AV1 只支持 4:2:0，SDR AVIF 跳过 gain map");
+            return write_sdr(path, ImageFormat::Avif, sdr, error);
+        }
         return avif_gainmap(path, sdr, hdr10, width, height, error);
     }
 
@@ -1067,6 +1282,14 @@ namespace gamesnap {
             return avif_from_bgra(path, image, false, error);
         case ImageFormat::Heic:
             return heic_from_bgra(path, image, error);
+        case ImageFormat::Jxl: {
+            ByteBuffer rgb;
+            if (!to_rgb(image, rgb)) {
+                error = "空图像或步幅不匹配";
+                return false;
+            }
+            return write_jxl_impl(path, rgb.data(), image.width, image.height, false, image.metadata, error);
+        }
         }
         return false;
     }
@@ -1097,6 +1320,16 @@ namespace gamesnap {
             return encode_avif_hdr10(path, rgba10, width, height, metadata, error);
         case ImageFormat::Heic:
             return encode_heic_hdr10(path, rgba10, width, height, metadata, error);
+        case ImageFormat::Jxl: {
+            // 丢掉 alpha：10-bit RGB 交错缓冲。
+            U16Buffer rgb;
+            rgb.resize(static_cast<std::size_t>(width) * height * 3);
+            for (std::uint32_t y = 0; y < height; ++y) {
+                rgba16_to_rgb16_row(rgba10 + static_cast<std::size_t>(y) * width * 4,
+                                    rgb.data() + static_cast<std::size_t>(y) * width * 3, width);
+            }
+            return write_jxl_impl(path, rgb.data(), width, height, true, metadata, error);
+        }
         default:
             error = "该格式不支持 HDR";
             return false;

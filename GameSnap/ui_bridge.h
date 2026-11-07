@@ -41,8 +41,10 @@ namespace gamesnap {
         void job_enqueued() noexcept;
         void job_finished() noexcept;
         // sequence 是截图序号：多编码线程下完成顺序不固定，只接受不比已发布结果更旧的作业，
-        // 避免旧截图的面板信息覆盖新截图。应在文件真正写成功之后调用。
-        void publish(std::uint64_t sequence, std::wstring filename, Image const& image);
+        // 避免旧截图的面板信息覆盖新截图。
+        // image 非空时刷新缩略图（编码一开始就调，让面板立刻显示这一张）；
+        // filename 留空表示"文件名还没确定"，等写盘成功后再调一次补上。
+        void publish(std::uint64_t sequence, std::wstring filename, Image const* image);
 
         [[nodiscard]] Snapshot snapshot() const;
         [[nodiscard]] HANDLE trigger_event() const noexcept { return trigger_event_; }

@@ -41,17 +41,20 @@ namespace gamesnap {
         SteadyClock::time_point enqueued = SteadyClock::now();
     };
 
-    // 纹理和占用标记绑定在同一个对象里，避免两个独立 shared_ptr 不配套。
-    struct TextureSlot {
-        std::shared_ptr<ID3D11Texture2D> texture;
-        bool hdr = false;
-    };
-
     // 截图线程 → 编码线程。GPU 拷贝（CopyResource）在回调里做；
-    // Map/Unmap 这种 GPU→CPU 传输在编码线程里做，所以 job 持有 staging 纹理和设备。
+    // Map/Unmap 这种 GPU→CPU 传输在编码线程里做，所以 job 直接持有 staging 纹理和设备。
+    // 纹理是独占的，因此 EncodeJob 显式只可移动：多一次拷贝就意味着多一次 AddRef 和
+    // 一个“谁还拿着这张纹理”的问题。注意 winrt::com_ptr 自己是可以拷贝的（拷贝会 AddRef），
+    // 所以这里的 delete 是必要的，不是冗余。
     struct EncodeJob {
+        EncodeJob() = default;
+        EncodeJob(EncodeJob&&) = default;
+        EncodeJob& operator=(EncodeJob&&) = default;
+        EncodeJob(EncodeJob const&) = delete;
+        EncodeJob& operator=(EncodeJob const&) = delete;
+
         bool stop = false;  // 编码线程的停止哨兵
-        std::shared_ptr<TextureSlot> texture_slot;
+        winrt::com_ptr<ID3D11Texture2D> texture;
         std::shared_ptr<D3DContext> d3d;             // 保活设备 + 提供 context 锁
         std::shared_ptr<std::atomic<bool>> canceled;  // 超时取消标记
         bool hdr = false;
@@ -69,5 +72,9 @@ namespace gamesnap {
 
     using CommandQueue = moodycamel::BlockingConcurrentQueue<Command>;
     using EncodeQueue = moodycamel::BlockingConcurrentQueue<EncodeJob>;
+
+    // 严格语义：job 里的纹理是独占的，不允许拷贝（队列按值搬运，只需要可移动）。
+    static_assert(!std::is_copy_constructible_v<EncodeJob>, "EncodeJob 只能移动，不能拷贝");
+    static_assert(std::is_move_constructible_v<EncodeJob>, "EncodeJob 必须可移动");
 
 }  // namespace gamesnap

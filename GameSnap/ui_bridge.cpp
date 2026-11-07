@@ -73,18 +73,22 @@ namespace gamesnap {
         }
     }
 
-    void UiBridge::publish(std::uint64_t sequence, std::wstring filename, Image const& image) {
+    void UiBridge::publish(std::uint64_t sequence, std::wstring filename, Image const* image) {
         // 缩略图在锁外生成；只有序号不比已发布结果旧的作业才会落进面板，
         // 这样多编码线程乱序完成时，旧截图不会覆盖新截图的显示。
-        auto thumbnail = std::make_shared<Thumbnail>();
-        make_thumbnail(image, thumbnail->pixels, thumbnail->width, thumbnail->height);
+        std::shared_ptr<Thumbnail> thumbnail;
+        if (image != nullptr && !image->pixels.empty()) {
+            thumbnail = std::make_shared<Thumbnail>();
+            make_thumbnail(*image, thumbnail->pixels, thumbnail->width, thumbnail->height);
+        }
 
         std::scoped_lock lock(mutex_);
         if (sequence < published_sequence_)
             return;
         published_sequence_ = sequence;
         filename_ = std::move(filename);
-        thumbnail_ = std::move(thumbnail);
+        if (thumbnail)
+            thumbnail_ = std::move(thumbnail);
         ++info_serial_;
     }
 

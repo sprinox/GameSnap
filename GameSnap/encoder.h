@@ -17,8 +17,8 @@ namespace gamesnap {
     class D3DContext;
     class UiBridge;
 
-    // 创建一块 CPU 可读的 staging 纹理（失败返回空）。
-    std::shared_ptr<ID3D11Texture2D> create_staging_texture(ID3D11Device* device, D3D11_TEXTURE2D_DESC const& desc);
+    // 创建一块 CPU 可读的 staging 纹理（失败返回空）。com_ptr：独占，不可拷贝。
+    winrt::com_ptr<ID3D11Texture2D> create_staging_texture(ID3D11Device* device, D3D11_TEXTURE2D_DESC const& desc);
 
     class EncodeWorkers {
     public:

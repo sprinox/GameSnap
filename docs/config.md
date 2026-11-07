@@ -18,8 +18,8 @@ YAML 先加载，命令行参数随后覆盖。仓库根的 [config.example.yaml
 | `hotkey` | 字符串 | `F12` | `F1..F24`、字母/数字、`printscreen`、`scrolllock`、`insert`、`home`、`end`、`space`、`0x7B`；可加 `ctrl+` / `shift+` / `alt+` / `win+` |
 | `swallow` | 布尔 | `false` | 是否吞掉热键，`true` 时游戏收不到 |
 | `monitor` | 字符串 | `primary` | `primary`：主显示器；`foreground`：前台窗口所在显示器 |
-| `format_hdr` | 字符串 | `avif` | HDR 容器，仅 `avif` / `heic` |
-| `format_sdr` | 字符串 | `webp` | SDR 格式：`bmp` / `png` / `jpeg` / `webp` / `avif` / `heic` |
+| `format_hdr` | 字符串 | `avif` | HDR 容器，仅 `avif` / `heic` / `jxl` |
+| `format_sdr` | 字符串 | `webp` | SDR 格式：`bmp` / `png` / `jpeg` / `webp` / `avif` / `heic` / `jxl` |
 | `tone_map` | 字符串 | `spline` | HDR→SDR 算法：`spline` / `analysis` |
 | `tone_map_backend` | 字符串 | `auto` | HDR→SDR 计算后端：`auto` / `gpu` / `cpu` |
 | `png_compression` | 整数 0–9 | `6` | PNG 压缩级别，越高越慢/越小 |
@@ -33,6 +33,12 @@ YAML 先加载，命令行参数随后覆盖。仓库根的 [config.example.yaml
 | `heic_quality` | 整数 0–100 | `90` | HEIC 质量 |
 | `heic_lossless` | 布尔 | `false` | HEIC 无损 |
 | `heic_preset` | 字符串 | `fast` | x265 预设，`ultrafast`..`veryslow` |
+| `jxl_distance` | 浮点 0–15 | `1.0` | JXL 距离：0 数学无损（需 `jxl_lossless: true`），1.0 视觉无损，越大越小越糊 |
+| `jxl_lossless` | 布尔 | `false` | JXL 无损（modular） |
+| `jxl_effort` | 整数 1–10 | `7` | JXL 编码强度，越高越慢、文件越小 |
+| `av1_encoder` | 字符串 | `auto` | AVIF 用哪个 AV1 编码库：`auto`（libavif 自选）/ `aom` / `svt` |
+| `aom_cpu_used` | 整数 -1–8 | `-1` | aom 的 `-cpu-used`；-1 表示由 `avif_speed` 推导 |
+| `svt_preset` | 整数 -1–13 | `-1` | SVT-AV1 的 preset；-1 表示由 `avif_speed` 推导 |
 | `verbose` | 布尔 | `false` | 输出 debug 级别日志 |
 
 布尔值使用 yaml-cpp 的规则：`true/false`、`yes/no`、`on/off`、`y/n`（不区分大小写），不接受 `1/0`。

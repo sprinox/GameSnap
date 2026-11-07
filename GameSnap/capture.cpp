@@ -69,15 +69,12 @@ namespace gamesnap {
             return desc;
         }
 
-        std::shared_ptr<ID3D11Texture2D> create_gpu_texture(ID3D11Device* device,
-                                                            D3D11_TEXTURE2D_DESC const& desc) {
+        winrt::com_ptr<ID3D11Texture2D> create_gpu_texture(ID3D11Device* device,
+                                                           D3D11_TEXTURE2D_DESC const& desc) {
             winrt::com_ptr<ID3D11Texture2D> texture;
             if (FAILED(device->CreateTexture2D(&desc, nullptr, texture.put())))
                 return {};
-            return std::shared_ptr<ID3D11Texture2D>{texture.detach(), [](ID3D11Texture2D* p) {
-                if (p != nullptr)
-                    p->Release();
-            }};
+            return texture;
         }
 
         // 前台窗口标题，用作文件名前缀；拿不到就由编码侧回退到 GameSnap。
@@ -134,11 +131,9 @@ namespace gamesnap {
 
             const D3D11_TEXTURE2D_DESC wanted =
                 shot.hdr ? make_gpu_desc_from(desc) : make_staging_desc_from(desc);
-            auto slot = std::make_shared<TextureSlot>();
-            slot->hdr = shot.hdr;
-            slot->texture = shot.hdr ? create_gpu_texture(shot.d3d->device(), wanted)
-                                     : create_staging_texture(shot.d3d->device(), wanted);
-            if (!slot->texture) {
+            auto target = shot.hdr ? create_gpu_texture(shot.d3d->device(), wanted)
+                                   : create_staging_texture(shot.d3d->device(), wanted);
+            if (!target) {
                 shot.failed.store(true, std::memory_order_release);
                 frame.Close();
                 SPDLOG_ERROR("创建 {} 纹理失败 ({}x{}, fmt={})",
@@ -149,7 +144,7 @@ namespace gamesnap {
             std::uint64_t gpu_fence = 0;
             {
                 std::scoped_lock lock(shot.d3d->context_mutex());
-                shot.d3d->context()->CopyResource(slot->texture.get(), source.get());
+                shot.d3d->context()->CopyResource(target.get(), source.get());
                 gpu_fence = shot.d3d->signal_fence_locked();
             }
             frame.Close();
@@ -171,7 +166,7 @@ namespace gamesnap {
                          duration_ms(copied - received));
 
             EncodeJob job;
-            job.texture_slot = slot;
+            job.texture = std::move(target);
             job.gpu_fence = gpu_fence;
             job.d3d = shot.d3d;
             job.canceled = shot.canceled;
@@ -463,11 +458,16 @@ namespace gamesnap {
 
         // 启动时就把资源准备好，第一次热键不需要重建。
         // 如果这里就失败（典型是 E_ACCESSDENIED），继续跑也没有任何意义，直接通知主线程退出。
+        // 例外：一个显示器都没有时不是致命错误——保留托盘和消息循环，接入后自动恢复。
         if (!ensure_ready(ReloadReason::Startup)) {
-            SPDLOG_CRITICAL("捕获资源初始化失败，GameSnap 无法截图，退出");
-            fatal_error_.store(true, std::memory_order_relaxed);
-            stop_->request_stop();
-            return;
+            if (no_display()) {
+                SPDLOG_WARN("当前没有检测到显示器，等待接入后自动恢复");
+            } else {
+                SPDLOG_CRITICAL("捕获资源初始化失败，GameSnap 无法截图，退出");
+                fatal_error_.store(true, std::memory_order_relaxed);
+                stop_->request_stop();
+                return;
+            }
         }
         ready_.count_down();  // 成功：先放行主线程，再取消 guard 避免重复 count_down
         ready_guard.dismiss();
@@ -560,9 +560,13 @@ namespace gamesnap {
         // 1) ensure_ready 已经选过显示器时直接复用，避免重复枚举。
         auto display = known_display != nullptr ? *known_display : select_monitor(config_.monitor);
         if (display.monitor == nullptr) {
-            SPDLOG_ERROR("没有可用的显示器");
+            // 没有显示器（启动时就没接，或者全部被拔掉）。标记成可恢复状态：
+            // 保留托盘/线程，等 WM_DISPLAYCHANGE 触发下一次 Validate 再重建。
+            no_display_.store(true, std::memory_order_relaxed);
+            SPDLOG_WARN("没有可用的显示器，等待接入");
             return false;
         }
+        no_display_.store(false, std::memory_order_relaxed);
         if (display.monitor != monitor_) {
             if (monitor_ != nullptr) {
                 SPDLOG_INFO("目标显示器发生变化: {} -> {}",

@@ -36,7 +36,7 @@
 
 5. **不做纹理/大缓冲复用。**
    capture 纹理、编码 `raw` / `sdr` / `hdr10`、`ToneMapper` 纹理全部按 job 动态分配，
-   job 结束即释放；只有 16KB 的 tone LUT 例外。
+   job 结束即释放，没有任何常驻的色调映射表。
 
 ---
 
@@ -119,18 +119,11 @@ SDR 的 BGRA→BGRA 路径仍通过 `pixels.swap()` 避免一次整帧复制。
 它只是给“同一个 mapper 服务多张图”留的实现细节，不构成复用路径。
 因此没有常驻 mapper，也没有 `mapper_mutex_` / `mapper_owner_` / 熔断状态。
 
-### 2.5 16KB tone LUT
+### 2.5 CPU 回退的色调映射
 
-`ToneLutCache` 是进程级静态对象，包含 `shared_ptr<const ToneLut>` 和一个
-`std::atomic<bool> empty{true}`：
-
-- 只在 HDR CPU 回退路径（FP16 逐像素转换）首次用到时构建；
-- HDR job 缓存，SDR job 结束时释放（HDR 期间常驻，闲置时不留）；
-- `empty` 为 true 时 `release_tone_lut()` 直接返回，不拿锁；只有表非空才进入 mutex；
-- `empty` 与 mutex 保护的 `current` 允许短暂不一致，不保证 100% 避免重复加锁/释放，
-  只优化绝大多数 SDR job。
-
-LUT 的 `current` 由 `ToneLutCache::mutex` 保护；`empty` 是快速路径原子标记。
+CPU 回退走的是和 GPU 同一套数学（PQ 域 spline + IPT + hull 色度收缩），**没有查找表**：
+每张图先扫一遍取峰值，再逐像素算。因此也不存在缓存/释放的跨线程状态，
+编码线程之间不需要任何锁；代价是 4K 约几秒（只在 GPU 不可用时才会走到）。
 
 ### 2.6 WGC pool/session 预创建
 
@@ -146,7 +139,6 @@ LUT 的 `current` 由 `ToneLutCache::mutex` 保护；`empty` 是快速路径原�
 | 锁 | 保护对象 | 持有时长 | 说明 |
 |---|---|---|---|
 | `D3DContext::context_mutex` | immediate context 的所有调用 | 微秒–毫秒 | 必要；Map 后的 CPU 行拷贝在锁外 |
-| `ToneLutCache::mutex` | 16KB LUT 的 `current` | 建表/取指针/非空时释放 | HDR CPU 回退 + SDR 释放；空表由 atomic `empty` 快速跳过 |
 | `UiBridge::mutex_` | 文件名、缩略图、`info_serial_` | 微秒 | Overlay 每帧只复制 `shared_ptr`/字符串 |
 | `FrameSink::mutex_` + `idle_cv_` | `shot_` / `accepting_` / `in_flight_` | 微秒 | 等回调退出用 |
 | `codec_options` | 编码参数 | 无锁 | 构造编码线程前写一次，之后只读 |
@@ -155,7 +147,7 @@ LUT 的 `current` 由 `ToneLutCache::mutex` 保护；`empty` 是快速路径原�
 
 ### 3.1 锁序
 
-- 持 `context_mutex` 时不再拿 `ToneLutCache::mutex` / `FrameSink::mutex_` / `UiBridge::mutex_`；
+- 持 `context_mutex` 时不再拿 `FrameSink::mutex_` / `UiBridge::mutex_`；
 - `ToneMapper` 的 fence 等待在 `context_mutex` 外；
 - `UiBridge::publish()` 不进入 D3D 锁；
 - `FrameSink::on_frame` 只在取/清 shot 时拿自己的 mutex，`CopyResource` 使用 `context_mutex`。
@@ -219,7 +211,6 @@ LUT 的 `current` 由 `ToneLutCache::mutex` 保护；`empty` 是快速路径原�
 
 ### 6.2 例外
 
-- **16KB tone LUT**：HDR 缓存，SDR 释放；空表由 atomic `empty` 快速跳过，避免大多数 SDR job 拿锁。
 - **WGC pool/session**：保留下一张预创建，以压低热键延迟。
 - **libjpeg `thread_local cinfo` / 行缓冲**：`longjmp` 不执行普通局部对象析构，
   改成每张分配会泄漏或破坏状态；这是非纹理的小缓冲。
@@ -233,7 +224,7 @@ LUT 的 `current` 由 `ToneLutCache::mutex` 保护；`empty` 是快速路径原�
 - [ ] 每张截图是否新建纹理，job 是否用 `com_ptr` 独占持有到编码结束？
 - [ ] 编码线程是否不再使用 `thread_local` 大缓冲，大缓冲是否都是 `UninitBuffer`（不整帧清零）？
 - [ ] `ToneMapper` 是否仍然每个 HDR job 现建现用、不跨 job 复用（闲置显存）？
-- [ ] 16KB LUT 是否 HDR 缓存、SDR 释放，且空表时 atomic 快路径不拿锁？
+- [ ] CPU 回退的色调映射是否仍然每张现算、不进程级缓存大表？
 - [ ] `context_mutex` 内是否没有 fence 等待、CPU 行拷贝、编码或写盘？
 - [ ] `UiBridge` 是否只复制 `shared_ptr`/字符串，不复制缩略图像素？
 - [ ] `FrameSink::disarm()` 是否丢弃已 arm 的 shot 并唤醒等待方？

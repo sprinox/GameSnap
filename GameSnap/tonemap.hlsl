@@ -103,15 +103,37 @@ static const float3x3 kLmsToRgb709 = {
     -0.0114500, -0.2650588, 1.2765739,
 };
 
-// libplacebo 的 spline 查找表：输入 PQ 码值，输出 PQ 码值。
-// 支点由 st2094_pick_knee 给出：无 HDR 元数据时 src_pivot = mix(in_min, in_max, 0.7)，
-// dst_pivot = mix(out_min, out_max, 0.7)，斜率为两者之比，再按 spline_contrast 微调；
-// 肩部/趾部是双曲段 y = slope*(x-piv)/(1+k*(x-piv)) + dst_piv。
-float tone_map_spline(float x, float in_max)
+// spline 曲线参数：每个 8x8 线程组算一次，组内共享（groupshared）。
+// 逐像素重算的话，8.3M 个线程就是 8.3M 次额外 pow；现在降到 ~13 万次。
+groupshared float4 g_curve0;  // src_pivot, dst_pivot, slope, pk
+groupshared float4 g_curve1;  // qk, out_min, out_max, unused
+
+// 曲线参数每个线程组只算一次（组内共享）。
+float eval_spline_curve(float x)
+{
+    const float src_pivot = g_curve0.x;
+    const float dst_pivot = g_curve0.y;
+    const float slope = g_curve0.z;
+    const float pk = g_curve0.w;
+    const float qk = g_curve1.x;
+    const float out_min = g_curve1.y;
+    const float out_max = g_curve1.z;
+
+    const float d = x - src_pivot;
+    const float y = slope * d / (1.0 + (d > 0.0 ? qk : pk) * d) + dst_pivot;
+    return clamp(y, out_min, out_max);
+}
+
+// st2094_pick_knee + spline_contrast，组内线程 0 调用一次。
+void compute_spline_curve()
 {
     const float in_min = 0.0;
     const float out_min = 0.0;
     const float out_max = nits_to_pq(max(SdrWhite, 1.0));
+
+    // 本帧峰值：peak pass 已经把 10-bit PQ 码值写进 Peak[0]，这里只做上限保护。
+    const float peak_pq = min(Peak[0] / 1023.0, nits_to_pq(max(PeakNits, 1.0)));
+    const float in_max = max(nits_to_pq(max(SdrWhite, 1.0)), peak_pq);
 
     // st2094_pick_knee（默认 knee=0.7，无场景平均亮度）
     const float src_pivot = lerp(in_min, in_max, 0.7);
@@ -127,16 +149,15 @@ float tone_map_spline(float x, float in_max)
     const float in_span_max = in_max - src_pivot;
     const float out_span_min = out_min - dst_pivot;
     const float out_span_max = out_max - dst_pivot;
-    const float pk = (slope * in_span_min - out_span_min) / (out_span_min * in_span_min);
-    const float qk = (slope * in_span_max - out_span_max) / (out_span_max * in_span_max);
 
-    const float d = x - src_pivot;
-    const float y = slope * d / (1.0 + (d > 0.0 ? qk : pk) * d) + dst_pivot;
-    return clamp(y, out_min, out_max);
+    g_curve0 = float4(src_pivot, dst_pivot, slope,
+                      (slope * in_span_min - out_span_min) / (out_span_min * in_span_min));
+    g_curve1 = float4((slope * in_span_max - out_span_max) / (out_span_max * in_span_max),
+                      out_min, out_max, 0.0);
 }
 
 // 线性 RGB（相对 100 nit 白）→ SDR 线性 RGB（显示白 = 1.0）。
-float3 tone_map_ipt(float3 rgb, float in_max)
+float3 tone_map_ipt(float3 rgb)
 {
     // 线性 → LMS → PQ → IPT
     const float3 lms = mul(kRgbToLms709, rgb);
@@ -144,7 +165,7 @@ float3 tone_map_ipt(float3 rgb, float in_max)
     float3 ipt = mul(kLmsToIpt, lmspq);
 
     const float i_orig = ipt.x;
-    ipt.x = tone_map_spline(i_orig, in_max);
+    ipt.x = eval_spline_curve(i_orig);
 
     // libplacebo：提亮时别把饱和度一起抬起来，压暗时按色域体积收缩色度。
     float2 hull = float2(i_orig, ipt.x);
@@ -157,33 +178,51 @@ float3 tone_map_ipt(float3 rgb, float in_max)
     return mul(kLmsToRgb709, lms2);
 }
 
-// analysis 的 false color：400 nit 以下按亮度做灰阶，400 nit 以上按对数刻度把色相
-// 从蓝(240°)连续过渡到红(0°)，中间没有任何分级色带。
-float3 hsv_to_rgb(float3 hsv)
+// analysis 的 false color：100 nit 以下灰阶，以上按nit 连续变色。
+// 分档和配色照抄 lilium 的 ReShade_HDR_shaders（lilium__include/hdr_and_sdr_analysis/
+// luminance.fxh 的 HeatmapRgbValues，10000 nit 档）：
+//   灰 → 绿 → 黄 → 红 → 粉 → 蓝，档位 100 / 203 / 400 / 1000 / 4000 / 10000 nit，档间线性插值。
+// 注意：输出目标是 UNORM，>10000 nit 的溢出标记（6.25 红）会被钳成纯红。
+float heatmap_fade_in(float y, float from, float to)
 {
-    const float3 p = abs(frac(hsv.xxx + float3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
-    return hsv.z * lerp(float3(1.0, 1.0, 1.0), saturate(p - 1.0), hsv.y);
+    return (y - from) / (to - from);
+}
+float heatmap_fade_out(float y, float from, float to)
+{
+    return 1.0 - heatmap_fade_in(y, from, to);
 }
 
 float3 analysis_colormap(float nits)
 {
-    const float knee = 400.0;                       // 灰/彩分界
-    const float top = 10000.0;                      // 色相走到红的上限
-    const float gray = pow(saturate(nits / knee), 1.0 / 2.2) * 0.6;   // 暗部也能看清
-    const float3 gray_rgb = float3(gray, gray, gray);
-
-    // 400 → 10000 nit：对数刻度（人眼与显示亮度都是对数感知），色相 240° → 0°。
-    // 用 saturate + lerp 而不是 if/return：整条曲线处处连续，也不会有分支发散。
-    const float t = saturate(log2(max(nits, 1e-4) / knee) / log2(top / knee));
-    const float3 color = hsv_to_rgb(float3((240.0 - 240.0 * t) / 360.0, 1.0, 1.0));
-    // 分界处 50 nit 内与灰阶插值，避免硬跳变
-    const float blend = saturate((nits - knee) / 50.0);
-    return lerp(gray_rgb, color, blend);
+    float3 output = float3(0.0, 0.0, 0.0);
+    if (nits < 0.0)
+        output = float3(0.0, 0.0, 6.25);
+    else if (nits <= 100.0)
+        output = float3(nits / 100.0 * 0.25, nits / 100.0 * 0.25, nits / 100.0 * 0.25);
+    else if (nits <= 203.0)
+        output = float3(0.0, 1.0, heatmap_fade_out(nits, 100.0, 203.0));
+    else if (nits <= 400.0)
+        output = float3(heatmap_fade_in(nits, 203.0, 400.0), 1.0, 0.0);
+    else if (nits <= 1000.0)
+        output = float3(1.0, heatmap_fade_out(nits, 400.0, 1000.0), 0.0);
+    else if (nits <= 4000.0)
+        output = float3(1.0, 0.0, heatmap_fade_in(nits, 1000.0, 4000.0));
+    else if (nits <= 10000.0)
+        output = float3(heatmap_fade_out(nits, 4000.0, 10000.0), 0.0, 1.0);
+    else
+        output = float3(6.25, 0.0, 0.0);
+    return output;
 }
 
 [numthreads(8, 8, 1)]
-void main(uint3 tid : SV_DispatchThreadID)
+void main(uint3 tid : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 {
+    // 曲线参数每个线程组只算一次（组内共享）。
+    // 注意：同步必须放在任何提前 return 之前，否则组内会有一部分线程跳过屏障。
+    if (gi == 0)
+        compute_spline_curve();
+    GroupMemoryBarrierWithGroupSync();
+
     if (tid.x >= Width || tid.y >= Height)
         return;
 
@@ -210,18 +249,18 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 nits = bt2020_to_709(nits2020);
     float luma = dot(nits, float3(0.2126, 0.7152, 0.0722));
     if (Algo == 1) {
+        // lilium 的 HeatmapRgbValues 输出的是**线性**光；他那边随后还有一步
+        // MapBt709IntoCurrentCsp（含 gamma 编码）。我们直接写 SDR 缓冲，所以必须自己做
+        // 一次线性→sRGB，否则灰阶 0.25 会被当成 sRGB 0.25 显示，看起来明显偏暗。
         // CPU 侧按 BGRA 读回，调试路径也必须按 BGRA 写出，否则红蓝互换。
-        Out[tid.xy] = float4(analysis_colormap(luma).bgr, 1.0);
+        Out[tid.xy] = float4(linear_to_srgb(analysis_colormap(luma)).bgr, 1.0);
         return;
     }
 
-    // 本帧峰值：peak pass 已经把 10-bit PQ 码值写进 Peak[0]，这里只做上限保护。
-    const float peak_pq = min(Peak[0] / 1023.0, nits_to_pq(max(PeakNits, 1.0)));
-    const float in_max = max(nits_to_pq(max(SdrWhite, 1.0)), peak_pq);
-
+    // 曲线参数已由组内线程 0 算好（groupshared），这里不再每像素重算支点/斜率。
     // tone map 走 libplacebo 的 IPT + spline + hull 这条链；输出线性 RGB（显示白 = 1.0）。
     // tone_map_ipt 返回的是相对 100 nit 白的值，这里按显示器 SDR 白点归一化。
-    const float3 sdr = tone_map_ipt(nits * 0.01, in_max) * (100.0 / max(SdrWhite, 1.0));
+    const float3 sdr = tone_map_ipt(nits * 0.01) * (100.0 / max(SdrWhite, 1.0));
     // 直接按 BGRA 写出，CPU 侧可以整行 memcpy，省一次全帧 swizzle。
     Out[tid.xy] = float4(linear_to_srgb(sdr).bgr, 1.0);
 }

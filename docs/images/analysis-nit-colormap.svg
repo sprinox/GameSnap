@@ -1,19 +1,20 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="330" viewBox="0 0 1200 330" font-family="Microsoft YaHei, Segoe UI, SimHei, Noto Sans CJK SC, sans-serif">
-  <rect width="1200" height="330" fill="#12141a"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="350" viewBox="0 0 1200 350" font-family="Microsoft YaHei, Segoe UI, SimHei, Noto Sans CJK SC, sans-serif">
+  <rect width="1200" height="350" fill="#12141a"/>
 
   <text x="40" y="42" fill="#f0f3f8" font-size="19">GameSnap analysis：nit 与颜色的对应关系</text>
   <text x="40" y="70" fill="#969eaa" font-size="14">配色取自 lilium 的 ReShade HDR analysis（10000 nit 档），已按 sRGB 编码显示；横轴为对数刻度</text>
 
   <defs>
     <linearGradient id="ramp" x1="40" y1="0" x2="1160" y2="0" gradientUnits="userSpaceOnUse">
+      <!-- 灰阶：linear = nits/100 × 0.25，再转 sRGB -->
       <stop offset="0.0000" stop-color="#010101"/>
       <stop offset="0.4000" stop-color="#2C2C2C"/>
       <stop offset="0.5398" stop-color="#636363"/>
       <stop offset="0.5806" stop-color="#7C7C7C"/>
       <stop offset="0.6000" stop-color="#898989"/>
-      <stop offset="0.6158" stop-color="#00FFE8"/>
+      <!-- 100 nit 处是硬跳变：灰 #898989 → 青 #00FFFF（代码里没有过渡带） -->
+      <stop offset="0.6000" stop-color="#00FFFF"/>
       <stop offset="0.6352" stop-color="#00FFBE"/>
-      <stop offset="0.6511" stop-color="#00FF82"/>
       <stop offset="0.6615" stop-color="#00FF00"/>
       <stop offset="0.6796" stop-color="#86FF00"/>
       <stop offset="0.7010" stop-color="#CBFF00"/>
@@ -35,7 +36,7 @@
 
   <!-- 100 nit 分界：offset 0.6 → x = 712 -->
   <line x1="712" y1="84" x2="712" y2="198" stroke="#f5f5f5" stroke-width="2"/>
-  <text x="722" y="80" fill="#f5f5f5" font-size="15">100 nit 分界（以下灰阶）</text>
+  <text x="722" y="80" fill="#f5f5f5" font-size="15">100 nit 分界（硬跳变：灰 → 青）</text>
 
   <g fill="#e4e8f0" font-size="16" text-anchor="middle">
     <line x1="40"   y1="192" x2="40"   y2="199" stroke="#cdd2dc"/><text x="40"   y="220">0.1</text>
@@ -49,6 +50,7 @@
   </g>
   <text x="600" y="252" fill="#969eaa" font-size="14" text-anchor="middle">亮度（nit，对数刻度）</text>
 
-  <text x="40" y="282" fill="#b6bec4" font-size="14">灰阶：0 – 100 nit，nits/100 × 0.25 线性光再转 sRGB（100 nit → #898989）</text>
-  <text x="40" y="304" fill="#b6bec4" font-size="14">彩色：100 → 蓝绿 → 绿(203) → 黄(400) → 红(1000) → 粉(4000) → 蓝(10000)，档间线性插值</text>
+  <text x="40" y="282" fill="#b6bec4" font-size="14">灰阶：0 – 100 nit，nits/100 × 0.25 线性光再转 sRGB（0 → #010101，50 → #636363，100 → #898989）</text>
+  <text x="40" y="304" fill="#b6bec4" font-size="14">彩色：100 青 → 绿(203) → 黄(400) → 红(1000) → 粉(4000) → 蓝(10000)，档间线性插值，无分级色带</text>
+  <text x="40" y="326" fill="#b6bec4" font-size="14">超出范围：&gt;10000 nit 输出溢出标记（线性 6.25 红），在 UNORM 目标上被钳成纯红；&lt;0 输出深蓝</text>
 </svg>

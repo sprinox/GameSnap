@@ -123,7 +123,10 @@ SDR 的 BGRA→BGRA 路径仍通过 `pixels.swap()` 避免一次整帧复制。
 
 CPU 回退走的是和 GPU 同一套数学（PQ 域 spline + IPT + hull 色度收缩），**没有查找表**：
 每张图先扫一遍取峰值，再逐像素算。因此也不存在缓存/释放的跨线程状态，
-编码线程之间不需要任何锁；代价是 4K 约几秒（只在 GPU 不可用时才会走到）。
+编码线程之间不需要任何锁；代价是 4K 约几秒。
+
+触发条件有两种：GPU 色调映射不可用/失败，或者用户显式配置 `tone_map_backend: cpu`。
+例外：**`analysis`（false color）只实现了 GPU 版本**，CPU 后端仍然出 spline 的结果。
 
 ### 2.6 WGC pool/session 预创建
 

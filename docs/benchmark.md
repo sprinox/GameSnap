@@ -15,11 +15,12 @@
 - 保真度：用 ffmpeg 解码输出，和源图统一到 `gbrp10le`（HDR）或 `rgb24`（SDR）后算 PSNR，
   `inf` 表示逐字节一致。
 
-开启基准模式需要重新编译（默认不编入）：
+开启基准模式需要重新编译（默认不编入）。用 `CL=` 追加宏，**不要**用
+`/p:PreprocessorDefinitions=...`——那会覆盖工程里原有的 `NDEBUG;_CONSOLE;%(PreprocessorDefinitions)`：
 
 ```
 msbuild GameSnap.vcxproj /p:Configuration=Release /p:Platform=x64 ^
-    /p:PreprocessorDefinitions="GAMESNAP_ENABLE_BENCH=1"
+    /p:CL="/DGAMESNAP_ENABLE_BENCH=1"
 GameSnap.exe --bench <源.png> --out <输出目录>
 ```
 
@@ -57,7 +58,8 @@ GameSnap.exe --bench <源.png> --out <输出目录>
   **YUV 域**无损，8-bit RGB→YCbCr 往返必然丢精度，实测 52.9 dB。
 - **WebP 无损被 JXL 全面压制**：即使是最慢的 method=6（83 s / 8.87 MB），也比 jxl effort=5
   （5 s / 8.03 MB）又慢又大。
-- **HEIC 的 preset 基本没用**：fast/medium/slow 体积差 0.01%，时间也一样 → 永远用 fast。
+- **HEIC 的 preset 在无损模式下基本没用**（见 §6 的复核）：本次基准全部跑无损，fast/medium/slow
+  体积差 0.01%、时间也一样；但 preset **确实生效**，在有损模式下 veryslow 比 fast 小约 28%。
 - **avif aom speed=6 不划算**：比 speed=10 只小 7%，慢 4 倍。
 - **jxl effort 的边际收益**：e5→e6 省 1.4% 但要 +37% 时间（60 KB/s）；e6→e7 省 3.0% 要 +61%
   时间（55 KB/s）；e7→e9 只剩 3 KB/s。**e6 在 SDR 上没有性价比**，要么 e5 要么 e7（e7 只为极限体积）。
@@ -134,7 +136,7 @@ png_compression: 6     # 3.1 s / 10.81 MB
 | `jxl_effort: 9` | 比 e7 只小 2%，时间 5.5 倍 |
 | `heic` 作为 HDR 容器 | 只能是 8-bit PQ，51.8 dB，暗部会分层 |
 | `avif_speed: 6` | 比 10 只小 8%，慢 4~8 倍 |
-| `heic_preset: slow/medium` | 体积/时间与 fast 无差别 |
+| `heic_preset: slow/medium`（**仅无损模式**） | 无损模式下体积/时间与 fast 几乎无差别（有损模式仍值得调） |
 
 ## 5. 已知限制
 
@@ -143,3 +145,20 @@ png_compression: 6     # 3.1 s / 10.81 MB
   所以没有采用。
 - 上面的耗时是单张、冷启动后第一次编码，重复编码会略快（库内部有缓存）。
 - SDR/HDR 各只测了一张样张；`7.png` 复测过排序一致，换图可能导致个别排序变化（尤其 jxl e3 与 heic 接近）。
+- **gain map 的体积只能看量级**：基准里的 SDR 底图是 `pq_to_nits / 203 nit` 直接截断 + sRGB 编码，
+  没有走真实的 spline 色调映射；真实链路里 base 与 alt 的差异更小，文件会略小。
+
+## 6. HEIC preset 复核（2026-11 追加）
+
+第 2 节的“preset 基本没用”容易被误读成“preset 没传进去”，所以单独复核了一遍：
+
+1. `heif_encoder_list_parameters()` 输出：`quality, lossless, preset, tune, tu-intra-depth, complexity, chroma`
+   → `preset` 在列表里，名字正确。
+2. 设置后 `heif_encoder_get_parameter(encoder, "preset", ...)` 回读：请求 `veryslow` → 回读 `veryslow`；
+   请求 `fast` → 回读 `fast` → **参数确实被接受**。
+3. 有损（quality=90）对比：`fast` 5,920 字节，`veryslow` 4,262 字节 → **小 28%**，preset 生效。
+4. 无损（`heic_lossless: true`）对比：fast 10,841 / veryslow 10,752（0.8%），个别用例甚至 veryslow 更大。
+
+结论：x265 的 preset 主要影响有损量化下的率失真搜索，`qp=0` 时熵编码占主导，preset 收益被抹平。
+基准全部跑无损，所以看起来“没用”。**有损 HEIC 场景仍然值得把 preset 调到 slower/veryslow**；
+无损场景用 fast 就行。

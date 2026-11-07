@@ -99,8 +99,29 @@ jobs:
           foreach ($cfg in 'Debug', 'Release') {
             $dir = "GameSnap\x64\$cfg"
             if (-not (Test-Path "$dir\GameSnap.exe")) { throw "$cfg build output missing" }
-            & $sevenZip a -t7z -mx=9 -m0=lzma2:d=256m -mfb=273 -ms=on "GameSnap-x64-$cfg.7z" "$dir\*"
-            if ($LASTEXITCODE -ne 0) { throw "7z $cfg failed" }
+
+            # OutDir 里除了 exe/pdb，还有 FxCompile 的输出（tonemap*_cs.h、*.cso）。
+            # Release 只带 exe；Debug 额外带 pdb（调试用），两者都不带 .h 和 .cso。
+            # 中间产物（obj/pch/iobj/sarif）在 IntDir（GameSnap\GameSnap\x64\<cfg>），本来就不在包内。
+            $files = @('GameSnap.exe')
+            if ($cfg -eq 'Debug') { $files += 'GameSnap.pdb' }
+
+            $stage = Join-Path $env:RUNNER_TEMP "dist-$cfg"
+            Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $stage | Out-Null
+            foreach ($file in $files) {
+              if (-not (Test-Path "$dir\$file")) { throw "${cfg}: $file missing" }
+              Copy-Item "$dir\$file" $stage
+            }
+
+            $archive = Join-Path $env:GITHUB_WORKSPACE "GameSnap-x64-$cfg.7z"
+            Push-Location $stage
+            try {
+              & $sevenZip a -t7z -mx=9 -m0=lzma2:d=256m -mfb=273 -ms=on $archive @files
+              if ($LASTEXITCODE -ne 0) { throw "7z $cfg failed" }
+            } finally {
+              Pop-Location
+            }
           }
 
       - name: Create pre-release

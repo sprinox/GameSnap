@@ -31,6 +31,11 @@ namespace gamesnap {
 
         CodecOptions codec_options;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables): set once before encoder threads start
 
+        // 前向声明：这三个由配置推导的辅助函数定义在文件后面，但前面的编码路径要用。
+        avifCodecChoice avif_effective_choice();
+        char const* heic_chroma_name();
+        void jpeg_sampling_factors(int& y_h, int& y_v, int& c_h, int& c_v);
+
         constexpr std::uint32_t kMaxChannel10 = 1023;
 
         std::string_view format_name(ImageFormat format) {
@@ -474,20 +479,24 @@ namespace gamesnap {
             scratch.cinfo.in_color_space = JCS_RGB;
             jpeg_set_defaults(&scratch.cinfo);
             jpeg_set_quality(&scratch.cinfo, codec_options.jpeg_quality, TRUE);
-            for (int i = 0; i < scratch.cinfo.num_components; ++i) {
-                scratch.cinfo.comp_info[i].h_samp_factor = 1;
-                scratch.cinfo.comp_info[i].v_samp_factor = 1;
+            // 色度采样由配置决定：444（默认）/ 422 / 420。
+            int y_h = 1, y_v = 1, c_h = 1, c_v = 1;
+            jpeg_sampling_factors(y_h, y_v, c_h, c_v);
+            if (scratch.cinfo.num_components == 3) {
+                scratch.cinfo.comp_info[0].h_samp_factor = y_h;
+                scratch.cinfo.comp_info[0].v_samp_factor = y_v;
+                scratch.cinfo.comp_info[1].h_samp_factor = c_h;
+                scratch.cinfo.comp_info[1].v_samp_factor = c_v;
+                scratch.cinfo.comp_info[2].h_samp_factor = c_h;
+                scratch.cinfo.comp_info[2].v_samp_factor = c_v;
             }
             jpeg_start_compress(&scratch.cinfo, TRUE);
 
             while (scratch.cinfo.next_scanline < scratch.cinfo.image_height) {
                 auto const* src =
                     image.pixels.data() + static_cast<std::size_t>(scratch.cinfo.next_scanline) * image.stride;
-                for (std::uint32_t x = 0; x < image.width; ++x) {
-                    scratch.row[x * 3 + 0] = src[x * 4 + 2];
-                    scratch.row[x * 3 + 1] = src[x * 4 + 1];
-                    scratch.row[x * 3 + 2] = src[x * 4 + 0];
-                }
+                // 复用 AVX2 的 BGRA→RGB（和 PNG/JXL 同一条路径），别再用逐像素循环。
+                bgra_to_rgb_row(src, scratch.row.data(), image.width);
                 JSAMPROW row_pointer = scratch.row.data();
                 jpeg_write_scanlines(&scratch.cinfo, &row_pointer, 1);
             }
@@ -578,20 +587,10 @@ namespace gamesnap {
             encoder->qualityGainMap = avif_quality;
 
             // AV1 编码库：配置指定了就用它，但库里没编进去时回落到 AUTO，而不是整张图失败。
-            switch (codec_options.av1_encoder) {
-            case Av1Encoder::Aom:
-                encoder->codecChoice = AVIF_CODEC_CHOICE_AOM;
-                break;
-            case Av1Encoder::Svt:
-                encoder->codecChoice = AVIF_CODEC_CHOICE_SVT;
-                break;
-            case Av1Encoder::Auto:
-                break;
-            }
-            if (encoder->codecChoice != AVIF_CODEC_CHOICE_AUTO &&
-                avifCodecName(encoder->codecChoice, AVIF_CODEC_FLAG_CAN_ENCODE) == nullptr) {
+            encoder->codecChoice = avif_effective_choice();
+            if (encoder->codecChoice == AVIF_CODEC_CHOICE_AUTO &&
+                codec_options.av1_encoder != Av1Encoder::Auto) {
                 SPDLOG_WARN("libavif 未内置 AV1 编码器 {}，回退 auto", to_string(codec_options.av1_encoder));
-                encoder->codecChoice = AVIF_CODEC_CHOICE_AUTO;
             }
             // 各库专属参数；-1 表示交给 avif_speed（libavif 会映射成 cpu-used / preset）。
             if (codec_options.aom_cpu_used >= 0) {
@@ -625,10 +624,41 @@ namespace gamesnap {
             return ok;
         }
 
-        // libavif 的 SVT 插件只接受 4:2:0；选 svt 时降到 420，其余情况保持无损的 4:4:4。
+        // 配置里选的 AV1 编码器 → 实际会用的编码器：库里没编进去就回落 AUTO。
+        // 像素格式和 encoder->codecChoice 都以它为准，避免"图像按 4:2:0 建、实际跑 aom 444"这类错配。
+        avifCodecChoice avif_effective_choice() {
+            switch (codec_options.av1_encoder) {
+            case Av1Encoder::Aom:
+                if (avifCodecName(AVIF_CODEC_CHOICE_AOM, AVIF_CODEC_FLAG_CAN_ENCODE) != nullptr)
+                    return AVIF_CODEC_CHOICE_AOM;
+                break;
+            case Av1Encoder::Svt:
+                if (avifCodecName(AVIF_CODEC_CHOICE_SVT, AVIF_CODEC_FLAG_CAN_ENCODE) != nullptr)
+                    return AVIF_CODEC_CHOICE_SVT;
+                break;
+            case Av1Encoder::Auto:
+                return AVIF_CODEC_CHOICE_AUTO;
+            }
+            return AVIF_CODEC_CHOICE_AUTO;  // 配置的编码器不可用
+        }
+
+        // 色度采样：SVT 插件只接受 4:2:0，其余按配置（auto = 4:4:4，无损场景首选）。
         avifPixelFormat avif_yuv_format() {
-            return codec_options.av1_encoder == Av1Encoder::Svt ? AVIF_PIXEL_FORMAT_YUV420
-                                                               : AVIF_PIXEL_FORMAT_YUV444;
+            if (avif_effective_choice() == AVIF_CODEC_CHOICE_SVT)
+                return AVIF_PIXEL_FORMAT_YUV420;
+            // 无损必须 4:4:4，否则 RGB→YCbCr 抽样那一步就丢了信息（启动时已告警）。
+            if (codec_options.avif_lossless)
+                return AVIF_PIXEL_FORMAT_YUV444;
+            switch (codec_options.chroma) {
+            case ChromaSubsampling::Yuv422:
+                return AVIF_PIXEL_FORMAT_YUV422;
+            case ChromaSubsampling::Yuv420:
+                return AVIF_PIXEL_FORMAT_YUV420;
+            case ChromaSubsampling::Auto:
+            case ChromaSubsampling::Yuv444:
+                break;
+            }
+            return AVIF_PIXEL_FORMAT_YUV444;
         }
 
         bool avif_from_bgra(std::filesystem::path const& path, Image const& image, bool hdr, std::string& error) {
@@ -872,12 +902,51 @@ namespace gamesnap {
                 error = fmt::format("HEVC 编码器不可用: {}", result.message ? result.message : "unknown");
                 return nullptr;
             }
-            heif_encoder_set_lossy_quality(encoder, codec_options.heic_quality);
-            heif_encoder_set_parameter_string(encoder, "chroma", "444");
-            heif_encoder_set_parameter_string(encoder, "preset", std::string(codec_options.heic_preset).c_str());
+            // libheif 的这些 setter 失败不影响编码能否继续，但会让配置悄悄不生效，所以记录一次。
+            const auto check = [](heif_error const& result, char const* what) {
+                if (result.code != heif_error_Ok)
+                    SPDLOG_WARN("HEIC 设置 {} 失败: {}", what, result.message ? result.message : "unknown");
+            };
+            check(heif_encoder_set_lossy_quality(encoder, codec_options.heic_quality), "quality");
+            check(heif_encoder_set_parameter_string(encoder, "chroma", heic_chroma_name()), "chroma");
+            check(heif_encoder_set_parameter_string(encoder, "preset", std::string(codec_options.heic_preset).c_str()),
+                  "preset");
             if (codec_options.heic_lossless)
-                heif_encoder_set_lossless(encoder, 1);
+                check(heif_encoder_set_lossless(encoder, 1), "lossless");
             return encoder;
+        }
+
+        // 色度采样 → libheif 的 chroma 参数名；auto 保持 4:4:4（保留 UI 文字/细线）。
+        char const* heic_chroma_name() {
+            // 无损必须 4:4:4（启动时已告警）。
+            if (codec_options.heic_lossless)
+                return "444";
+            switch (codec_options.chroma) {
+            case ChromaSubsampling::Yuv422:
+                return "422";
+            case ChromaSubsampling::Yuv420:
+                return "420";
+            case ChromaSubsampling::Auto:
+            case ChromaSubsampling::Yuv444:
+                break;
+            }
+            return "444";
+        }
+
+        // 色度采样 → JPEG 的采样因子（Y 与 Cb/Cr 各自）。
+        void jpeg_sampling_factors(int& y_h, int& y_v, int& c_h, int& c_v) {
+            y_h = 1, y_v = 1, c_h = 1, c_v = 1;
+            switch (codec_options.chroma) {
+            case ChromaSubsampling::Yuv422:
+                y_h = 2, y_v = 1;
+                break;
+            case ChromaSubsampling::Yuv420:
+                y_h = 2, y_v = 2;
+                break;
+            case ChromaSubsampling::Auto:
+            case ChromaSubsampling::Yuv444:
+                break;
+            }
         }
 
         bool heic_from_bgra(std::filesystem::path const& path, Image const& image, std::string& error) {
@@ -1157,6 +1226,13 @@ namespace gamesnap {
         SPDLOG_INFO("AV1 编码器: libavif 支持 aom={} svt={}（默认 auto={}），配置选择 {}",
                     aom.empty() ? "否" : "是", svt.empty() ? "否" : "是",
                     name_of(AVIF_CODEC_CHOICE_AUTO), to_string(options.av1_encoder));
+        // 无损与色度抽样冲突时以无损为准，这里提前说清楚，免得看文件时才发现采样被强制改回 444。
+        if (options.chroma != ChromaSubsampling::Auto && options.chroma != ChromaSubsampling::Yuv444) {
+            if (options.avif_lossless)
+                SPDLOG_WARN("AVIF 无损固定 4:4:4，忽略 chroma_subsampling={}", to_string(options.chroma));
+            if (options.heic_lossless)
+                SPDLOG_WARN("HEIC 无损固定 4:4:4，忽略 chroma_subsampling={}", to_string(options.chroma));
+        }
     }
 
     std::string_view to_string(ImageFormat format) {
@@ -1182,6 +1258,32 @@ namespace gamesnap {
             return Av1Encoder::Aom;
         if (text == "svt" || text == "svt-av1" || text == "svtav1")
             return Av1Encoder::Svt;
+        return std::nullopt;
+    }
+
+    std::string_view to_string(ChromaSubsampling chroma) {
+        switch (chroma) {
+        case ChromaSubsampling::Auto:
+            return "auto";
+        case ChromaSubsampling::Yuv444:
+            return "444";
+        case ChromaSubsampling::Yuv422:
+            return "422";
+        case ChromaSubsampling::Yuv420:
+            return "420";
+        }
+        return "unknown";
+    }
+
+    std::optional<ChromaSubsampling> parse_chroma_subsampling(std::string_view text) {
+        if (text == "auto")
+            return ChromaSubsampling::Auto;
+        if (text == "444" || text == "4:4:4")
+            return ChromaSubsampling::Yuv444;
+        if (text == "422" || text == "4:2:2")
+            return ChromaSubsampling::Yuv422;
+        if (text == "420" || text == "4:2:0")
+            return ChromaSubsampling::Yuv420;
         return std::nullopt;
     }
 

@@ -84,6 +84,15 @@ namespace gamesnap {
         Svt,
     };
 
+    // YUV 色度采样。auto = 各编码器自己的默认（AVIF/HEIC/JPEG 都是 4:4:4 优先）。
+    // 只对走 YCbCr 的编码器有效：PNG/BMP/JXL/WebP 无损是 RGB，WebP 有损固定 4:2:0。
+    enum class ChromaSubsampling : std::uint8_t {
+        Auto = 0,
+        Yuv444,
+        Yuv422,
+        Yuv420,
+    };
+
     enum class ToneMapBackend : std::uint8_t {
         Auto = 0,
         Gpu,
@@ -99,6 +108,8 @@ namespace gamesnap {
     std::optional<ImageFormat> parse_image_format(std::string_view text);
     std::string_view to_string(Av1Encoder encoder);
     std::optional<Av1Encoder> parse_av1_encoder(std::string_view text);
+    std::string_view to_string(ChromaSubsampling chroma);
+    std::optional<ChromaSubsampling> parse_chroma_subsampling(std::string_view text);
     std::wstring_view image_extension(ImageFormat format);
     // HDR 容器：AVIF / HEIC / JXL；其余格式只输出 SDR。
     bool format_supports_hdr(ImageFormat format);
@@ -130,6 +141,9 @@ namespace gamesnap {
         Av1Encoder av1_encoder = Av1Encoder::Auto;
         int aom_cpu_used = -1;  // 0..8，aom -cpu-used
         int svt_preset = -1;    // 0..13，SVT-AV1 preset
+
+        // YUV 色度采样（AVIF / HEIC / JPEG 生效）。默认 auto = 4:4:4，保留 UI 文字和细线。
+        ChromaSubsampling chroma = ChromaSubsampling::Auto;
     };
 
     // 写入 EXIF 的截图信息；时间格式为 YYYY:MM:DD HH:MM:SS。

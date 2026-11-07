@@ -202,7 +202,7 @@ namespace gamesnap {
         }
 
         bool is_known_config_key(std::string_view key) {
-            constexpr std::array<std::string_view, 27> keys{
+            constexpr std::array<std::string_view, 28> keys{
                 "output_dir", "encode_threads", "hotkey", "swallow", "monitor",
                 "format_hdr", "format_sdr", "tone_map", "tone_map_backend", "verbose",
                 "png_compression", "jpeg_quality",
@@ -210,7 +210,8 @@ namespace gamesnap {
                 "avif_quality", "avif_lossless", "avif_speed",
                 "heic_quality", "heic_lossless", "heic_preset",
                 "jxl_distance", "jxl_lossless", "jxl_effort",
-                "av1_encoder", "aom_cpu_used", "svt_preset"};
+                "av1_encoder", "aom_cpu_used", "svt_preset",
+                "chroma_subsampling"};
             return std::ranges::find(keys, key) != keys.end();
         }
 
@@ -326,6 +327,14 @@ namespace gamesnap {
                     }
                     read_range("aom_cpu_used", -1, 8, parsed.codec.aom_cpu_used);
                     read_range("svt_preset", -1, 13, parsed.codec.svt_preset);
+                    // 色度采样：AVIF / HEIC / JPEG 生效（PNG/BMP/JXL/WebP 无损是 RGB，WebP 有损固定 4:2:0）。
+                    if (const auto text = read_key<std::string>(root, "chroma_subsampling"); text) {
+                        const auto chroma = parse_chroma_subsampling(*text);
+                        if (!chroma)
+                            throw ConfigError(
+                                fmt::format("chroma_subsampling 只支持 auto / 444 / 422 / 420，实际为 {}", *text));
+                        parsed.codec.chroma = *chroma;
+                    }
                     if (const auto text = read_key<std::string>(root, "monitor"); text) {
                         if (*text == "primary")
                             parsed.monitor = MonitorChoice::Primary;
@@ -818,10 +827,11 @@ namespace gamesnap {
                     config.codec.png_compression, config.codec.jpeg_quality,
                     config.codec.webp_quality, config.codec.webp_lossless, config.codec.webp_method);
         SPDLOG_INFO("编码参数: AVIF quality={} lossless={} speed={} 编码库={} aom_cpu_used={} svt_preset={}；"
-                    "HEIC quality={} lossless={} preset={}",
+                    "HEIC quality={} lossless={} preset={}；色度采样={}",
                     config.codec.avif_quality, config.codec.avif_lossless, config.codec.avif_speed,
                     to_string(config.codec.av1_encoder), config.codec.aom_cpu_used, config.codec.svt_preset,
-                    config.codec.heic_quality, config.codec.heic_lossless, config.codec.heic_preset);
+                    config.codec.heic_quality, config.codec.heic_lossless, config.codec.heic_preset,
+                    to_string(config.codec.chroma));
         SPDLOG_INFO("编码参数: JXL distance={:.2f} lossless={} effort={}",
                     config.codec.jxl_distance, config.codec.jxl_lossless, config.codec.jxl_effort);
         SPDLOG_INFO("采集模式: 按需(热键时 StartCapture)，HDR 由目标显示器决定");

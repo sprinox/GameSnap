@@ -88,6 +88,19 @@ namespace gamesnap {
             return;
         }
 
+        // 先把格式能力查清楚：R10G10B10A2 必须能当 UAV 写（HDR 输出）且能当 SRV 采样（SDR 输出），
+        // 否则后面的纹理创建会失败，只能回退 CPU 色调映射。这里给出明确原因，别让它静默降级。
+        UINT hdr_support = 0;
+        const HRESULT support_hr =
+            d3d_->device()->CheckFormatSupport(DXGI_FORMAT_R10G10B10A2_UNORM, &hdr_support);
+        constexpr UINT kNeeded = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_RENDER_TARGET |
+                                 D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW;
+        if (FAILED(support_hr) || (hdr_support & kNeeded) != kNeeded) {
+            error_ = fmt::format("该显卡不支持 10-bit UAV，HDR 走 CPU 色调映射（R10G10B10A2 支持位=0x{:X}）",
+                                 hdr_support);
+            return;
+        }
+
         if (FAILED(d3d_->device()->CreateComputeShader(kTonemapCS, sizeof(kTonemapCS), nullptr, shader_.put()))) {  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
             error_ = "CreateComputeShader 失败";
             return;

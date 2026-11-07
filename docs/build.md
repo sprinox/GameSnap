@@ -43,11 +43,13 @@ Release 默认启用 clang-tidy。机器上没有 `clang-tidy.exe` 时会在 `Mi
 ## 自检
 
 ```powershell
-.\GameSnap\x64\Release\GameSnap.exe --selftest --out .\test
+# 自检只在 Debug 构建里编进去（Release 为了体积把 -Selftest 相关代码编掉了）
+.\GameSnap\x64\Debug\GameSnap.exe --selftest --out .\test
 ```
 
 用合成纹理走完“staging → Map → 转换 → 编码 → 写盘”，不经过 WGC；输出格式取配置/命令行
-（`--format-sdr` / `--format-hdr`）。采集失败仍需看真实运行的日志。
+（`--format-sdr` / `--format-hdr`）。例外：HDR 用例的 SDR 伴生文件固定写 PNG，这样自检末尾的
+像素级校验（需要无损解码）在任何配置下都会执行。采集失败仍需看真实运行的日志。
 
 ## clang-format
 
@@ -88,7 +90,8 @@ $llvm    = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\
 ## 一键构建脚本
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Configuration Release -Rebuild -Tidy -Selftest
+# -Selftest 会把 Configuration 强制成 Debug（自检只在 Debug 里编），这里不用再写 -Configuration
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Rebuild -Tidy -Selftest
 ```
 
 - `-Format`：格式化 `GameSnap/*.h/*.cpp`

@@ -158,7 +158,9 @@ namespace gamesnap {
             foreground_hook_ = nullptr;
         }
         if (adapters_wait_ != nullptr) {
-            ::UnregisterWait(adapters_wait_);
+            // UnregisterWait 不等待在途回调；用 UnregisterWaitEx + INVALID_HANDLE_VALUE 同步等待，
+            // 否则回调可能拿着已经析构的 this 继续跑。
+            ::UnregisterWaitEx(adapters_wait_, INVALID_HANDLE_VALUE);
             adapters_wait_ = nullptr;
         }
         if (adapters_factory_ && adapters_cookie_ != 0) {
@@ -289,8 +291,8 @@ namespace gamesnap {
     void CALLBACK SystemEventThread::adapters_changed_proc(PVOID context, BOOLEAN timed_out) {
         (void)timed_out;
         auto* self = static_cast<SystemEventThread*>(context);
-        if (self == nullptr)
-            return;
+        if (self == nullptr || self->stop_.load(std::memory_order_acquire))
+            return;  // 已经在收尾了，别再往队列里塞命令
         // 线程池线程：只投递命令，不碰任何界面/设备资源。
         SPDLOG_INFO("显卡/适配器发生变化，触发捕获资源重建");
         self->post(CommandKind::Reload, ReloadReason::DeviceChange);

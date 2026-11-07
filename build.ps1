@@ -11,6 +11,13 @@ $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 $project = Join-Path $root "GameSnap\GameSnap.vcxproj"
 
+# 自检代码只在 Debug 里编进来（见 selftest.h 的 GAMESNAP_SELFTEST）。
+# 想跑 -Selftest 就必须构建 Debug，否则会出现"构建 Release、却运行上次遗留的 Debug exe"。
+if ($Selftest -and $Configuration -ne 'Debug') {
+    Write-Host "Selftest 需要 Debug 构建，Configuration 已从 $Configuration 改为 Debug"
+    $Configuration = 'Debug'
+}
+
 function Find-MSBuild {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
     if (Test-Path $vswhere) {
@@ -86,8 +93,9 @@ if ($Tidy) {
 }
 
 if ($Selftest) {
-    $exe = Join-Path $root "GameSnap\x64\$Configuration\GameSnap.exe"
-    if (-not (Test-Path $exe)) { throw "GameSnap.exe not found: $exe" }
+    # Configuration 已在脚本开头被强制成 Debug，这里构建与运行的是同一个二进制。
+    $exe = Join-Path $root "GameSnap\x64\Debug\GameSnap.exe"
+    if (-not (Test-Path $exe)) { throw "GameSnap.exe not found: $exe（Debug 构建失败？）" }
     $out = Join-Path $root "build-selftest"
     Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Path $out | Out-Null

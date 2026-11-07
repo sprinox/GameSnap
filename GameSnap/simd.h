@@ -30,4 +30,7 @@ namespace gamesnap {
     // RGBA16 → 紧凑 RGB16（丢掉 alpha），每像素 6 字节。AVX2 一次 4 像素。
     void rgba16_to_rgb16_row(std::uint16_t const* src, std::uint16_t* dst, std::size_t pixels);
 
+    // 10-bit（0..1023，越界会被钳位）→ 8-bit 的按比例缩放。
+    void rgba10_to_rgba8(std::uint16_t const* src, std::uint8_t* dst, std::size_t count);
+
 }  // namespace gamesnap

@@ -29,6 +29,8 @@ namespace gamesnap {
         std::uint32_t bits_per_color = 8;
         std::uint32_t sdr_white_nits = 80;
         std::wstring adapter_name;
+        // select_monitor 已经枚举过的 DXGI 输出；D3DContext::create 复用它，避免二次枚举。
+        DxgiOutputInfo dxgi;
     };
 
     bool monitor_alive(HMONITOR monitor);

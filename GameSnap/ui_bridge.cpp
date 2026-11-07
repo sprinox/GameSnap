@@ -9,6 +9,20 @@ namespace gamesnap {
 
         constexpr std::uint32_t kThumbWidth = 320;
         constexpr std::uint32_t kThumbHeight = 180;
+        // 缩略图缓冲是 BGRA（和截图源同序），而 overlay 的占位块用 IM_COL32(R,G,B,A)=45,48,58。
+        // 想和占位块同色，这里必须按 BGRA 写 58,48,45。
+        constexpr std::uint8_t kLetterboxB = 58;
+        constexpr std::uint8_t kLetterboxG = 48;
+        constexpr std::uint8_t kLetterboxR = 45;
+
+        void fill_letterbox_row(std::uint8_t* dst, std::uint32_t width) {
+            for (std::uint32_t x = 0; x < width; ++x) {
+                dst[x * 4 + 0] = kLetterboxB;
+                dst[x * 4 + 1] = kLetterboxG;
+                dst[x * 4 + 2] = kLetterboxR;
+                dst[x * 4 + 3] = 255;
+            }
+        }
 
         void make_thumbnail(Image const& image, std::vector<std::uint8_t>& out,
                             std::uint32_t& width, std::uint32_t& height) {
@@ -23,12 +37,39 @@ namespace gamesnap {
             width = kThumbWidth;
             height = kThumbHeight;
             out.resize(static_cast<std::size_t>(width) * height * 4);
+
+            // 按源图宽高比等比缩放再居中（letterbox），4:3 / 16:10 屏不再被拉扁。
+            // 空白区域填面板底色，和 overlay 里"还没有缩略图"时的占位块一致。
+            const std::uint64_t by_width = static_cast<std::uint64_t>(width) * image.height;
+            const std::uint64_t by_height = static_cast<std::uint64_t>(height) * image.width;
+            std::uint32_t draw_width = width;
+            std::uint32_t draw_height = height;
+            if (by_width <= by_height)
+                draw_height = std::max(1U, static_cast<std::uint32_t>(by_width / image.width));
+            else
+                draw_width = std::max(1U, static_cast<std::uint32_t>(by_height / image.height));
+            const std::uint32_t offset_x = (width - draw_width) / 2;
+            const std::uint32_t offset_y = (height - draw_height) / 2;
+
             for (std::uint32_t y = 0; y < height; ++y) {
-                const std::uint32_t sy = std::min(image.height - 1, y * image.height / height);
-                auto const* src = image.pixels.data() + static_cast<std::size_t>(sy) * image.stride;
                 auto* dst = out.data() + static_cast<std::size_t>(y) * width * 4;
+                if (y < offset_y || y >= offset_y + draw_height) {
+                    fill_letterbox_row(dst, width);
+                    continue;
+                }
+                const std::uint32_t sy = std::min(
+                    image.height - 1, (y - offset_y) * image.height / draw_height);
+                auto const* src = image.pixels.data() + static_cast<std::size_t>(sy) * image.stride;
                 for (std::uint32_t x = 0; x < width; ++x) {
-                    const std::uint32_t sx = std::min(image.width - 1, x * image.width / width);
+                    if (x < offset_x || x >= offset_x + draw_width) {
+                        dst[x * 4 + 0] = kLetterboxB;
+                        dst[x * 4 + 1] = kLetterboxG;
+                        dst[x * 4 + 2] = kLetterboxR;
+                        dst[x * 4 + 3] = 255;
+                        continue;
+                    }
+                    const std::uint32_t sx = std::min(
+                        image.width - 1, (x - offset_x) * image.width / draw_width);
                     const auto* pixel = src + static_cast<std::size_t>(sx) * 4;
                     dst[x * 4 + 0] = pixel[0];
                     dst[x * 4 + 1] = pixel[1];

@@ -17,9 +17,6 @@
 namespace gamesnap {
     namespace {
 
-        // HDR 色调映射 LUT 的采样点数：只影响 LUT 内存（16 KB）和建表耗时。
-        constexpr std::size_t kToneLutSize = 16384;
-
         // 去掉 Windows 文件名里不允许的字符；空标题回退到 GameSnap。
         // 按值接收，直接原地修改后返回，省掉一次拷贝。
         std::wstring sanitize_filename(std::wstring title) {
@@ -29,7 +26,7 @@ namespace gamesnap {
                 if (invalid)
                     ch = L'_';
             }
-            const auto first = title.find_first_not_of(L" ."); // 把字符串开头和结尾的“空格”和“点”全部删掉
+            const auto first = title.find_first_not_of(L" .");  // 把字符串开头和结尾的“空格”和“点”全部删掉
             const auto last = title.find_last_not_of(L" .");
             if (first == std::wstring::npos)
                 title.clear();
@@ -131,35 +128,131 @@ namespace gamesnap {
             bool alpha_normalized = false;
         };
 
-        struct ToneLut {
-            bool pq = false;
-            std::uint32_t white = 0;
-            std::array<std::uint8_t, kToneLutSize> values{};
-        };
+        // ── 色调映射（与 tonemap.hlsl 逐行对应） ─────────────────────────────
+        // CPU 回退必须和 GPU 出一样的图，所以这里照抄 shader 的数学：
+        // PQ 域 spline + IPT 的 I 通道 + hull 色度收缩，矩阵和常量都一一对应。
 
-        struct ToneLutCache {
-            std::mutex mutex;
-            std::shared_ptr<const ToneLut> current;
-            // 快速判断是否为空；允许与 mutex 保护的 current 有短暂不一致，
-            // 只用于避免绝大多数 SDR job 拿锁。
-            std::atomic<bool> empty{true};
-        };
-
-        ToneLutCache& tone_lut_cache() {
-            static ToneLutCache cache;
-            return cache;
+        // nits → ST 2084 PQ 码值（对应 shader 的 nits_to_pq）。
+        inline float nits_to_pq(float nits) {
+            constexpr float m1 = 2610.0F / 16384.0F;
+            constexpr float m2 = 2523.0F / 4096.0F * 128.0F;
+            constexpr float c1 = 3424.0F / 4096.0F;
+            constexpr float c2 = 2413.0F / 4096.0F * 32.0F;
+            constexpr float c3 = 2392.0F / 4096.0F * 32.0F;
+            const float y = std::pow(std::clamp(nits / 10000.0F, 0.0F, 1.0F), m1);
+            return std::pow((c1 + (c2 * y)) / (1.0F + (c3 * y)), m2);
         }
 
-        // SDR job 结束时调用：表为空时直接返回，不拿锁。HDR job 不调用，表随之常驻。
-        void release_tone_lut() {
-            auto& cache = tone_lut_cache();
-            if (cache.empty.load(std::memory_order_acquire))
-                return;
-            std::scoped_lock lock(cache.mutex);
-            cache.current.reset();
-            cache.empty.store(true, std::memory_order_release);
+        struct Mat3 {
+            float m[9];
+        };
+
+        // 和 tonemap.hlsl 的 static const float3x3 完全一致（行主序）。
+        constexpr Mat3 kRgbToLms709{
+            {0.2957413F, 0.6230997F, 0.0811802F,
+             0.1561450F, 0.7272835F, 0.1165603F,
+             0.0350734F, 0.1565968F, 0.8082766F}};
+        constexpr Mat3 kLmsToIpt{
+            {0.4000000F, 0.4000000F, 0.2000000F,
+             4.4550000F, -4.8510000F, 0.3960000F,
+             0.8056000F, 0.3572000F, -1.1628000F}};
+        constexpr Mat3 kIptToLms{
+            {1.0000000F, 0.0975689F, 0.2052260F,
+             1.0000000F, -0.1138760F, 0.1332170F,
+             1.0000000F, 0.0326151F, -0.6768870F}};
+        constexpr Mat3 kLmsToRgb709{
+            {6.1728843F, -5.3203218F, 0.1472545F,
+             -1.3234594F, 2.5597126F, -0.2362089F,
+             -0.0114500F, -0.2650588F, 1.2765739F}};
+        constexpr Mat3 kSrgbToBt2020{
+            {0.6274F, 0.3293F, 0.0433F,
+             0.0691F, 0.9195F, 0.0114F,
+             0.0164F, 0.0880F, 0.8956F}};
+        constexpr Mat3 kBt2020To709{
+            {1.6605F, -0.5876F, -0.0728F,
+             -0.1246F, 1.1329F, -0.0083F,
+             -0.0182F, -0.1006F, 1.1187F}};
+
+        inline void mat3_mul(Mat3 const& mat, float const in[3], float out[3]) {
+            out[0] = (mat.m[0] * in[0]) + (mat.m[1] * in[1]) + (mat.m[2] * in[2]);
+            out[1] = (mat.m[3] * in[0]) + (mat.m[4] * in[1]) + (mat.m[5] * in[2]);
+            out[2] = (mat.m[6] * in[0]) + (mat.m[7] * in[1]) + (mat.m[8] * in[2]);
         }
 
+        // spline 曲线参数只依赖 (in_max, sdr_white)：每张图算一次，逐像素只求值。
+        struct SplineCurve {
+            float src_pivot = 0.0F;
+            float dst_pivot = 0.0F;
+            float slope = 1.0F;
+            float pk = 0.0F;
+            float qk = 0.0F;
+            float out_min = 0.0F;
+            float out_max = 1.0F;
+        };
+
+        // libplacebo 的 spline 曲线（PQ 域），参数与 shader 的 tone_map_spline 一致。
+        inline SplineCurve make_spline(float in_max, float sdr_white) {
+            constexpr float in_min = 0.0F;
+            constexpr float out_min = 0.0F;
+            SplineCurve curve;
+            curve.out_min = out_min;
+            curve.out_max = nits_to_pq(std::max(sdr_white, 1.0F));
+
+            curve.src_pivot = std::lerp(in_min, in_max, 0.7F);
+            float dst_pivot = std::lerp(out_min, curve.out_max, 0.7F);
+            dst_pivot = std::clamp(dst_pivot, std::lerp(out_min, curve.out_max, 0.1F),
+                                   std::lerp(out_min, curve.out_max, 0.9F));
+            curve.dst_pivot = dst_pivot;
+
+            float slope = (dst_pivot - out_min) / std::max(curve.src_pivot - in_min, 1e-6F);
+            const float ratio =
+                std::clamp((in_max / std::max(curve.out_max, 1e-6F)) - 1.0F, 0.0F, 1.0F);
+            slope = std::pow(std::max(slope, 1e-6F), (1.0F - 0.5F) * ratio);
+            curve.slope = slope;
+
+            const float in_span_min = in_min - curve.src_pivot;
+            const float in_span_max = in_max - curve.src_pivot;
+            const float out_span_min = out_min - dst_pivot;
+            const float out_span_max = curve.out_max - dst_pivot;
+            curve.pk = ((slope * in_span_min) - out_span_min) / (out_span_min * in_span_min);
+            curve.qk = ((slope * in_span_max) - out_span_max) / (out_span_max * in_span_max);
+            return curve;
+        }
+
+        inline float eval_spline(SplineCurve const& curve, float x) {
+            const float d = x - curve.src_pivot;
+            const float y =
+                ((curve.slope * d) / (1.0F + ((d > 0.0F ? curve.qk : curve.pk) * d))) + curve.dst_pivot;
+            return std::clamp(y, curve.out_min, curve.out_max);
+        }
+
+        // 线性 RGB（相对 100 nit 白）→ SDR 线性 RGB（显示白 = 1.0），对应 shader 的 tone_map_ipt。
+        inline void tone_map_ipt(float const rgb[3], SplineCurve const& curve, float out[3]) {
+            float lms[3];
+            mat3_mul(kRgbToLms709, rgb, lms);
+            float lmspq[3]{nits_to_pq(lms[0] * 100.0F), nits_to_pq(lms[1] * 100.0F),
+                           nits_to_pq(lms[2] * 100.0F)};
+            float ipt[3];
+            mat3_mul(kLmsToIpt, lmspq, ipt);
+
+            const float i_orig = ipt[0];
+            ipt[0] = eval_spline(curve, i_orig);
+
+            // hull：提亮时不抬饱和度，压暗时按色域体积收缩色度。
+            float hull[2]{i_orig, ipt[0]};
+            hull[0] = ((((hull[0] - 6.0F) * hull[0]) + 9.0F) * hull[0]);
+            hull[1] = ((((hull[1] - 6.0F) * hull[1]) + 9.0F) * hull[1]);
+            const float scale = std::min(i_orig / std::max(ipt[0], 1e-6F), hull[1] / std::max(hull[0], 1e-9F));
+            ipt[1] *= scale;
+            ipt[2] *= scale;
+
+            float lmspq2[3];
+            mat3_mul(kIptToLms, ipt, lmspq2);
+            float lms2[3]{pq_to_nits(std::clamp(lmspq2[0], 0.0F, 1.0F)) * 0.01F,
+                          pq_to_nits(std::clamp(lmspq2[1], 0.0F, 1.0F)) * 0.01F,
+                          pq_to_nits(std::clamp(lmspq2[2], 0.0F, 1.0F)) * 0.01F};
+            mat3_mul(kLmsToRgb709, lms2, out);
+        }
 
         // 统一成 32bpp BGRA（Image 定义在 image.h）。
 
@@ -199,12 +292,19 @@ namespace gamesnap {
                     error = "创建 HDR 回读 staging 失败";
                     return false;
                 }
+                // 拷贝完成后立刻记一个 fence：《锁外》等它，绝不在锁内等 GPU。
+                // 否则 4K 拷贝期间一直握着 context_mutex，capture 的 CopyResource 和其他
+                // 编码线程都会被堵住，而且没有超时兜底。
+                std::uint64_t copy_fence = 0;
                 {
                     std::scoped_lock lock(d3d.context_mutex());
                     d3d.context()->CopyResource(readback.get(), texture);
+                    copy_fence = d3d.signal_fence_locked();
                 }
                 texture = readback.get();
                 texture->GetDesc(&desc);
+                if (copy_fence != 0 && !d3d.wait_fence(copy_fence, std::chrono::seconds(5), error))
+                    return false;
             }
             const std::uint32_t bpp = bytes_per_pixel(desc.Format);
             if (desc.Width == 0 || desc.Height == 0 || bpp == 0) {
@@ -222,24 +322,17 @@ namespace gamesnap {
             raw.pixels.resize(static_cast<std::size_t>(raw.stride) * raw.height);
 
             D3D11_MAPPED_SUBRESOURCE mapped{};
-            const auto map_deadline = SteadyClock::now() + std::chrono::seconds(5);
-            for (;;) {
-                HRESULT hr = E_FAIL;
-                {
-                    std::scoped_lock lock(d3d.context_mutex());
-                    hr = d3d.context()->Map(texture, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
-                }
-                if (hr == S_OK)
-                    break;
-                if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
+            {
+                // 阻塞 Map：拷贝/渲染的完成已经由上面的 wait_fence 在锁外等到，
+                // 所以这里正常会立即返回，持锁时间只有一次 Map 调用。
+                // 之前用 DO_NOT_WAIT 轮询，在 NVIDIA 上即使 fence 已完成也会持续返回
+                // DXGI_ERROR_WAS_STILL_DRAWING，只能靠 sleep 轮询，白白浪费 10~20 ms。
+                std::scoped_lock lock(d3d.context_mutex());
+                const HRESULT hr = d3d.context()->Map(texture, 0, D3D11_MAP_READ, 0, &mapped);
+                if (FAILED(hr)) {
                     error = fmt::format("Map staging 纹理失败: {}", describe_hresult(hr));
                     return false;
                 }
-                if (SteadyClock::now() >= map_deadline) {
-                    error = "Map staging 纹理超时";
-                    return false;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             for (std::size_t y = 0; y < raw.height; ++y) {
                 auto const* src = static_cast<const std::uint8_t*>(mapped.pData) +
@@ -300,60 +393,72 @@ namespace gamesnap {
             }
 
             // FP16：HDR10(PQ) 或 scRGB 的色调映射到 SDR。
-            // 逐像素做 PQ EOTF + sRGB OETF（各含一次 pow）在 4K 上要一秒多，
-            // 所以先把“输入码值 → 8bit sRGB”预计算成 LUT，热路径上只查表。
+            // 走的是和 shader 完全相同的 spline + IPT 链路（见上面的 tone_map_ipt），
+            // 所以 GPU 失败回退到 CPU 时 SDR 结果不会变。
+            // 代价是每像素十几次 pow，比原来的逐通道 LUT 慢；只在 GPU 不可用时才会走到。
             const bool is_pq = color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
                                color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020;
             const float sdr_white = static_cast<float>(std::max<std::uint32_t>(sdr_white_nits, 1));
 
-            // PQ 的输入域是 [0,1]；scRGB 统一按 [0,4] 采样，超出部分当作白色。
-            const float domain = is_pq ? 1.0F : 4.0F;
+            std::vector<float> row_floats(static_cast<std::size_t>(raw.width) * 4);
 
-            // LUT 只依赖 (PQ/scRGB, SDR 白点)；全进程一份，用 shared_ptr 读取。
-            // 只有 HDR CPU 回退路径会构建它：HDR job 构建后缓存，SDR job 结束时由
-            // release_tone_lut() 释放（空表走 atomic 快路径，不拿锁）。
-            auto& lut_cache = tone_lut_cache();
-            const std::uint32_t white_key = std::max<std::uint32_t>(sdr_white_nits, 1);
-            std::shared_ptr<const ToneLut> lut;
-            {
-                std::scoped_lock lock(lut_cache.mutex);
-                if (!lut_cache.current || lut_cache.current->pq != is_pq ||
-                    lut_cache.current->white != white_key) {
-                    auto next = std::make_shared<ToneLut>();
-                    next->pq = is_pq;
-                    next->white = white_key;
-                    for (std::size_t i = 0; i < kToneLutSize; ++i) {
-                        const float value =
-                            static_cast<float>(i) / static_cast<float>(kToneLutSize - 1) * domain;
-                        const float linear = is_pq ? (pq_to_nits(value) / sdr_white)
-                                                   : (value * 80.0F / sdr_white);
-                        next->values[i] = linear_to_srgb8(linear);
-                    }
-                    lut_cache.current = std::move(next);
+            // Pass 1：峰值。GPU 用 peak pass 取“最大通道 → 10-bit PQ 码值”，这里做同样的事，
+            // 否则 CPU 和 GPU 的 in_max 不同，曲线就不同。
+            const auto load_row = [&](std::uint32_t y) {
+                const auto* src = reinterpret_cast<const std::uint16_t*>(
+                    raw.pixels.data() + (static_cast<std::size_t>(y) * raw.stride));
+                half_to_float_row(src, row_floats.data(), static_cast<std::size_t>(raw.width) * 4);
+            };
+            const auto pixel_nits_2020 = [is_pq](float const rgb[3], float out[3]) {
+                if (is_pq) {
+                    out[0] = pq_to_nits(rgb[0]);
+                    out[1] = pq_to_nits(rgb[1]);
+                    out[2] = pq_to_nits(rgb[2]);
+                } else {
+                    float scaled[3]{rgb[0] * 80.0F, rgb[1] * 80.0F, rgb[2] * 80.0F};
+                    mat3_mul(kSrgbToBt2020, scaled, out);
                 }
-                lut = lut_cache.current;
-                lut_cache.empty.store(false, std::memory_order_release);
-            }
-            const auto& table = lut->values;
-            const auto sample = [&table, domain](float value) -> std::uint8_t {
-                if (!(value > 0.0F))  // 同时拦掉 NaN
-                    return 0;
-                if (value >= domain)
-                    return table.back();
-                const auto index = static_cast<std::size_t>(value / domain * (kToneLutSize - 1));
-                return table[index];
             };
 
-            std::vector<float> row_floats(static_cast<std::size_t>(raw.width) * 4);
+            float peak_pq = 0.0F;
             for (std::uint32_t y = 0; y < raw.height; ++y) {
-                const auto* src = reinterpret_cast<const std::uint16_t*>(raw.pixels.data() + (static_cast<std::size_t>(y) * raw.stride));
-                half_to_float_row(src, row_floats.data(), static_cast<std::size_t>(raw.width) * 4);
+                load_row(y);
+                for (std::uint32_t x = 0; x < raw.width; ++x) {
+                    const float rgb[3]{row_floats[(static_cast<std::size_t>(x) * 4) + 0],
+                                       row_floats[(static_cast<std::size_t>(x) * 4) + 1],
+                                       row_floats[(static_cast<std::size_t>(x) * 4) + 2]};
+                    float nits2020[3];
+                    pixel_nits_2020(rgb, nits2020);
+                    const float m = std::max({nits2020[0], nits2020[1], nits2020[2], 0.0F});
+                    peak_pq = std::max(peak_pq, nits_to_pq(m));
+                }
+            }
+            // 和 shader 一样把峰值量化到 10-bit 码值，再和 SDR 白点取大。
+            const float peak_code = std::round(std::clamp(peak_pq, 0.0F, 1.0F) * 1023.0F) / 1023.0F;
+            const float in_max = std::max(nits_to_pq(sdr_white), peak_code);
+            const float white_scale = 100.0F / sdr_white;
+            const SplineCurve curve = make_spline(in_max, sdr_white);
+
+            // Pass 2：逐像素 tone map → sRGB → BGRA。
+            for (std::uint32_t y = 0; y < raw.height; ++y) {
+                load_row(y);
                 std::uint8_t* dst = out.pixels.data() + (static_cast<std::size_t>(y) * out.stride);
                 for (std::uint32_t x = 0; x < raw.width; ++x) {
+                    const float rgb[3]{row_floats[(static_cast<std::size_t>(x) * 4) + 0],
+                                       row_floats[(static_cast<std::size_t>(x) * 4) + 1],
+                                       row_floats[(static_cast<std::size_t>(x) * 4) + 2]};
+                    float nits2020[3];
+                    pixel_nits_2020(rgb, nits2020);
+                    // shader 里是 nits2020 → BT.709 → *0.01 再进 IPT，这里照做。
+                    float nits709[3];
+                    mat3_mul(kBt2020To709, nits2020, nits709);
+                    const float relative[3]{nits709[0] * 0.01F, nits709[1] * 0.01F, nits709[2] * 0.01F};
+                    float linear[3];
+                    tone_map_ipt(relative, curve, linear);
                     std::uint8_t* q = dst + (static_cast<std::size_t>(x) * 4);
-                    q[0] = sample(row_floats[static_cast<std::size_t>(x) * 4 + 2]);
-                    q[1] = sample(row_floats[static_cast<std::size_t>(x) * 4 + 1]);
-                    q[2] = sample(row_floats[static_cast<std::size_t>(x) * 4 + 0]);
+                    q[0] = linear_to_srgb8(linear[2] * white_scale);  // B
+                    q[1] = linear_to_srgb8(linear[1] * white_scale);  // G
+                    q[2] = linear_to_srgb8(linear[0] * white_scale);  // R
                     q[3] = 255;
                 }
             }
@@ -380,8 +485,7 @@ namespace gamesnap {
     EncodeWorkers::EncodeWorkers(std::filesystem::path output_dir, std::shared_ptr<EncodeQueue> jobs,
                                  CodecOptions options, ToneMapBackend tone_map_backend,
                                  std::shared_ptr<UiBridge> ui)
-        : output_dir_(std::move(output_dir)), jobs_(std::move(jobs)), ui_(std::move(ui)),
-          options_(options), tone_map_backend_(tone_map_backend) {
+        : output_dir_(std::move(output_dir)), jobs_(std::move(jobs)), ui_(std::move(ui)), options_(options), tone_map_backend_(tone_map_backend) {
         set_codec_options(options_);
     }
 
@@ -488,11 +592,6 @@ namespace gamesnap {
         U16Buffer hdr10;
         sdr.metadata.title = wstring_to_utf8(job.title);
         sdr.metadata.date_time = exif_date_time(job.local_time);
-        // LUT 保留既有策略：HDR job 缓存，SDR job 结束后释放；表为空时 atomic 快路径不拿锁。
-        auto lut_release = ScopeExit{[&] {
-            if (!job.hdr)
-                release_tone_lut();
-        }};
         std::string error;
         D3D11_TEXTURE2D_DESC texture_desc{};
         job.texture->GetDesc(&texture_desc);
@@ -527,6 +626,9 @@ namespace gamesnap {
                 return;
             }
         }
+        // 像素已经在 CPU 手里（或 GPU 路径已经采样完），这里就把全尺寸捕获纹理放掉：
+        // 队列积压时每张 4K FP16 纹理占 33 MiB，早放一刻就能少顶住一次显存峰值。
+        job.texture = nullptr;
         const auto mapped_at = SteadyClock::now();
 
         if (job.canceled && job.canceled->load(std::memory_order_acquire))

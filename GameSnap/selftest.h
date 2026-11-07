@@ -12,9 +12,9 @@
 // 自检只在 Debug 构建里编进去：Release 去掉那一整条合成纹理生成 + 独立编码链路能省二进制。
 // 需要时可以用 /DGAMESNAP_ENABLE_SELFTEST=1 在 Release 里强制打开。
 #if defined(_DEBUG) || defined(GAMESNAP_ENABLE_SELFTEST)
-#define GAMESNAP_SELFTEST 1
+#    define GAMESNAP_SELFTEST 1
 #else
-#define GAMESNAP_SELFTEST 0
+#    define GAMESNAP_SELFTEST 0
 #endif
 
 namespace gamesnap {

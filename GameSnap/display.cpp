@@ -183,6 +183,8 @@ namespace gamesnap {
         }
 
         const auto output = find_dxgi_output(monitor);
+        // 把已找到的适配器/输出留着：D3DContext::create 直接用，不必再枚举一次。
+        info.dxgi = output;
         if (output.adapter) {
             DXGI_ADAPTER_DESC adapter_desc{};
             if (SUCCEEDED(output.adapter->GetDesc(&adapter_desc)))

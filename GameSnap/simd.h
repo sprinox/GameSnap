@@ -5,9 +5,6 @@
 
 namespace gamesnap {
 
-    // BGRA8 → RGBA8。AVX2 一次处理 8 像素，尾部走标量。
-    void bgra_to_rgba_row(std::uint8_t const* src, std::uint8_t* dst, std::size_t pixels);
-
     // FP16 → FP32。F16C（AVX2 平台默认可用）一次转换 8 个 half。
     void half_to_float_row(std::uint16_t const* src, float* dst, std::size_t count);
 

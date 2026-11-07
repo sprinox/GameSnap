@@ -157,23 +157,28 @@ float3 tone_map_ipt(float3 rgb, float in_max)
     return mul(kLmsToRgb709, lms2);
 }
 
-// analysis 的简化版：按亮度做 false color，方便看 HDR 分布。
-float3 analysis_debug(float nits)
+// analysis 的 false color：400 nit 以下按亮度做灰阶，400 nit 以上按对数刻度把色相
+// 从蓝(240°)连续过渡到红(0°)，中间没有任何分级色带。
+float3 hsv_to_rgb(float3 hsv)
 {
-    float3 color = float3(0.0, 0.0, 0.0);
-    if (nits < 1.0)
-        color = float3(0.02, 0.02, 0.15);
-    else if (nits < 10.0)
-        color = float3(0.0, 0.0, 1.0);
-    else if (nits < 100.0)
-        color = float3(0.0, 1.0, 0.0);
-    else if (nits < 300.0)
-        color = float3(1.0, 1.0, 0.0);
-    else if (nits < 1000.0)
-        color = float3(1.0, 0.4, 0.0);
-    else
-        color = float3(1.0, 0.0, 1.0);
-    return color;
+    const float3 p = abs(frac(hsv.xxx + float3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
+    return hsv.z * lerp(float3(1.0, 1.0, 1.0), saturate(p - 1.0), hsv.y);
+}
+
+float3 analysis_colormap(float nits)
+{
+    const float knee = 400.0;                       // 灰/彩分界
+    const float top = 10000.0;                      // 色相走到红的上限
+    const float gray = pow(saturate(nits / knee), 1.0 / 2.2) * 0.6;   // 暗部也能看清
+    const float3 gray_rgb = float3(gray, gray, gray);
+
+    // 400 → 10000 nit：对数刻度（人眼与显示亮度都是对数感知），色相 240° → 0°。
+    // 用 saturate + lerp 而不是 if/return：整条曲线处处连续，也不会有分支发散。
+    const float t = saturate(log2(max(nits, 1e-4) / knee) / log2(top / knee));
+    const float3 color = hsv_to_rgb(float3((240.0 - 240.0 * t) / 360.0, 1.0, 1.0));
+    // 分界处 50 nit 内与灰阶插值，避免硬跳变
+    const float blend = saturate((nits - knee) / 50.0);
+    return lerp(gray_rgb, color, blend);
 }
 
 [numthreads(8, 8, 1)]
@@ -206,7 +211,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float luma = dot(nits, float3(0.2126, 0.7152, 0.0722));
     if (Algo == 1) {
         // CPU 侧按 BGRA 读回，调试路径也必须按 BGRA 写出，否则红蓝互换。
-        Out[tid.xy] = float4(analysis_debug(luma).bgr, 1.0);
+        Out[tid.xy] = float4(analysis_colormap(luma).bgr, 1.0);
         return;
     }
 

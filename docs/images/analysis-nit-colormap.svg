@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="330" viewBox="0 0 1200 330" font-family="Microsoft YaHei, Segoe UI, SimHei, Noto Sans CJK SC, sans-serif">
+  <rect width="1200" height="330" fill="#12141a"/>
+
+  <!-- 标题 -->
+  <text x="40" y="42" fill="#f0f3f8" font-size="19">GameSnap analysis：nit 与颜色的对应关系</text>
+  <text x="40" y="70" fill="#969eaa" font-size="14">横轴为对数刻度（0.1 – 10000 nit）</text>
+
+  <defs>
+    <!-- 一个渐变覆盖整条，stop 的 offset 全部是"占整条比例"，和刻度同一套坐标 -->
+    <linearGradient id="ramp" x1="40" y1="0" x2="1160" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0.0000" stop-color="#040404"/>
+      <stop offset="0.0720" stop-color="#050505"/>
+      <stop offset="0.1441" stop-color="#070707"/>
+      <stop offset="0.2161" stop-color="#0B0B0B"/>
+      <stop offset="0.2882" stop-color="#101010"/>
+      <stop offset="0.3602" stop-color="#171717"/>
+      <stop offset="0.4322" stop-color="#222222"/>
+      <stop offset="0.5043" stop-color="#313131"/>
+      <stop offset="0.5763" stop-color="#484848"/>
+      <stop offset="0.6484" stop-color="#696969"/>
+      <stop offset="0.7000" stop-color="#838383"/>
+      <stop offset="0.7204" stop-color="#999999"/>
+      <stop offset="0.7321" stop-color="#002BFF"/>
+      <stop offset="0.7437" stop-color="#0055FF"/>
+      <stop offset="0.7554" stop-color="#0080FF"/>
+      <stop offset="0.7670" stop-color="#00AAFF"/>
+      <stop offset="0.7787" stop-color="#00D4FF"/>
+      <stop offset="0.7903" stop-color="#00FFFF"/>
+      <stop offset="0.8020" stop-color="#00FFD4"/>
+      <stop offset="0.8136" stop-color="#00FFAA"/>
+      <stop offset="0.8253" stop-color="#00FF80"/>
+      <stop offset="0.8369" stop-color="#00FF55"/>
+      <stop offset="0.8486" stop-color="#00FF2A"/>
+      <stop offset="0.8602" stop-color="#00FF00"/>
+      <stop offset="0.8719" stop-color="#2AFF00"/>
+      <stop offset="0.8835" stop-color="#55FF00"/>
+      <stop offset="0.8952" stop-color="#80FF00"/>
+      <stop offset="0.9068" stop-color="#AAFF00"/>
+      <stop offset="0.9185" stop-color="#D4FF00"/>
+      <stop offset="0.9301" stop-color="#FFFF00"/>
+      <stop offset="0.9418" stop-color="#FFD400"/>
+      <stop offset="0.9534" stop-color="#FFAA00"/>
+      <stop offset="0.9651" stop-color="#FF8000"/>
+      <stop offset="0.9767" stop-color="#FF5500"/>
+      <stop offset="0.9884" stop-color="#FF2A00"/>
+      <stop offset="1.0000" stop-color="#FF0000"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 色条：x 40 → 1160 就是 0.1 → 10000 nit 的对数轴 -->
+  <rect x="40" y="96" width="1120" height="96" fill="url(#ramp)"/>
+  <rect x="40" y="96" width="1120" height="96" fill="none" stroke="#464c58" stroke-width="1"/>
+
+  <!-- 400 nit 分界：offset 0.7204 → x = 40 + 0.7204 × 1120 = 847 -->
+  <line x1="847" y1="84" x2="847" y2="198" stroke="#f5f5f5" stroke-width="2"/>
+  <text x="857" y="80" fill="#f5f5f5" font-size="15">400 nit 分界</text>
+
+  <!-- 刻度 -->
+  <g fill="#e4e8f0" font-size="16" text-anchor="middle">
+    <line x1="40"   y1="192" x2="40"   y2="199" stroke="#cdd2dc"/><text x="40"   y="220">0.1</text>
+    <line x1="264"  y1="192" x2="264"  y2="199" stroke="#cdd2dc"/><text x="264"  y="220">1</text>
+    <line x1="488"  y1="192" x2="488"  y2="199" stroke="#cdd2dc"/><text x="488"  y="220">10</text>
+    <line x1="712"  y1="192" x2="712"  y2="199" stroke="#cdd2dc"/><text x="712"  y="220">100</text>
+    <line x1="847"  y1="192" x2="847"  y2="199" stroke="#cdd2dc"/><text x="847"  y="220">400</text>
+    <line x1="936"  y1="192" x2="936"  y2="199" stroke="#cdd2dc"/><text x="936"  y="220">1000</text>
+    <line x1="1160" y1="192" x2="1160" y2="199" stroke="#cdd2dc"/><text x="1160" y="220">10000</text>
+  </g>
+  <text x="600" y="252" fill="#969eaa" font-size="14" text-anchor="middle">亮度（nit，对数刻度）</text>
+
+  <!-- 说明 -->
+  <text x="40" y="282" fill="#b6bec4" font-size="14">灰阶：低于 400 nit，按 sRGB 感知曲线（pow 1/2.2），峰值 0.6 灰，暗部也能看清</text>
+  <text x="40" y="304" fill="#b6bec4" font-size="14">彩色：400 – 10000 nit，色相从蓝 240° 连续转到红 0°，每个 nit 颜色都在变，没有分级色带；分界处 50 nit 与灰阶插值</text>
+</svg>

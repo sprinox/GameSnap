@@ -93,12 +93,14 @@ namespace gamesnap {
             return;
         }
 
-        // 先把格式能力查清楚：R10G10B10A2 必须能当 UAV 写（HDR 输出）且能当 SRV 采样（SDR 输出），
+        // 先把格式能力查清楚：R10G10B10A2 要能当 UAV 写（HDR 输出）且能当 SRV 采样（SDR 输出），
         // 否则后面的纹理创建会失败，只能回退 CPU 色调映射。这里给出明确原因，别让它静默降级。
+        // 注意不要要求 RENDER_TARGET：两张输出纹理都只绑 UAV（BindFlags 里没有 RENDER_TARGET），
+        // 多要一项会把本来能做 GPU 色调映射的显卡误判成不支持。
         UINT hdr_support = 0;
         const HRESULT support_hr =
             d3d_->device()->CheckFormatSupport(DXGI_FORMAT_R10G10B10A2_UNORM, &hdr_support);
-        constexpr UINT kNeeded = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_RENDER_TARGET |
+        constexpr UINT kNeeded = D3D11_FORMAT_SUPPORT_TEXTURE2D |
                                  D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW;
         if (FAILED(support_hr) || (hdr_support & kNeeded) != kNeeded) {
             error_ = fmt::format("该显卡不支持 10-bit UAV，HDR 走 CPU 色调映射（R10G10B10A2 支持位=0x{:X}）",
@@ -315,28 +317,40 @@ namespace gamesnap {
             // 1) 峰值归约：先清 0，再按 8x8 线程组做两级 max，结果留在 peak_buffer_。
             //    槽位必须和 HLSL 的 register(u2) 一致，否则写入被丢弃、峰值恒为 0，
             //    色调映射会退化成"SDR 白点硬裁剪"。
-            const UINT clear[4]{};
-            context->ClearUnorderedAccessViewUint(peak_uav_.get(), clear);
-            context->CSSetShader(peak_shader_.get(), nullptr, 0);
-            ID3D11ShaderResourceView* peak_in = input_view.get();
-            context->CSSetShaderResources(0, 1, &peak_in);
-            ID3D11UnorderedAccessView* peak_uav = peak_uav_.get();
-            context->CSSetUnorderedAccessViews(kPeakUavSlot, 1, &peak_uav, nullptr);
-            context->Dispatch((desc.Width + 7) / 8, (desc.Height + 7) / 8, 1);
-            ID3D11UnorderedAccessView* no_uav = nullptr;
-            context->CSSetUnorderedAccessViews(kPeakUavSlot, 1, &no_uav, nullptr);
+            //    analysis（false color 调试）不需要峰值，省掉这一次全帧 dispatch。
+            if (constants.algorithm != 0) {
+                context->CSSetShader(shader_.get(), nullptr, 0);
+                ID3D11ShaderResourceView* srv_only = input_view.get();
+                context->CSSetShaderResources(0, 1, &srv_only);
+                ID3D11UnorderedAccessView* uav_only = output_view_.get();
+                context->CSSetUnorderedAccessViews(0, 1, &uav_only, nullptr);
+                ID3D11UnorderedAccessView* hdr_uav_only = hdr_output_view_.get();
+                context->CSSetUnorderedAccessViews(1, 1, &hdr_uav_only, nullptr);
+                context->Dispatch((desc.Width + 7) / 8, (desc.Height + 7) / 8, 1);
+            } else {
+                const UINT clear[4]{};
+                context->ClearUnorderedAccessViewUint(peak_uav_.get(), clear);
+                context->CSSetShader(peak_shader_.get(), nullptr, 0);
+                ID3D11ShaderResourceView* peak_in = input_view.get();
+                context->CSSetShaderResources(0, 1, &peak_in);
+                ID3D11UnorderedAccessView* peak_uav = peak_uav_.get();
+                context->CSSetUnorderedAccessViews(kPeakUavSlot, 1, &peak_uav, nullptr);
+                context->Dispatch((desc.Width + 7) / 8, (desc.Height + 7) / 8, 1);
+                ID3D11UnorderedAccessView* no_uav = nullptr;
+                context->CSSetUnorderedAccessViews(kPeakUavSlot, 1, &no_uav, nullptr);
 
-            // 2) 色调映射：tone map 从 t1 读回本帧峰值，不回读 CPU。
-            context->CSSetShader(shader_.get(), nullptr, 0);
-            ID3D11ShaderResourceView* srv = input_view.get();
-            context->CSSetShaderResources(0, 1, &srv);
-            ID3D11ShaderResourceView* peak_srv = peak_srv_.get();
-            context->CSSetShaderResources(1, 1, &peak_srv);
-            ID3D11UnorderedAccessView* uav = output_view_.get();
-            context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-            ID3D11UnorderedAccessView* hdr_uav = hdr_output_view_.get();
-            context->CSSetUnorderedAccessViews(1, 1, &hdr_uav, nullptr);
-            context->Dispatch((desc.Width + 7) / 8, (desc.Height + 7) / 8, 1);
+                // 2) 色调映射：tone map 从 t1 读回本帧峰值，不回读 CPU。
+                context->CSSetShader(shader_.get(), nullptr, 0);
+                ID3D11ShaderResourceView* srv = input_view.get();
+                context->CSSetShaderResources(0, 1, &srv);
+                ID3D11ShaderResourceView* peak_srv = peak_srv_.get();
+                context->CSSetShaderResources(1, 1, &peak_srv);
+                ID3D11UnorderedAccessView* uav = output_view_.get();
+                context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+                ID3D11UnorderedAccessView* hdr_uav = hdr_output_view_.get();
+                context->CSSetUnorderedAccessViews(1, 1, &hdr_uav, nullptr);
+                context->Dispatch((desc.Width + 7) / 8, (desc.Height + 7) / 8, 1);
+            }
 
             std::array<ID3D11ShaderResourceView*, 2> null_srvs{};
             std::array<ID3D11UnorderedAccessView*, 2> null_uavs{};
@@ -359,10 +373,23 @@ namespace gamesnap {
             return false;
         }
         const HRESULT registered = fence_->SetEventOnCompletion(fence_value_, fence_event);
-        const DWORD waited = SUCCEEDED(registered) ? ::WaitForSingleObject(fence_event, 1000) : WAIT_FAILED;
+        if (FAILED(registered)) {
+            // 注册就没成功：事件上没有任何挂起引用，可以安全关闭，也不要误报成超时。
+            ::CloseHandle(fence_event);
+            error = fmt::format("注册 tone map fence 事件失败: {}", describe_hresult(registered));
+            return false;
+        }
+        const DWORD waited = ::WaitForSingleObject(fence_event, 1000);
+        if (waited == WAIT_TIMEOUT) {
+            // 同 d3d.cpp::wait_fence：超时说明设备已挂起，fence 仍注册在这个事件上，
+            // 这时 CloseHandle 会让之后 GPU 完成的 Signal 落到可能被复用的句柄值上。
+            // 故意不关（job 已失败，进程很快会走 CPU 回退或退出）。
+            error = "等待 tone map GPU 超时";
+            return false;
+        }
         ::CloseHandle(fence_event);
         if (waited != WAIT_OBJECT_0 || fence_->GetCompletedValue() < fence_value_) {
-            error = "等待 tone map GPU 超时";
+            error = fmt::format("等待 tone map GPU 失败: Win32 {}", ::GetLastError());
             return false;
         }
 

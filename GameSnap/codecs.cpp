@@ -88,18 +88,6 @@ namespace gamesnap {
             return true;
         }
 
-        bool to_rgba(Image const& image, ByteBuffer& rgba) {
-            if (image.width == 0 || image.height == 0 || image.stride != image.width * 4)
-                return false;
-            rgba.resize(static_cast<std::size_t>(image.width) * image.height * 4);
-            for (std::size_t y = 0; y < image.height; ++y) {
-                auto const* src = image.pixels.data() + y * image.stride;
-                auto* dst = rgba.data() + y * image.width * 4;
-                bgra_to_rgba_row(src, dst, image.width);
-            }
-            return true;
-        }
-
         // ── PQ ───────────────────────────────────────────────────────────────
         float pq_to_nits(float pq) {
             if (!(pq > 0.0F))
@@ -211,8 +199,7 @@ namespace gamesnap {
             std::memcpy(base, &header, sizeof(header));
 
             const std::array<ExifEntry, 3> ifd0_entries{{
-                {.tag = 0x010E, .type = 2,
-                 .count = static_cast<std::uint32_t>(title.size()) + 1, .value = title_offset},
+                {.tag = 0x010E, .type = 2, .count = static_cast<std::uint32_t>(title.size()) + 1, .value = title_offset},
                 {.tag = 0x0131, .type = 2, .count = software_text_size, .value = software_offset},
                 {.tag = 0x8769, .type = 4, .count = 1, .value = exif_ifd_offset},
             }};
@@ -247,26 +234,27 @@ namespace gamesnap {
             return make_exif(metadata, true);
         }
 
-        // 入参用 const&：4K PNG/JPEG 有十几 MB，按值传会白做一次整块拷贝。
-        std::vector<std::uint8_t> add_jpeg_exif(std::vector<std::uint8_t> const& jpeg,
+        // 入参用裸指针 + 长度：调用方手里的压缩缓冲（spng/libjpeg 分配的）不必再拷一份 vector。
+        std::vector<std::uint8_t> add_jpeg_exif(std::uint8_t const* jpeg, std::size_t jpeg_size,
                                                 ImageMetadata const& metadata) {
             const auto exif = make_exif_payload(metadata);
-            if (jpeg.size() < 2 || jpeg[0] != 0xFF || jpeg[1] != 0xD8)
-                return jpeg;
-            std::vector<std::uint8_t> out(6 + exif.size() + jpeg.size() - 2);
+            if (jpeg_size < 2 || jpeg[0] != 0xFF || jpeg[1] != 0xD8)
+                return {jpeg, jpeg + jpeg_size};
+            std::vector<std::uint8_t> out(6 + exif.size() + jpeg_size - 2);
             auto* p = out.data();
             constexpr std::array<std::uint8_t, 4> app1_marker{0xFF, 0xD8, 0xFF, 0xE1};
             std::memcpy(p, app1_marker.data(), app1_marker.size());
             write_u16_be(p + 4, static_cast<std::uint16_t>(exif.size() + 2));
             std::memcpy(p + 6, exif.data(), exif.size());
-            std::memcpy(p + 6 + exif.size(), jpeg.data() + 2, jpeg.size() - 2);
+            std::memcpy(p + 6 + exif.size(), jpeg + 2, jpeg_size - 2);
             return out;
         }
 
-        std::vector<std::uint8_t> add_png_exif(std::vector<std::uint8_t> const& png,
+        std::vector<std::uint8_t> add_png_exif(std::uint8_t const* png, std::size_t png_size,
                                                ImageMetadata const& metadata) {
-            if (png.size() < 12)
-                return png;
+            constexpr std::size_t kIendSize = 12;  // length=0 + "IEND" + crc
+            if (png_size < kIendSize)
+                return {png, png + png_size};
             const auto tiff = make_exif_tiff(metadata);
             std::vector<std::uint8_t> chunk(12 + tiff.size());
             auto* chunk_data = chunk.data();
@@ -280,13 +268,13 @@ namespace gamesnap {
             write_u32_be(chunk_data + 8 + tiff.size(), static_cast<std::uint32_t>(crc));
 
             // IEND 固定为最后 12 字节：length=0 + "IEND" + crc。直接在 out 里拼好，
-            // 不走"按值入参 + insert"那套（4K PNG 那是 20 MB 级的两趟 memcpy）。
-            const std::size_t insert_at = png.size() - 12;
+            // 全程只有这一趟拷贝（不再先构造 png_bytes 再 insert 一次）。
+            const std::size_t insert_at = png_size - kIendSize;
             std::vector<std::uint8_t> out;
-            out.reserve(png.size() + chunk.size());
-            out.insert(out.end(), png.begin(), png.begin() + static_cast<std::ptrdiff_t>(insert_at));
+            out.reserve(png_size + chunk.size());
+            out.insert(out.end(), png, png + insert_at);
             out.insert(out.end(), chunk.begin(), chunk.end());
-            out.insert(out.end(), png.begin() + static_cast<std::ptrdiff_t>(insert_at), png.end());
+            out.insert(out.end(), png + insert_at, png + png_size);
             return out;
         }
 
@@ -347,22 +335,43 @@ namespace gamesnap {
             }
             file.write(reinterpret_cast<char const*>(&file_header), sizeof(file_header));
             file.write(reinterpret_cast<char const*>(&info_header), sizeof(info_header));
-            ByteBuffer row;
-            row.resize(row_bytes);
-            std::memset(row.data(), 0, row_bytes);  // 行尾 4 字节对齐的填充保持为 0
-            for (std::size_t y = 0; y < image.height; ++y) {
-                auto const* src = image.pixels.data() + y * image.stride;
-                bgra_to_bgr_row(src, row.data(), image.width);
-                file.write(reinterpret_cast<char const*>(row.data()), static_cast<std::streamsize>(row_bytes));
+            // 按块拼行再一次性写出：4K 下逐行 write 是 2160 次系统调用，攒成 ~4 MB 一块能少两个数量级。
+            constexpr std::size_t kChunkTarget = 4 * 1024 * 1024;
+            const std::size_t rows_per_chunk = std::max<std::size_t>(1, kChunkTarget / row_bytes);
+            ByteBuffer chunk;
+            chunk.resize(row_bytes * rows_per_chunk);
+            for (std::size_t y = 0; y < image.height; y += rows_per_chunk) {
+                const std::size_t rows = std::min(rows_per_chunk, static_cast<std::size_t>(image.height) - y);
+                for (std::size_t row_index = 0; row_index < rows; ++row_index) {
+                    auto const* src = image.pixels.data() + (y + row_index) * image.stride;
+                    auto* dst = chunk.data() + row_index * row_bytes;
+                    bgra_to_bgr_row(src, dst, image.width);
+                    // 行尾 4 字节对齐的填充保持为 0（chunk 只 append 时同一块会复用，
+                    // 这里每行显式清一次，避免上一轮的像素残留在 padding 里）。
+                    if (row_bytes > static_cast<std::size_t>(image.width) * 3) {
+                        std::memset(dst + static_cast<std::size_t>(image.width) * 3, 0,
+                                    row_bytes - static_cast<std::size_t>(image.width) * 3);
+                    }
+                }
+                file.write(reinterpret_cast<char const*>(chunk.data()),
+                           static_cast<std::streamsize>(row_bytes * rows));
+                if (!file.good())
+                    break;
             }
             file.flush();
             if (!file.good()) {
                 error = "写 BMP 失败";
+                file.close();
+                // 别留半张图：磁盘满/中断时删掉残file，免得看起来像一次成功截图。
+                std::error_code remove_ec;
+                std::filesystem::remove(path, remove_ec);
                 return false;
             }
             file.close();
             if (file.fail()) {
                 error = "关闭 BMP 失败";
+                std::error_code remove_ec;
+                std::filesystem::remove(path, remove_ec);
                 return false;
             }
             return true;
@@ -412,9 +421,7 @@ namespace gamesnap {
                 error = "spng_get_png_buffer 失败";
                 return false;
             }
-            const std::vector<std::uint8_t> png_bytes(static_cast<std::uint8_t*>(png),
-                                                       static_cast<std::uint8_t*>(png) + png_size);
-            const auto with_exif = add_png_exif(png_bytes, image.metadata);
+            const auto with_exif = add_png_exif(static_cast<std::uint8_t const*>(png), png_size, image.metadata);
             const bool ok = write_bytes(path, with_exif.data(), with_exif.size(), error);
             free(png);  // NOLINT(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
             spng_ctx_free(ctx);
@@ -505,8 +512,8 @@ namespace gamesnap {
                 jpeg_write_scanlines(&scratch.cinfo, &row_pointer, 1);
             }
             jpeg_finish_compress(&scratch.cinfo);
-            const std::vector<std::uint8_t> jpeg(scratch.mem, scratch.mem + scratch.mem_size);
-            const auto with_exif = add_jpeg_exif(jpeg, image.metadata);
+            const auto with_exif = add_jpeg_exif(static_cast<std::uint8_t const*>(scratch.mem),
+                                                 static_cast<std::size_t>(scratch.mem_size), image.metadata);
             const bool ok = write_bytes(path, with_exif.data(), with_exif.size(), error);
             jpeg_destroy_compress(&scratch.cinfo);
             scratch.created = false;
@@ -603,16 +610,22 @@ namespace gamesnap {
                 codec_options.av1_encoder != Av1Encoder::Auto) {
                 SPDLOG_WARN("libavif 未内置 AV1 编码器 {}，回退 auto", to_string(codec_options.av1_encoder));
             }
-            // 各库专属参数；-1 表示交给 avif_speed（libavif 会映射成 cpu-used / preset）。
-            if (codec_options.aom_cpu_used >= 0) {
+            // 各库专属参数：只设给实际选中的编码器（AUTO 时两个都试，失败静默），
+            // 免得把 svt 的 preset 塞给 aom 还打一条没意义的 warning。
+            const auto choice = encoder->codecChoice;
+            if (codec_options.aom_cpu_used >= 0 && choice != AVIF_CODEC_CHOICE_SVT) {
                 const std::string value = std::to_string(codec_options.aom_cpu_used);
-                if (avifEncoderSetCodecSpecificOption(encoder, "cpu-used", value.c_str()) != AVIF_RESULT_OK)
+                if (avifEncoderSetCodecSpecificOption(encoder, "cpu-used", value.c_str()) != AVIF_RESULT_OK &&
+                    choice == AVIF_CODEC_CHOICE_AOM) {
                     SPDLOG_WARN("aom 不接受 cpu-used={}", value);
+                }
             }
-            if (codec_options.svt_preset >= 0) {
+            if (codec_options.svt_preset >= 0 && choice != AVIF_CODEC_CHOICE_AOM) {
                 const std::string value = std::to_string(codec_options.svt_preset);
-                if (avifEncoderSetCodecSpecificOption(encoder, "preset", value.c_str()) != AVIF_RESULT_OK)
+                if (avifEncoderSetCodecSpecificOption(encoder, "preset", value.c_str()) != AVIF_RESULT_OK &&
+                    choice == AVIF_CODEC_CHOICE_SVT) {
                     SPDLOG_WARN("svt 不接受 preset={}", value);
+                }
             }
             if (codec_options.avif_lossless) {
                 encoder->minQuantizer = AVIF_QUANTIZER_LOSSLESS;
@@ -693,6 +706,8 @@ namespace gamesnap {
             rgb.format = AVIF_RGB_FORMAT_BGRA;
             rgb.depth = depth;
             rgb.rowBytes = image.stride;
+            // 截图恒不透明：跳过 alpha 平面的分配与逐像素填充。
+            rgb.ignoreAlpha = AVIF_TRUE;
             rgb.pixels = const_cast<std::uint8_t*>(image.pixels.data());  // NOLINT(cppcoreguidelines-pro-type-const-cast)
 
             bool ok = false;
@@ -768,6 +783,7 @@ namespace gamesnap {
             rgb.format = AVIF_RGB_FORMAT_RGBA;
             rgb.depth = 10;
             rgb.rowBytes = width * 8;
+            rgb.ignoreAlpha = AVIF_TRUE;                                                          // 不透明，别让 libavif 建 alpha 平面
             rgb.pixels = const_cast<std::uint8_t*>(reinterpret_cast<std::uint8_t const*>(rgba));  // NOLINT(cppcoreguidelines-pro-type-const-cast)
 
             bool ok = false;
@@ -803,6 +819,7 @@ namespace gamesnap {
             base_rgb.depth = 8;
             base_rgb.format = AVIF_RGB_FORMAT_BGRA;
             base_rgb.rowBytes = sdr.stride;
+            base_rgb.ignoreAlpha = AVIF_TRUE;                                // 不透明
             base_rgb.pixels = const_cast<std::uint8_t*>(sdr.pixels.data());  // NOLINT(cppcoreguidelines-pro-type-const-cast)
             if (avifImageRGBToYUV(base, &base_rgb) != AVIF_RESULT_OK) {
                 avifImageDestroy(base);
@@ -816,6 +833,7 @@ namespace gamesnap {
             alt_rgb.depth = 10;
             alt_rgb.format = AVIF_RGB_FORMAT_RGBA;
             alt_rgb.rowBytes = width * 8;
+            alt_rgb.ignoreAlpha = AVIF_TRUE;                                                           // 不透明
             alt_rgb.pixels = const_cast<std::uint8_t*>(reinterpret_cast<std::uint8_t const*>(hdr10));  // NOLINT(cppcoreguidelines-pro-type-const-cast)
 
             avifGainMap* gain_map = avifGainMapCreate();
@@ -846,7 +864,11 @@ namespace gamesnap {
             }
             gain_map->altColorPrimaries = AVIF_COLOR_PRIMARIES_BT2020;
             gain_map->altTransferCharacteristics = AVIF_TRANSFER_CHARACTERISTICS_PQ;
+            // IDENTITY = "YUV 平面里直接放 RGB"，配合 4:4:4 + full range 才是无损的 RGB 承载；
+            // 换成 BT2020_NCL 反而会再做一次 RGB→YCbCr，和独立 HDR AVIF 的编码路径就不一致了。
+            // altYUVRange 必须显式写 FULL，否则读端可能按 narrow range 解释（画面发灰）。
             gain_map->altMatrixCoefficients = AVIF_MATRIX_COEFFICIENTS_IDENTITY;
+            gain_map->altYUVRange = AVIF_RANGE_FULL;
             gain_map->altDepth = 10;
             gain_map->altPlaneCount = 3;
 
@@ -878,6 +900,8 @@ namespace gamesnap {
                 return false;
             }
             if (handle != nullptr) {
+                // libheif 的 EXIF 接口约定：传入 "Exif\0\0" + TIFF（即 make_exif_payload 的格式），
+                // 它会自己扫描 TIFF header 定位数据。换库/换版本时这点要重新确认。
                 const auto exif = make_exif_payload(metadata);
                 const heif_error add_exif = heif_context_add_exif_metadata(
                     ctx, handle, exif.data(), static_cast<int>(exif.size()));
@@ -1013,8 +1037,13 @@ namespace gamesnap {
                 heif_nclx_color_profile_set_color_primaries(nclx, 1);
                 heif_nclx_color_profile_set_transfer_characteristics(nclx, 13);
                 heif_nclx_color_profile_set_matrix_coefficients(nclx, 1);
-                heif_image_set_nclx_color_profile(img, nclx);
+                const heif_error nclx_error = heif_image_set_nclx_color_profile(img, nclx);
+                if (nclx_error.code != heif_error_Ok)
+                    SPDLOG_WARN("HEIC 设置 NCLX 色彩配置失败: {}",
+                                nclx_error.message ? nclx_error.message : "unknown");
                 heif_nclx_color_profile_free(nclx);
+            } else {
+                SPDLOG_WARN("heif_nclx_color_profile_alloc 失败，HEIC 将不带色彩空间标记");
             }
 
             heif_encoder* encoder = make_heif_encoder(ctx, error);
@@ -1098,8 +1127,13 @@ namespace gamesnap {
                 heif_nclx_color_profile_set_color_primaries(nclx, hdr ? 9 : 1);
                 heif_nclx_color_profile_set_transfer_characteristics(nclx, hdr ? 16 : 13);
                 heif_nclx_color_profile_set_matrix_coefficients(nclx, hdr ? 9 : 1);
-                heif_image_set_nclx_color_profile(img, nclx);
+                const heif_error nclx_error = heif_image_set_nclx_color_profile(img, nclx);
+                if (nclx_error.code != heif_error_Ok)
+                    SPDLOG_WARN("HEIC 设置 NCLX 色彩配置失败: {}",
+                                nclx_error.message ? nclx_error.message : "unknown");
                 heif_nclx_color_profile_free(nclx);
+            } else {
+                SPDLOG_WARN("heif_nclx_color_profile_alloc 失败，HEIC 将不带色彩空间标记");
             }
 
             heif_encoder* encoder = nullptr;
@@ -1172,29 +1206,42 @@ namespace gamesnap {
                 error = "JxlEncoderFrameSettingsCreate 失败";
                 return false;
             }
+            // libjxl 的这些 setter 都有返回状态：拒绝时会静默用默认值，所以逐个检查。
+            const auto check_jxl = [](JxlEncoderStatus status, char const* what) {
+                if (status != JXL_ENC_SUCCESS)
+                    SPDLOG_WARN("JXL 设置 {} 被拒绝，编码将使用库默认值", what);
+            };
             if (codec_options.jxl_lossless) {
-                JxlEncoderSetFrameLossless(frame, JXL_TRUE);
-                JxlEncoderSetFrameDistance(frame, 0.0F);
+                check_jxl(JxlEncoderSetFrameLossless(frame, JXL_TRUE), "lossless");
+                check_jxl(JxlEncoderSetFrameDistance(frame, 0.0F), "distance=0");
             } else {
-                JxlEncoderSetFrameDistance(frame, std::clamp(codec_options.jxl_distance, 0.0F, 15.0F));
+                check_jxl(JxlEncoderSetFrameDistance(frame, std::clamp(codec_options.jxl_distance, 0.0F, 15.0F)),
+                          "distance");
             }
-            JxlEncoderFrameSettingsSetOption(frame, JXL_ENC_FRAME_SETTING_EFFORT,
-                                             std::clamp(codec_options.jxl_effort, 1, 10));
+            check_jxl(JxlEncoderFrameSettingsSetOption(frame, JXL_ENC_FRAME_SETTING_EFFORT,
+                                                       std::clamp(codec_options.jxl_effort, 1, 10)),
+                      "effort");
 
             if (hdr) {
                 JxlBitDepth depth{};
                 depth.type = JXL_BIT_DEPTH_FROM_CODESTREAM;
                 depth.bits_per_sample = 10;
                 depth.exponent_bits_per_sample = 0;
-                JxlEncoderSetFrameBitDepth(frame, &depth);
+                check_jxl(JxlEncoderSetFrameBitDepth(frame, &depth), "bit_depth");
             }
 
-            // EXIF 用独立 box，内容是裸 TIFF（不带 "Exif\0\0" 前缀）。
+            // EXIF 用独立 box。libjxl 要求 box 内容以 4 字节大端 TIFF 偏移开头
+            // （decode.h: "Starts with a 4-byte tiff header offset"），TIFF 头紧随其后；
+            // 实测偏移写 0 时 ffmpeg/djxl 都能正常解析，写 4 反而报 "invalid TIFF header"。
             if (!metadata.title.empty() || !metadata.date_time.empty()) {
                 JxlEncoderUseBoxes(enc);
-                const auto exif = make_exif_tiff(metadata);
-                if (!exif.empty())
-                    JxlEncoderAddBox(enc, "Exif", exif.data(), exif.size(), JXL_FALSE);
+                const auto tiff = make_exif_tiff(metadata);
+                if (!tiff.empty()) {
+                    std::vector<std::uint8_t> box(4 + tiff.size(), 0);
+                    std::memcpy(box.data() + 4, tiff.data(), tiff.size());
+                    if (JxlEncoderAddBox(enc, "Exif", box.data(), box.size(), JXL_FALSE) != JXL_ENC_SUCCESS)
+                        SPDLOG_WARN("JXL 写入 EXIF box 失败（元数据不会出现在文件里）");
+                }
             }
 
             JxlPixelFormat format{

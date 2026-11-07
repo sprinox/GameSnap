@@ -219,6 +219,8 @@ namespace gamesnap {
         CodecOptions codec;
         bool verbose = false;
         bool selftest = false;  // 不经过 WGC，用合成纹理验证编码链路
+    // 编码基准：给定一张 PNG，用各种格式/参数重新编码，量体积与耗时。
+    std::optional<std::filesystem::path> bench_source;
     };
 
     std::filesystem::path default_output_dir();

@@ -700,6 +700,7 @@ namespace gamesnap {
             ("tone-map", "色调映射 spline / analysis", cxxopts::value<std::string>())
             ("verbose", "输出调试日志")
             ("selftest", "用合成纹理跑编码链路自检")
+            ("bench", "编码基准：对指定 PNG 跑格式/参数矩阵", cxxopts::value<std::string>())
             ("h,help", "显示帮助");
         // clang-format on
 
@@ -803,6 +804,16 @@ namespace gamesnap {
             config.verbose = true;
         if (result.count("selftest") != 0)
             config.selftest = true;
+
+        if (result.count("bench") != 0) {
+            const std::filesystem::path source = utf8_to_wstring(result["bench"].as<std::string>());
+            std::error_code ec;
+            if (!std::filesystem::exists(source, ec)) {
+                SPDLOG_ERROR("--bench 指定的源文件不存在: {}", wstring_to_utf8(source.wstring()));
+                return std::nullopt;
+            }
+            config.bench_source = source;
+        }
 
         config.encode_threads = std::clamp(config.encode_threads, 1, 8);
         return config;

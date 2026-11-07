@@ -145,6 +145,7 @@
     </Manifest>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="bench.cpp" />
     <ClCompile Include="capture.cpp" />
     <ClCompile Include="codecs.cpp">
       <FloatingPointModel>Precise</FloatingPointModel>
@@ -171,6 +172,7 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="bench.h" />
     <ClInclude Include="capture.h" />
     <ClInclude Include="codecs.h" />
     <ClInclude Include="common.h" />

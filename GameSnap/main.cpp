@@ -7,6 +7,7 @@
 #include <process.h>
 #include <span>
 
+#include "bench.h"
 #include "capture.h"
 #include "overlay.h"
 #include "ui_bridge.h"
@@ -186,6 +187,18 @@ int wmain(int argc, wchar_t** argv) {
         SPDLOG_WARN("无法创建输出目录 {}: {}", gamesnap::wstring_to_utf8(config->output_dir.wstring()), ec.message());
 
     gamesnap::log_config(*config);
+
+    if (config->bench_source) {
+#if GAMESNAP_BENCH
+        const bool ok = gamesnap::run_encode_bench(*config);
+        spdlog::shutdown();
+        return ok ? 0 : 1;
+#else
+        SPDLOG_ERROR("这个构建没有编入编码基准（默认关闭）；用 /DGAMESNAP_ENABLE_BENCH=1 重新编译");
+        spdlog::shutdown();
+        return 1;
+#endif
+    }
 
     if (config->selftest) {
 #if GAMESNAP_SELFTEST

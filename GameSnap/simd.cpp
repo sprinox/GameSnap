@@ -213,6 +213,56 @@ namespace gamesnap {
         rgba16_to_rgb16_row_avx2(src, dst, pixels);
     }
 
+    // ── 10-bit → 8-bit（PQ 8-bit 回退用） ────────────────────────────────────
+    namespace {
+
+        // AVX2：每次 16 个 uint16 → 16 个 uint8。
+        // 注意 packus_epi32 在 256 位下按 128 位 lane 打包，顺序会错，所以要 permute4x64 重排；
+        // 重排后每 16 位元素只有低字节有效，再用 shuffle_epi8 抽出 16 个字节拼成一次 16B 写。
+        void rgba10_to_rgba8_avx2(std::uint16_t const* __restrict src, std::uint8_t* __restrict dst,
+                                 std::size_t count) {
+            const __m256i kMax = _mm256_set1_epi32(1023);
+            const __m256 kInv = _mm256_set1_ps(1.0F / 1023.0F);
+            // 每个 16 位元素取低字节（每 lane 8 个）。
+            const __m256i kBytePick = _mm256_setr_epi8(
+                0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1,
+                0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1);
+            std::size_t i = 0;
+            for (; i + 16 <= count; i += 16) {
+                const __m256i v = _mm256_loadu_si256(reinterpret_cast<__m256i const*>(src + i));
+                const auto convert = [&](__m256i xi) -> __m256i {
+                    const __m256 x = _mm256_cvtepi32_ps(_mm256_min_epu32(xi, kMax));
+                    // 标量是 floor((v*255+511)/1023)。float 实际误差约 3e-5，
+                    // 远小于与最近整数边界的距离 1/1023 ≈ 9.8e-4；且全部 1024 个输入
+                    // 都已逐值与标量结果对齐过，所以这里取 floor 与整数除法一致。
+                    const __m256 scaled =
+                        _mm256_mul_ps(_mm256_add_ps(_mm256_mul_ps(x, _mm256_set1_ps(255.0F)),
+                                                    _mm256_set1_ps(511.0F)),
+                                      kInv);
+                    return _mm256_cvttps_epi32(_mm256_floor_ps(scaled));
+                };
+                const __m256i lo = convert(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(v)));
+                const __m256i hi = convert(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(v, 1)));
+                __m256i words = _mm256_packus_epi32(lo, hi);
+                words = _mm256_permute4x64_epi64(words, _MM_SHUFFLE(3, 1, 2, 0));
+                const __m256i bytes = _mm256_shuffle_epi8(words, kBytePick);
+                const __m128i packed = _mm_unpacklo_epi64(_mm256_castsi256_si128(bytes),
+                                                          _mm256_extracti128_si256(bytes, 1));
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), packed);
+            }
+            for (; i < count; ++i) {
+                // 尾部标量：(v * 255 + 511) / 1023，与向量路径同一条公式（越界先钳位）。
+                dst[i] = static_cast<std::uint8_t>(
+                    (std::min<std::uint32_t>(src[i], 1023U) * 255U + 511U) / 1023U);
+            }
+        }
+
+    }  // namespace
+
+    void rgba10_to_rgba8(std::uint16_t const* src, std::uint8_t* dst, std::size_t count) {
+        rgba10_to_rgba8_avx2(src, dst, count);
+    }
+
     // BMP 的像素字节序是 B,G,R：不能复用 bgra_to_rgb_row，否则红蓝颠倒。
     // 和 bgra_to_rgb_row 同一套打包手法，只是掩码保留 B,G,R 原序。
     void bgra_to_bgr_row(std::uint8_t const* __restrict src, std::uint8_t* __restrict dst,

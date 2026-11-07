@@ -1,5 +1,7 @@
 #include "pch.h"
 
+#include <set>
+
 #include "overlay.h"
 
 #include "ui_bridge.h"
@@ -331,6 +333,9 @@ namespace gamesnap {
         ImFont* build_font(float scale, std::wstring const& filename, std::set<ImWchar>& covered) {
             ImGuiIO& io = ImGui::GetIO();
             io.Fonts->Clear();
+            // 图集刚被清空，之前记录的"已覆盖码点"随之失效——不清就会声称某些字形在，
+            // 实际图集里没有（A→B→回到 A 时最容易踩）。
+            covered.clear();
             ImFontGlyphRangesBuilder builder;
             builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
             builder.AddText("GameSnap正在生成截图…剩余编码任务: 编码完成");

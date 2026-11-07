@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <vector>
@@ -97,7 +98,9 @@ namespace gamesnap {
             return static_cast<std::uint16_t>(std::lround(m));
         }
 
-        // PQ 编码值 0..0.58 约等于 0..203 nit（SDR 白点），色调映射后应是完整灰阶。
+        // PQ 编码值 0..0.58 约等于 0..203 nit；HDR 用例的白点故意设成 100 nit，
+        // 让渐变的高端超过白点，这样"肩部有没有生效"才会体现在输出上
+        // （白点设成 203 时曲线本来就该是恒等，测不出峰值归约失效这类问题）。
         void fill_pq(std::uint8_t* data, std::uint32_t row_pitch, std::uint32_t width, std::uint32_t height) {
             for (std::uint32_t y = 0; y < height; ++y) {
                 for (std::uint32_t x = 0; x < width; ++x) {
@@ -121,6 +124,8 @@ namespace gamesnap {
             char const* label = "";
             std::uint32_t width = kWidth;
             std::uint32_t height = kHeight;
+            // 覆盖 SDR 伴生格式；空 = HDR 用例固定 PNG（给像素级校验用），SDR 用例跟随配置。
+            std::optional<ImageFormat> sdr_format;
         };
 
         winrt::com_ptr<ID3D11Texture2D> create_gpu_texture(ID3D11Device* device, D3D11_TEXTURE2D_DESC const& desc) {
@@ -251,7 +256,9 @@ namespace gamesnap {
             job.sdr_white_nits = test_case.sdr_white_nits;
             job.hdr = test_case.format == DXGI_FORMAT_R16G16B16A16_FLOAT;
             job.hdr_format = config.hdr_format;
-            job.sdr_format = config.sdr_format;
+            // HDR 用例的 SDR 伴生文件默认写 PNG：这样像素级校验（需要无损解码）不依赖用户配置的
+            // format_sdr，默认流程也会跑到。需要覆盖特定路径时可显式指定 sdr_format。
+            job.sdr_format = test_case.sdr_format.value_or(job.hdr ? ImageFormat::Png : config.sdr_format);
             job.tone_map = config.tone_map;
             job.sequence = 7777;
             job.title = L"GameSnap SelfTest";
@@ -310,17 +317,20 @@ namespace gamesnap {
             }
 
             // 像素级校验：光看"文件存在且非空"抓不到色调映射绑错槽位这类问题
-            // （曲线退化成硬裁剪时文件照样正常）。HDR 用例的 SDR 输出（PNG 配置）
-            // 不允许大面积被判成纯白。
-            if (hdr_job && config.sdr_format == ImageFormat::Png) {
+            // （曲线退化成硬裁剪时文件照样正常）。HDR 用例的 SDR 伴生文件固定是 PNG（见上），
+            // 所以这里的条件与格式无关，默认配置也会执行。
+            if (hdr_job && job.sdr_format == ImageFormat::Png) {
                 for (const auto& path : produced) {
                     if (path.filename().wstring().find(L"_SDR.") == std::wstring::npos)
                         continue;
                     double fraction = 0.0;
-                    if (saturated_fraction(path, fraction) && fraction > 0.05) {
-                        SPDLOG_ERROR("自检失败: SDR 渐变区有 {:.0f}% 像素被裁成纯白，色调映射可能退化了",
-                                     fraction * 100.0);
-                        return false;
+                    if (saturated_fraction(path, fraction)) {
+                        SPDLOG_INFO("SDR 渐变区饱和像素 {:.2f}%（阈值 5%）", fraction * 100.0);
+                        if (fraction > 0.05) {
+                            SPDLOG_ERROR("自检失败: SDR 渐变区有 {:.0f}% 像素被裁成纯白，色调映射可能退化了",
+                                         fraction * 100.0);
+                            return false;
+                        }
                     }
                 }
             }
@@ -364,6 +374,10 @@ namespace gamesnap {
              ok;
         // WGC 的 FP16 帧实际是 scRGB（线性，1.0 = 80 nits），这才是真实采集帧的编码。
         ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R16G16B16A16_FLOAT, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, .sdr_white_nits = 80, .label = "HDR scRGB FP16"}) &&
+             ok;
+        // AVIF + AVIF：唯一会走 encode_avif_gainmap() 的组合（HDR 与 SDR 都写 AVIF）。
+        // 这条路径内存最重（4K 下增益图计算约 100 MiB），必须留在自检里。
+        ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R16G16B16A16_FLOAT, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, .sdr_white_nits = 80, .label = "HDR scRGB + AVIF gain map", .sdr_format = ImageFormat::Avif}) &&
              ok;
 
         SPDLOG_INFO("=== 自检{}：输出目录 {} ===", ok ? "全部通过" : "失败",

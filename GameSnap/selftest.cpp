@@ -2,12 +2,17 @@
 
 #include "selftest.h"
 
+// Release 不编自检（见 selftest.h 的 GAMESNAP_SELFTEST）。
+#if GAMESNAP_SELFTEST
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <vector>
+
+#include <spng.h>
 
 #include "d3d.h"
 #include "display.h"
@@ -123,6 +128,60 @@ namespace gamesnap {
             if (FAILED(device->CreateTexture2D(&desc, nullptr, texture.put())))
                 return {};
             return texture;
+        }
+
+        // 解码一张 PNG，统计三通道同时为 255 的像素占比。
+        // 自检图顶部 1/3 是一条故意写满的纯白条，会干扰统计，所以只统计它下面的渐变区——
+        // 那段如果被大面积裁成纯白，就说明色调映射退化了（例如峰值归约失效 → 曲线恒等）。
+        bool saturated_fraction(std::filesystem::path const& path, double& fraction) {
+            std::FILE* file = nullptr;
+            if (::_wfopen_s(&file, path.c_str(), L"rb") != 0 || file == nullptr)
+                return false;
+            std::vector<std::uint8_t> bytes;
+            std::uint8_t chunk[64 * 1024];
+            std::size_t read = 0;
+            while ((read = std::fread(chunk, 1, sizeof(chunk), file)) > 0)
+                bytes.insert(bytes.end(), chunk, chunk + read);
+            std::fclose(file);
+            if (bytes.empty())
+                return false;
+
+            spng_ctx* ctx = spng_ctx_new(0);
+            if (ctx == nullptr)
+                return false;
+            bool ok = false;
+            if (spng_set_png_buffer(ctx, bytes.data(), bytes.size()) == 0) {
+                spng_ihdr ihdr{};
+                std::size_t decoded_size = 0;
+                if (spng_get_ihdr(ctx, &ihdr) == 0 &&
+                    spng_decoded_image_size(ctx, SPNG_FMT_RGB8, &decoded_size) == 0) {
+                    std::vector<std::uint8_t> rgb(decoded_size);
+                    if (spng_decode_image(ctx, rgb.data(), rgb.size(), SPNG_FMT_RGB8, 0) == 0) {
+                        // 跳过顶部 1/3 的纯白条，只统计渐变区。
+                        const std::size_t row_bytes = static_cast<std::size_t>(ihdr.width) * 3;
+                        const std::size_t start_row = static_cast<std::size_t>(ihdr.height) / 3;
+                        std::size_t saturated = 0;
+                        std::size_t counted = 0;
+                        for (std::size_t y = start_row; y < ihdr.height; ++y) {
+                            const std::size_t begin = y * row_bytes;
+                            const std::size_t end = begin + row_bytes;
+                            if (end > rgb.size())
+                                break;
+                            for (std::size_t i = begin; i + 2 < end; i += 3) {
+                                ++counted;
+                                if (rgb[i] == 255 && rgb[i + 1] == 255 && rgb[i + 2] == 255)
+                                    ++saturated;
+                            }
+                        }
+                        if (counted > 0) {
+                            fraction = static_cast<double>(saturated) / static_cast<double>(counted);
+                            ok = true;
+                        }
+                    }
+                }
+            }
+            spng_ctx_free(ctx);
+            return ok;
         }
 
         bool run_case(Config const& config, std::shared_ptr<D3DContext> const& d3d, Case const& test_case) {
@@ -250,6 +309,22 @@ namespace gamesnap {
                 return false;
             }
 
+            // 像素级校验：光看"文件存在且非空"抓不到色调映射绑错槽位这类问题
+            // （曲线退化成硬裁剪时文件照样正常）。HDR 用例的 SDR 输出（PNG 配置）
+            // 不允许大面积被判成纯白。
+            if (hdr_job && config.sdr_format == ImageFormat::Png) {
+                for (const auto& path : produced) {
+                    if (path.filename().wstring().find(L"_SDR.") == std::wstring::npos)
+                        continue;
+                    double fraction = 0.0;
+                    if (saturated_fraction(path, fraction) && fraction > 0.05) {
+                        SPDLOG_ERROR("自检失败: SDR 渐变区有 {:.0f}% 像素被裁成纯白，色调映射可能退化了",
+                                     fraction * 100.0);
+                        return false;
+                    }
+                }
+            }
+
             SPDLOG_INFO("自检用例通过: {} 个文件", produced.size());
             return true;
         }  // NOLINT(clang-analyzer-cplusplus.NewDeleteLeaks): custom shared_ptr deleter is opaque
@@ -283,9 +358,9 @@ namespace gamesnap {
              ok;
         ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R8G8B8A8_UNORM, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, .sdr_white_nits = 80, .label = "SDR RGBA"}) &&
              ok;
-        ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R16G16B16A16_FLOAT, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, .sdr_white_nits = 203, .label = "HDR10(PQ) FP16"}) &&
+        ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R16G16B16A16_FLOAT, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, .sdr_white_nits = 100, .label = "HDR10(PQ) FP16"}) &&
              ok;
-        ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R16G16B16A16_FLOAT, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, .sdr_white_nits = 203, .label = "HDR10(PQ) FP16 641x361", .width = 641, .height = 361}) &&
+        ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R16G16B16A16_FLOAT, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, .sdr_white_nits = 100, .label = "HDR10(PQ) FP16 641x361", .width = 641, .height = 361}) &&
              ok;
         // WGC 的 FP16 帧实际是 scRGB（线性，1.0 = 80 nits），这才是真实采集帧的编码。
         ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R16G16B16A16_FLOAT, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, .sdr_white_nits = 80, .label = "HDR scRGB FP16"}) &&
@@ -297,3 +372,5 @@ namespace gamesnap {
     }
 
 }  // namespace gamesnap
+
+#endif  // GAMESNAP_SELFTEST

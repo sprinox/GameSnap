@@ -11,6 +11,11 @@ namespace gamesnap {
 
     namespace {
 
+        // 着色器槽位号，必须和 tonemap.hlsl 里的 register(...) 对齐。
+        // 曾经峰值 pass 在 HLSL 里写 u2、主机却绑 u0，写入被丢弃 → 峰值恒为 0 →
+        // 曲线退化成"SDR 白点硬裁剪"。用常量把两边钉在一起，改的时候起码要改名字。
+        constexpr UINT kPeakUavSlot = 2;  // RWStructuredBuffer<uint> PeakOut : register(u2)
+
         struct Constants {
             std::uint32_t width = 0;
             std::uint32_t height = 0;
@@ -308,16 +313,18 @@ namespace gamesnap {
             context->CSSetConstantBuffers(0, 1, &cbuf);
 
             // 1) 峰值归约：先清 0，再按 8x8 线程组做两级 max，结果留在 peak_buffer_。
+            //    槽位必须和 HLSL 的 register(u2) 一致，否则写入被丢弃、峰值恒为 0，
+            //    色调映射会退化成"SDR 白点硬裁剪"。
             const UINT clear[4]{};
             context->ClearUnorderedAccessViewUint(peak_uav_.get(), clear);
             context->CSSetShader(peak_shader_.get(), nullptr, 0);
             ID3D11ShaderResourceView* peak_in = input_view.get();
             context->CSSetShaderResources(0, 1, &peak_in);
             ID3D11UnorderedAccessView* peak_uav = peak_uav_.get();
-            context->CSSetUnorderedAccessViews(0, 1, &peak_uav, nullptr);
+            context->CSSetUnorderedAccessViews(kPeakUavSlot, 1, &peak_uav, nullptr);
             context->Dispatch((desc.Width + 7) / 8, (desc.Height + 7) / 8, 1);
             ID3D11UnorderedAccessView* no_uav = nullptr;
-            context->CSSetUnorderedAccessViews(0, 1, &no_uav, nullptr);
+            context->CSSetUnorderedAccessViews(kPeakUavSlot, 1, &no_uav, nullptr);
 
             // 2) 色调映射：tone map 从 t1 读回本帧峰值，不回读 CPU。
             context->CSSetShader(shader_.get(), nullptr, 0);
@@ -360,6 +367,10 @@ namespace gamesnap {
         }
 
         {
+            // 这里用阻塞 Map，但**前面已经在锁外等到 fence 完成**，所以正常情况下它立即返回。
+            // 试过 D3D11_MAP_FLAG_DO_NOT_WAIT：在 NVIDIA 驱动上即使 fence 已完成也持续返回
+            // DXGI_ERROR_WAS_STILL_DRAWING，导致 GPU 色调映射每次都失败回退 CPU——比它要防的
+            // 问题严重得多，所以退回阻塞 Map。真正的卡死风险由上面的 fence 超时兜住。
             std::scoped_lock lock(d3d_->context_mutex());
             auto* context = d3d_->context();
             if (FAILED(context->Map(readback_.get(), 0, D3D11_MAP_READ, 0, &mapped))) {

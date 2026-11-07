@@ -73,6 +73,9 @@ namespace gamesnap {
             [[nodiscard]] ID3D11ShaderResourceView* thumbnail_view() const noexcept {
                 return thumbnail_view_.get();
             }
+            [[nodiscard]] bool device_lost() const noexcept {
+                return device_lost_.load(std::memory_order_relaxed);
+            }
 
         private:
             bool create_swap_chain(HWND hwnd, std::uint32_t width, std::uint32_t height);
@@ -88,6 +91,8 @@ namespace gamesnap {
             winrt::com_ptr<ID3D11RenderTargetView> render_target_;
             winrt::com_ptr<ID3D11Texture2D> thumbnail_texture_;
             winrt::com_ptr<ID3D11ShaderResourceView> thumbnail_view_;
+            // Present 报设备移除后就别再画了（否则一路失败空转到 linger 到期）。
+            std::atomic<bool> device_lost_{false};
             std::uint32_t width_ = 0;
             std::uint32_t height_ = 0;
         };
@@ -200,7 +205,15 @@ namespace gamesnap {
 
         void OverlayDevice::end_frame() {
             ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-            swap_chain_->Present(1, 0);
+            // Present 前解绑 RTV：DXGI 对"仍绑着 RTV 的 back buffer 做 Present"会告警，
+            // 部分驱动上还会插入隐式同步。
+            context_->OMSetRenderTargets(0, nullptr, nullptr);
+            const HRESULT presented = swap_chain_->Present(1, 0);
+            if (presented == DXGI_ERROR_DEVICE_REMOVED || presented == DXGI_ERROR_DEVICE_RESET) {
+                // 设备没了就别再空转 Present，否则会一路失败到 linger 超时。
+                device_lost_.store(true, std::memory_order_relaxed);
+                SPDLOG_WARN("overlay Present 失败（设备移除）: {}", describe_hresult(presented));
+            }
         }
 
         class AudioPlayer {
@@ -289,7 +302,27 @@ namespace gamesnap {
 
         // 字体图集：固定文案 + 当前文件名的字形。文件名变化时重建（imgui 1.92 动态字体，
         // 后端会在 NewFrame 里更新纹理）。
-        ImFont* build_font(float scale, std::wstring const& filename) {
+        // 文件名里出现的码点是否都已经烘进图集（固定 UI 文案 + 之前见过的文件名）。
+        bool glyphs_covered(std::set<ImWchar> const& covered, std::wstring const& filename) {
+            for (wchar_t ch : filename) {
+                const auto code = static_cast<ImWchar>(ch);
+                if (code >= 0x20 && !covered.contains(code))
+                    return false;
+            }
+            return true;
+        }
+
+        void remember_glyphs(std::set<ImWchar>& covered, std::wstring const& filename, ImVector<ImWchar> const& ranges) {
+            // ranges 是 BuildRanges 的成对区间 [from, to]，把区间内全部标记为已覆盖。
+            for (int i = 0; i + 1 < ranges.Size; i += 2) {
+                for (ImWchar code = ranges.Data[i]; code <= ranges.Data[i + 1] && code != 0; ++code)
+                    covered.insert(code);
+            }
+            for (wchar_t ch : filename)
+                covered.insert(static_cast<ImWchar>(ch));
+        }
+
+        ImFont* build_font(float scale, std::wstring const& filename, std::set<ImWchar>& covered) {
             ImGuiIO& io = ImGui::GetIO();
             io.Fonts->Clear();
             ImFontGlyphRangesBuilder builder;
@@ -309,6 +342,7 @@ namespace gamesnap {
             }
             if (result == nullptr)
                 result = io.Fonts->AddFontDefaultVector();
+            remember_glyphs(covered, filename, ranges);
             return result;
         }
 
@@ -324,6 +358,9 @@ namespace gamesnap {
         bool imgui_ready = false;
         ImFont* font = nullptr;
         std::wstring font_filename;
+        // 已经烘进图集的码点。每次发布文件名都重建字体太贵（文件名里只有时间戳/序号在变），
+        // 只有出现新字符时才重建。
+        std::set<ImWchar> covered_glyphs;
         float scale = 1.0F;
         std::uint32_t panel_width = 0;
         std::uint32_t panel_height = 0;
@@ -457,7 +494,7 @@ namespace gamesnap {
             ImGui::GetStyle().FontSizeBase = 18.0F * state_->scale;
             state_->imgui_ready = true;
             state_->font_filename = bridge_->snapshot().filename;
-            state_->font = build_font(state_->scale, state_->font_filename);
+            state_->font = build_font(state_->scale, state_->font_filename, state_->covered_glyphs);
             SPDLOG_INFO("overlay 就绪（窗口/设备/字体/播放器常驻 {}s）", kOverlayLinger.count());
         }
         return true;
@@ -649,8 +686,11 @@ namespace gamesnap {
                 if (snapshot.filename != state.font_filename) {
                     state.font_filename = snapshot.filename;
                     filename_utf8 = wstring_to_utf8(state.font_filename);
-                    font = build_font(scale, state.font_filename);
-                    state.font = font;
+                    // 文件名里只有时间戳/序号在变，字符集几乎不变：缺字形才重建图集。
+                    if (!glyphs_covered(state.covered_glyphs, state.font_filename)) {
+                        font = build_font(scale, state.font_filename, state.covered_glyphs);
+                        state.font = font;
+                    }
                 }
                 // 缩略图和文件名是分两次发布的（先图、写盘后补文件名），
                 // 指针没变就不必重新上传纹理。
@@ -748,6 +788,8 @@ namespace gamesnap {
             ImGui::Render();
             state.device->begin_frame();
             state.device->end_frame();
+            if (state.device->device_lost())
+                break;  // 设备没了，直接退出面板循环，别再空转
         }
 
         // 收起后隐藏窗口：linger 期间不让 DWM 继续合成这个顶层表面，也不再 Present。

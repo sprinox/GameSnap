@@ -33,7 +33,7 @@ YAML 先加载，命令行参数随后覆盖。仓库根的 [config.example.yaml
 | `heic_quality` | 整数 0–100 | `90` | HEIC 质量 |
 | `heic_lossless` | 布尔 | `false` | HEIC 无损 |
 | `heic_preset` | 字符串 | `fast` | x265 预设，`ultrafast`..`veryslow` |
-| `jxl_distance` | 浮点 0–15 | `1.0` | JXL 距离：0 数学无损（需 `jxl_lossless: true`），1.0 视觉无损，越大越小越糊 |
+| `jxl_distance` | 浮点 0–15 | `1.0` | JXL 距离：0 数学无损（需 `jxl_lossless: true`），1.0 视觉无损，越大越糊、文件越小 |
 | `jxl_lossless` | 布尔 | `false` | JXL 无损（modular） |
 | `jxl_effort` | 整数 1–10 | `7` | JXL 编码强度，越高越慢、文件越小 |
 | `av1_encoder` | 字符串 | `auto` | AVIF 用哪个 AV1 编码库：`auto`（libavif 自选）/ `aom` / `svt` |

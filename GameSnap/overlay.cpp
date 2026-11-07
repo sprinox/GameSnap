@@ -76,6 +76,12 @@ namespace gamesnap {
             [[nodiscard]] bool device_lost() const noexcept {
                 return device_lost_.load(std::memory_order_relaxed);
             }
+            // 设备还能不能用：Present 报过移除，或者驱动报告设备已被移除（TDR/显卡下线）。
+            [[nodiscard]] bool healthy() const noexcept {
+                if (device_lost_.load(std::memory_order_relaxed))
+                    return false;
+                return device_ != nullptr && SUCCEEDED(device_->GetDeviceRemovedReason());
+            }
 
         private:
             bool create_swap_chain(HWND hwnd, std::uint32_t width, std::uint32_t height);
@@ -467,6 +473,12 @@ namespace gamesnap {
             // 显示器或 DPI 变了：交换链和字体图集都要按新尺寸重建（窗口本身保留）。
             release_ui();
         }
+        // 显卡下线 / TDR 后旧设备已经不可用：丢掉它，下面按需重建。
+        // 不这么做的话，之后每次触发都会拿着死设备画一帧、Present 失败、面板再也出不来。
+        if (state_->device && !state_->device->healthy()) {
+            SPDLOG_WARN("overlay 的 D3D 设备已失效（显卡下线或驱动重置），释放后等待重建");
+            release_ui();
+        }
         state_->scale = scale;
         state_->panel_width = panel_width;
         state_->panel_height = panel_height;
@@ -587,6 +599,12 @@ namespace gamesnap {
             }
             last_trigger = run_panel(snapshot.trigger_serial);
             idle_since = SteadyClock::now();
+            // 面板里 Present 失败（设备移除）会在 run_panel 内 break；这里把死设备放掉，
+            // 下次触发重新建，显卡恢复后能自愈。
+            if (state_ && state_->device && !state_->device->healthy()) {
+                SPDLOG_WARN("overlay 结束一帧时设备仍不可用，释放资源等待下次重建");
+                release_ui();
+            }
         }
 
         release_all();

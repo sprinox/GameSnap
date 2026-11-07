@@ -51,6 +51,8 @@ namespace gamesnap {
         static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
         static void CALLBACK win_event_proc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
                                             LONG id_object, LONG id_child, DWORD thread_id, DWORD time);
+        // DXGI 适配器变化（显卡拔插 / eGPU / 驱动重启 / 显卡下线）的线程池回调。
+        static void CALLBACK adapters_changed_proc(PVOID context, BOOLEAN timed_out);
 
         std::shared_ptr<CommandQueue> commands_;
         std::shared_ptr<StopSource> stop_signal_;
@@ -68,6 +70,11 @@ namespace gamesnap {
         NOTIFYICONDATAW tray_{};
         bool tray_added_ = false;
         UINT taskbar_created_ = 0;
+        // 适配器变化事件：比 WM_DISPLAYCHANGE 更准（单纯显卡下线不一定改显示拓扑）。
+        winrt::com_ptr<IDXGIFactory7> adapters_factory_;
+        HANDLE adapters_event_ = nullptr;
+        HANDLE adapters_wait_ = nullptr;
+        DWORD adapters_cookie_ = 0;
     };
 
 }  // namespace gamesnap

@@ -109,6 +109,32 @@ namespace gamesnap {
 
         add_tray_icon();
 
+        // 显卡/适配器变化：DXGI 的专用事件，比 WM_DISPLAYCHANGE 更准——
+        // 单纯一块显卡下线（eGPU 拔出、驱动重启）不一定改变显示拓扑，广播消息可能收不到。
+        // 收到后让 capture 重建资源；overlay 侧则在自己发现设备失效时释放重建。
+        {
+            winrt::com_ptr<IDXGIFactory7> factory7;
+            if (SUCCEEDED(::CreateDXGIFactory2(0, __uuidof(IDXGIFactory7), factory7.put_void()))) {
+                adapters_event_ = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (adapters_event_ != nullptr &&
+                    SUCCEEDED(factory7->RegisterAdaptersChangedEvent(adapters_event_, &adapters_cookie_))) {
+                    adapters_factory_ = factory7;
+                    if (::RegisterWaitForSingleObject(&adapters_wait_, adapters_event_,
+                                                      &SystemEventThread::adapters_changed_proc, this,
+                                                      INFINITE, WT_EXECUTEINWAITTHREAD) == FALSE) {
+                        adapters_wait_ = nullptr;
+                        SPDLOG_DEBUG("RegisterWaitForSingleObject(adapters) 失败: {}", ::GetLastError());
+                    } else {
+                        SPDLOG_INFO("已监听 DXGI 适配器变化事件（显卡拔插/驱动重启）");
+                    }
+                } else {
+                    ::CloseHandle(adapters_event_);
+                    adapters_event_ = nullptr;
+                    SPDLOG_DEBUG("注册 DXGI 适配器变化事件失败（旧系统），退回 WM_DISPLAYCHANGE");
+                }
+            }
+        }
+
         win_event_target().store(this, std::memory_order_release);
         foreground_hook_ = ::SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
@@ -130,6 +156,19 @@ namespace gamesnap {
         if (foreground_hook_ != nullptr) {
             ::UnhookWinEvent(foreground_hook_);
             foreground_hook_ = nullptr;
+        }
+        if (adapters_wait_ != nullptr) {
+            ::UnregisterWait(adapters_wait_);
+            adapters_wait_ = nullptr;
+        }
+        if (adapters_factory_ && adapters_cookie_ != 0) {
+            (void)adapters_factory_->UnregisterAdaptersChangedEvent(adapters_cookie_);
+            adapters_cookie_ = 0;
+        }
+        adapters_factory_ = nullptr;
+        if (adapters_event_ != nullptr) {
+            ::CloseHandle(adapters_event_);
+            adapters_event_ = nullptr;
         }
         win_event_target().store(nullptr, std::memory_order_release);
         remove_tray_icon();
@@ -245,6 +284,16 @@ namespace gamesnap {
             return;
         self->foreground_monitor_ = monitor;
         self->post(CommandKind::Validate, ReloadReason::DisplayChange);
+    }
+
+    void CALLBACK SystemEventThread::adapters_changed_proc(PVOID context, BOOLEAN timed_out) {
+        (void)timed_out;
+        auto* self = static_cast<SystemEventThread*>(context);
+        if (self == nullptr)
+            return;
+        // 线程池线程：只投递命令，不碰任何界面/设备资源。
+        SPDLOG_INFO("显卡/适配器发生变化，触发捕获资源重建");
+        self->post(CommandKind::Reload, ReloadReason::DeviceChange);
     }
 
     LRESULT CALLBACK SystemEventThread::window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {

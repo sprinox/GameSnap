@@ -89,7 +89,9 @@ namespace gamesnap {
 
             const int clamped = std::min(length, 512);
             std::wstring title(static_cast<std::size_t>(clamped) + 1, L'\0');
-            const int copied = ::GetWindowTextW(window, title.data(), clamped);
+            // GetWindowTextW 的 nMaxCount 包含结尾 NUL：传 clamped 只能拷到 clamped-1 个字符，
+            // 之前文件名里的窗口标题永远少最后一位。缓冲区已经多留了一个位置，这里传 clamped + 1。
+            const int copied = ::GetWindowTextW(window, title.data(), clamped + 1);
             if (copied <= 0)
                 return {};
             title.resize(static_cast<std::size_t>(copied));

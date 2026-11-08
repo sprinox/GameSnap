@@ -24,7 +24,10 @@ GameSnap.exe --key printscreen --out D:\shots
 ```
 
 手柄按 Xbox Share 键截图，`Ctrl+C` 退出。截图不包含鼠标指针。
-手柄热键需要 GameInput 运行时：Windows 11 自带，旧系统需安装随包分发的 `GameInputRedist.msi`。
+手柄热键需要 GameInput 运行时：Windows 11 自带，旧系统需安装随包分发的 `GameInputRedist.msi`；
+手柄本身要带 Share 键（Xbox Series X|S 手柄或同款第三方手柄），旧款 Xbox One 手柄没有 Share 键，
+启动日志里会明确写“该手柄没有 Share 键”。程序启动时会打开 GameInput 的后台输入
+（托盘程序没有前台窗口，不开的话读数回调根本不会派发）。
 
 ## 配置
 

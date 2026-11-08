@@ -133,9 +133,10 @@ namespace gamesnap {
         std::string_view heic_preset = "fast";  // x265 preset
 
         // JXL（libjxl）：distance 0 = 数学无损（还要 jxl_lossless），1.0 = 视觉无损；effort 越高越慢越小。
-        float jxl_distance = 1.0F;  // 0..15
-        bool jxl_lossless = false;
-        int jxl_effort = 7;  // 1..10
+        // 默认无损 + effort 5：基准里 4K 约 8.0 MB / 5 s，是体积与时间的平衡点。
+        float jxl_distance = 0.0F;  // 0..15
+        bool jxl_lossless = true;
+        int jxl_effort = 5;  // 1..10
 
         // AVIF 的 AV1 编码库与各库专属参数；-1 表示交给 avif_speed 推导。
         Av1Encoder av1_encoder = Av1Encoder::Auto;

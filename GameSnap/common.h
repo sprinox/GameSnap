@@ -212,8 +212,10 @@ namespace gamesnap {
         UINT hotkey_modifiers = 0;    // 修饰键组合
         bool hotkey_swallow = false;  // 是否吞掉热键（默认不吞，游戏仍能收到）
         MonitorChoice monitor = MonitorChoice::Primary;
-        ImageFormat hdr_format = ImageFormat::Avif;  // HDR 输出容器（仅 avif/heic）
-        ImageFormat sdr_format = ImageFormat::Webp;  // SDR 输出格式
+        ImageFormat hdr_format = ImageFormat::Avif;  // HDR 输出容器（仅 avif/heic/jxl）
+        // SDR 默认走 JXL 无损：实测（docs/benchmark.md）比 WebP 无损快 10~20 倍、体积更小，
+        // 而且是逐字节无损；effort 5 在 4K 约 5 s，要更快可降到 3。
+        ImageFormat sdr_format = ImageFormat::Jxl;
         ToneMapAlgorithm tone_map = ToneMapAlgorithm::Spline;
         ToneMapBackend tone_map_backend = ToneMapBackend::Auto;
         CodecOptions codec;

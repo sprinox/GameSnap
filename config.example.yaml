@@ -15,8 +15,10 @@ encode_threads: 2
 
 # HDR 由目标显示器动态决定；HDR 显示器保存 HDR 容器 + SDR 两份。
 # format_hdr 仅支持 avif / heic / jxl；format_sdr 支持 bmp / png / jpeg / webp / avif / heic / jxl。
+# 默认组合来自 docs/benchmark.md 的实测：SDR 用 JXL 无损（同体积比 WebP 快 10~20 倍、逐字节无损），
+# HDR 用 AVIF（avif_speed: 10 时 4K 约 0.5 s，speed 调小只小 8% 却慢 8 倍）。
 format_hdr: avif
-format_sdr: webp
+format_sdr: jxl
 
 # ── 编码参数 ────────────────────────────────────────────────────────────────
 # PNG：compression 0..9，越大越慢、文件越小
@@ -26,26 +28,30 @@ png_compression: 6
 jpeg_quality: 95
 
 # WebP：quality 0..100；lossless=true 时 quality 忽略；method 0..6，越大越慢
+# （实测：无损时被 JXL 全面压制，仅在需要 WebP 兼容性时才用）
 webp_quality: 90
 webp_lossless: false
 webp_method: 4
 
 # AVIF：quality 0..100；lossless=true 时 quality 忽略；speed 0..10，越大越快
+# 注意：AVIF 的“无损”只在 YUV 域成立（RGB→YCbCr 有量化损失），逐字节无损请用 JXL。
 avif_quality: 90
 avif_lossless: false
 avif_speed: 10
 
 # HEIC（x265）：quality 0..100；lossless=true 时 quality 忽略；
 # preset: ultrafast/superfast/veryfast/faster/fast/medium/slow/slower/veryslow
+# 注意：preset 只在有损模式下影响体积（veryslow 比 fast 小约 28%）；无损模式下差异 <1%。
 heic_quality: 90
 heic_lossless: false
 heic_preset: fast
 
 # JXL（libjxl）：distance 0..15，0 表示数学无损（还要 jxl_lossless: true），1.0 = 视觉无损
-jxl_distance: 1.0
-jxl_lossless: false
-# effort 1..10，越高越慢、文件越小
-jxl_effort: 7
+# effort 1..10，越高越慢、文件越小。默认无损 + effort 5：4K 约 8.0 MB / 5 s（基准平衡点）；
+# 嫌慢改 3（1.4 s，8.7 MB），要更小改 7（11 s，7.7 MB）。
+jxl_distance: 0.0
+jxl_lossless: true
+jxl_effort: 5
 
 # AVIF 的 AV1 编码库：auto（libavif 自己挑）/ aom / svt
 # 注意：SVT-AV1 只接受 4:2:0，会退化为色度抽样，并跳过 SDR AVIF 内嵌的 gain map

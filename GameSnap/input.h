@@ -47,6 +47,9 @@ namespace gamesnap {
         static LRESULT CALLBACK keyboard_proc(int code, WPARAM wparam, LPARAM lparam);
         static void CALLBACK reading_callback(gi::GameInputCallbackToken callback_token, void* context,
                                               gi::IGameInputReading* reading);
+        static void CALLBACK device_callback(gi::GameInputCallbackToken callback_token, void* context,
+                                             gi::GameInputDeviceEvent device_event,
+                                             gi::IGameInputDevice* device);
 
         Config config_;
         std::shared_ptr<CommandQueue> commands_;
@@ -60,6 +63,7 @@ namespace gamesnap {
 
         winrt::com_ptr<gi::IGameInput> game_input_;
         gi::GameInputCallbackToken reading_token_ = 0;  // 0 表示未注册
+        gi::GameInputCallbackToken device_token_ = 0;   // 手柄插拔日志用
         std::atomic<bool> share_latched_{false};        // GameInput 派发线程可能并发进来
     };
 

@@ -92,12 +92,26 @@ namespace gamesnap {
                 "需要手柄热键时请安装随包分发的 GameInputRedist.msi 或更新 Windows",
                 describe_hresult(gameinput_hr));
         } else {
+            // 托盘程序没有前台窗口，而 GameInput 默认只把读数派发给“当前聚焦”的进程：
+            // 不开后台输入时，下面的读数回调永远不会被调用（实测手柄 Share 键完全没反应）。
+            game_input_->EnableBackgroundInput(true);
+
+            // 设备回调只用于日志：确认手柄有没有被识别、有没有 Share 键。
+            const HRESULT device_hr = game_input_->RegisterDeviceCallback(
+                nullptr, gi::GameInputKindGamepad, this, &InputThread::device_callback, &device_token_);
+            if (FAILED(device_hr)) {
+                SPDLOG_DEBUG("注册手柄设备回调失败: {}", describe_hresult(device_hr));
+                device_token_ = 0;
+            }
+
             // 手柄用 GameInput 读数回调；回调在 GameInput 的派发线程上执行，context 传 this。
             const HRESULT register_hr = game_input_->RegisterReadingCallback(
                 nullptr, gi::GameInputKindSystemButton, this, &InputThread::reading_callback, &reading_token_);
             if (FAILED(register_hr)) {
                 SPDLOG_WARN("注册手柄读数回调失败: {}", describe_hresult(register_hr));
                 reading_token_ = 0;
+            } else {
+                SPDLOG_INFO("手柄 Share 键已启用（GameInput，后台输入已打开）");
             }
         }
 
@@ -129,6 +143,10 @@ namespace gamesnap {
             // 因此在 run() 退出前反注册，reading_callback 里的裸 this 是安全的。
             game_input_->UnregisterCallback(reading_token_);
             reading_token_ = 0;
+        }
+        if (game_input_ && device_token_ != 0) {
+            game_input_->UnregisterCallback(device_token_);
+            device_token_ = 0;
         }
         game_input_ = nullptr;
 
@@ -194,6 +212,26 @@ namespace gamesnap {
             ui_->on_trigger();
     }
 
+    void CALLBACK InputThread::device_callback([[maybe_unused]] gi::GameInputCallbackToken callback_token,
+                                               void* context, gi::GameInputDeviceEvent device_event,
+                                               gi::IGameInputDevice* device) {
+        if (device == nullptr)
+            return;
+        const bool connected = device_event == gi::GameInputDeviceEventConnected;
+        if (!connected)
+            return;
+
+        // 只打日志，方便排查“手柄没反应”：能看出手柄识别到没有、有没有 Share 键。
+        const gi::GameInputSystemButtons system_buttons = device->GetSupportedSystemButtons();
+        const bool has_share = (system_buttons & gi::GameInputSystemButtonShare) != 0;
+        (void)context;
+        if (has_share)
+            SPDLOG_INFO("检测到手柄，支持 Share 键（0x{:X}）", static_cast<unsigned>(system_buttons));
+        else
+            SPDLOG_INFO("检测到手柄，但该手柄没有 Share 键（支持的系统键 0x{:X}）；手柄热键需要 Xbox 系列手柄",
+                        static_cast<unsigned>(system_buttons));
+    }
+
     void InputThread::on_reading(gi::IGameInputReading& reading) {
         gi::GameInputSystemButtons buttons{};
         if (!reading.GetSystemButtonState(&buttons))
@@ -201,7 +239,7 @@ namespace gamesnap {
 
         const bool share = (buttons & gi::GameInputSystemButtonShare) != 0;
         if (share && !share_latched_.exchange(true, std::memory_order_acq_rel)) {
-            SPDLOG_DEBUG("手柄 Share 键触发截图");
+            SPDLOG_INFO("手柄 Share 键触发截图");
             trigger(SteadyClock::now());
         } else if (!share) {
             share_latched_.store(false, std::memory_order_release);

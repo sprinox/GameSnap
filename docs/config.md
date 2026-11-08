@@ -19,7 +19,7 @@ YAML 先加载，命令行参数随后覆盖。仓库根的 [config.example.yaml
 | `swallow` | 布尔 | `false` | 是否吞掉热键，`true` 时游戏收不到 |
 | `monitor` | 字符串 | `primary` | `primary`：主显示器；`foreground`：前台窗口所在显示器 |
 | `format_hdr` | 字符串 | `avif` | HDR 容器，仅 `avif` / `heic` / `jxl` |
-| `format_sdr` | 字符串 | `webp` | SDR 格式：`bmp` / `png` / `jpeg` / `webp` / `avif` / `heic` / `jxl` |
+| `format_sdr` | 字符串 | `jxl` | SDR 格式：`bmp` / `png` / `jpeg` / `webp` / `avif` / `heic` / `jxl`（默认 JXL 无损，见 `docs/benchmark.md`） |
 | `tone_map` | 字符串 | `spline` | HDR→SDR 算法：`spline` / `analysis` |
 | `tone_map_backend` | 字符串 | `auto` | HDR→SDR 计算后端：`auto` / `gpu` / `cpu` |
 | `png_compression` | 整数 0–9 | `6` | PNG 压缩级别，越高越慢/越小 |
@@ -33,9 +33,9 @@ YAML 先加载，命令行参数随后覆盖。仓库根的 [config.example.yaml
 | `heic_quality` | 整数 0–100 | `90` | HEIC 质量 |
 | `heic_lossless` | 布尔 | `false` | HEIC 无损 |
 | `heic_preset` | 字符串 | `fast` | x265 预设，`ultrafast`..`veryslow` |
-| `jxl_distance` | 浮点 0–15 | `1.0` | JXL 距离：0 数学无损（需 `jxl_lossless: true`），1.0 视觉无损，越大越糊、文件越小 |
-| `jxl_lossless` | 布尔 | `false` | JXL 无损（modular） |
-| `jxl_effort` | 整数 1–10 | `7` | JXL 编码强度，越高越慢、文件越小 |
+| `jxl_distance` | 浮点 0–15 | `0.0` | JXL 距离：0 数学无损（需 `jxl_lossless: true`），1.0 视觉无损，越大越糊、文件越小 |
+| `jxl_lossless` | 布尔 | `true` | JXL 无损（modular）；逐字节无损，解码结果与输入完全一致 |
+| `jxl_effort` | 整数 1–10 | `5` | JXL 编码强度，越高越慢、文件越小（4K 实测：1≈0.3 s/10.7 MB，5≈5 s/8.0 MB，7≈11 s/7.7 MB） |
 | `av1_encoder` | 字符串 | `auto` | AVIF 用哪个 AV1 编码库：`auto`（libavif 自选）/ `aom` / `svt` |
 | `aom_cpu_used` | 整数 -1–8 | `-1` | aom 的 `-cpu-used`；-1 表示由 `avif_speed` 推导 |
 | `svt_preset` | 整数 -1–13 | `-1` | SVT-AV1 的 preset；-1 表示由 `avif_speed` 推导 |

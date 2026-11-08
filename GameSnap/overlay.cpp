@@ -37,7 +37,8 @@ namespace gamesnap {
         // 超过就整体释放，回到“闲置不占显存/内存”。
         constexpr auto kOverlayLinger = std::chrono::seconds(30);
         constexpr float kBasePanelWidth = 440.0F;
-        // 内容高度 = 上下 padding 32 + 缩略图 90 = 122；再留一点余量和文件名换行的空间。
+        // 这是合成表面（交换链/窗口）的高度上限：卡片本身按内容算高度
+        // （缩略图上下各 16px padding），只有文件名换行很多时才会用到这里的余量。
         constexpr float kBasePanelHeight = 150.0F;
         constexpr float kBaseMargin = 16.0F;
 
@@ -470,8 +471,9 @@ namespace gamesnap {
             monitor_info.cbSize = sizeof(monitor_info);
             if (::GetMonitorInfoW(pick_monitor(monitor_), &monitor_info) == FALSE) {
                 // 没有显示器（或句柄失效）：退化成屏幕尺寸，避免把窗口放到负坐标。
-                monitor_info.rcWork = RECT{0, 0, ::GetSystemMetrics(SM_CXSCREEN),
-                                           ::GetSystemMetrics(SM_CYSCREEN)};
+                const RECT screen{0, 0, ::GetSystemMetrics(SM_CXSCREEN), ::GetSystemMetrics(SM_CYSCREEN)};
+                monitor_info.rcMonitor = screen;
+                monitor_info.rcWork = screen;
             }
 
             // DirectComposition 负责合成：只需要 NOREDIRECTIONBITMAP，不要再叠 WS_EX_LAYERED
@@ -493,7 +495,7 @@ namespace gamesnap {
                              ::GetLastError());
             }
             // 先把 1x1 窗口放到目标显示器再取 DPI，避免沿用主显示器/旧窗口的 DPI。
-            ::SetWindowPos(hwnd, HWND_TOPMOST, monitor_info.rcWork.right - 1, monitor_info.rcWork.bottom - 1, 1, 1,
+            ::SetWindowPos(hwnd, HWND_TOPMOST, monitor_info.rcMonitor.right - 1, monitor_info.rcMonitor.bottom - 1, 1, 1,
                            SWP_NOACTIVATE);
         }
 
@@ -650,8 +652,9 @@ namespace gamesnap {
         monitor_info.cbSize = sizeof(monitor_info);
         if (::GetMonitorInfoW(pick_monitor(monitor_), &monitor_info) == FALSE) {
             // 没有显示器时按屏幕尺寸兜底，面板位置仍有定义。
-            monitor_info.rcWork = RECT{0, 0, ::GetSystemMetrics(SM_CXSCREEN),
-                                       ::GetSystemMetrics(SM_CYSCREEN)};
+            const RECT screen{0, 0, ::GetSystemMetrics(SM_CXSCREEN), ::GetSystemMetrics(SM_CYSCREEN)};
+            monitor_info.rcMonitor = screen;
+            monitor_info.rcWork = screen;
         }
 
         const float scale = state.scale;
@@ -661,11 +664,13 @@ namespace gamesnap {
         ImFont* font = state.font;
         std::string filename_utf8 = wstring_to_utf8(state.font_filename);
 
+        // 用 rcMonitor 而不是 rcWork：面板要贴着屏幕右下角、和任务栏无关。
+        // 右边距与下边距都取 margin，而且下边距按**卡片**高度算（合成表面比卡片高，
+        // 多出来的是透明区域，如果按表面高度摆，卡片看起来会偏上）。
         const float margin = kBaseMargin * scale;
-        const float visible_x = static_cast<float>(monitor_info.rcWork.right - panel_width) - margin;
-        const float hidden_x = static_cast<float>(monitor_info.rcWork.right) + 8.0F;
-        const int panel_y =
-            monitor_info.rcWork.bottom - static_cast<int>(panel_height) - static_cast<int>(margin);
+        const float visible_x = static_cast<float>(monitor_info.rcMonitor.right - panel_width) - margin;
+        const float hidden_x = static_cast<float>(monitor_info.rcMonitor.right) + 8.0F;
+        const int screen_bottom = static_cast<int>(monitor_info.rcMonitor.bottom);
         float panel_x = hidden_x;
         bool shown = true;
         bool animating = true;
@@ -727,10 +732,6 @@ namespace gamesnap {
             if (!want_visible && !shown && !animating && panel_x >= hidden_x - 1.0F)
                 break;
 
-            ::SetWindowPos(state.hwnd, HWND_TOPMOST, static_cast<int>(panel_x), panel_y,
-                           static_cast<int>(panel_width), static_cast<int>(panel_height),
-                           SWP_NOACTIVATE | SWP_SHOWWINDOW);
-
             if (snapshot.info_serial != last_info) {
                 last_info = snapshot.info_serial;
                 if (snapshot.filename != state.font_filename) {
@@ -759,28 +760,51 @@ namespace gamesnap {
             io.DeltaTime = delta > 0.0F ? delta : 1.0F / 60.0F;
             ImGui_ImplDX11_NewFrame();
             ImGui::NewFrame();
+            ImGui::PushFont(font, 18.0F * scale);
+
+            const float padding = 16.0F * scale;
+            const float thumb_width = 160.0F * scale;
+            const float thumb_height = 90.0F * scale;
+            const float text_x = padding + thumb_width + 14.0F * scale;
+            const float text_width = static_cast<float>(panel_width) - text_x - padding;
+
+            // 卡片高度按内容算：缩略图上下各留一个 padding（上边距 = 下边距），
+            // 文件名换行更高时卡片跟着长高。之前固定 150 比缩略图高 28px，底部多出一截"下巴"。
+            const std::string shown_name = snapshot.filename.empty() ? "正在生成截图…" : filename_utf8;
+            const float text_height = ImGui::GetTextLineHeight() + ImGui::GetStyle().ItemSpacing.y +
+                                      ImGui::CalcTextSize(shown_name.c_str(), nullptr, false, text_width).y;
+            // 卡片贴在合成表面底部：表面高度固定（swapchain 不用重建），卡片按内容收缩，
+            // 上方空出来的是透明区域。
+            const float card_height =
+                std::min(static_cast<float>(panel_height), std::max(thumb_height, text_height) + (padding * 2.0F));
+            const float card_top = static_cast<float>(panel_height) - card_height;
+
+            // 定位：卡片底边到屏幕底、右边到屏幕右都是 margin（用 rcMonitor，与任务栏无关）。
+            // 表面底边落在“屏幕底 - margin”，卡片又贴着表面底部，所以下边距正好等于右边距。
+            const int panel_y =
+                screen_bottom - static_cast<int>(panel_height) - static_cast<int>(std::lround(margin));
+            ::SetWindowPos(state.hwnd, HWND_TOPMOST, static_cast<int>(std::lround(panel_x)), panel_y,
+                           static_cast<int>(panel_width), static_cast<int>(panel_height),
+                           SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
             ImDrawList* background = ImGui::GetBackgroundDrawList();
-            background->AddRectFilled(ImVec2(0, 0), ImVec2(static_cast<float>(panel_width), static_cast<float>(panel_height)),
+            background->AddRectFilled(ImVec2(0, card_top), ImVec2(static_cast<float>(panel_width), card_top + card_height),
                                       IM_COL32(18, 20, 26, 205), 14.0F * scale);
-            background->AddRect(ImVec2(1, 1), ImVec2(static_cast<float>(panel_width) - 1, static_cast<float>(panel_height) - 1),
+            background->AddRect(ImVec2(1, card_top + 1),
+                                ImVec2(static_cast<float>(panel_width) - 1, card_top + card_height - 1),
                                 IM_COL32(255, 255, 255, 32), 14.0F * scale, 0, 1.0F);
 
             const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                                            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
                                            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBackground |
                                            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNav;
-            ImGui::PushFont(font, 18.0F * scale);
-            ImGui::SetNextWindowPos(ImVec2(0, 0));
-            ImGui::SetNextWindowSize(ImVec2(static_cast<float>(panel_width), static_cast<float>(panel_height)));
+            ImGui::SetNextWindowPos(ImVec2(0, card_top));
+            ImGui::SetNextWindowSize(ImVec2(static_cast<float>(panel_width), card_height));
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
             ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0F);
             ImGui::Begin("##overlay", nullptr, flags);
             ImGui::PopStyleVar(2);
 
-            const float padding = 16.0F * scale;
-            const float thumb_width = 160.0F * scale;
-            const float thumb_height = 90.0F * scale;
             ImGui::SetCursorPos(ImVec2(padding, padding));
             if (state.device->thumbnail_view() != nullptr) {
                 ImGui::Image(ImTextureRef(static_cast<ImTextureID>(
@@ -795,7 +819,6 @@ namespace gamesnap {
                 ImGui::Dummy(ImVec2(thumb_width, thumb_height));
             }
 
-            const float text_x = padding + thumb_width + 14.0F * scale;
             ImGui::SetCursorPos(ImVec2(text_x, padding));
             ImGui::BeginGroup();
             // 标题行：左边 GameSnap，右边编码状态。状态右对齐，放不下时退回短文案，
@@ -825,9 +848,8 @@ namespace gamesnap {
             ImGui::TextUnformatted(status_text);
 
             ImGui::Spacing();
-            const std::string filename = snapshot.filename.empty() ? "正在生成截图…" : filename_utf8;
             ImGui::PushTextWrapPos(static_cast<float>(panel_width) - padding);
-            ImGui::TextWrapped("%s", filename.c_str());
+            ImGui::TextWrapped("%s", shown_name.c_str());
             ImGui::PopTextWrapPos();
             ImGui::EndGroup();
             ImGui::End();

@@ -73,7 +73,19 @@ AVIF 支持 quality/lossless/speed；HEIC（x265）支持 quality/lossless/prese
 
 ## 日志
 
-文件位于 exe 目录的 `logs\GameSnap.log`，UTF-8，单文件 8 MB、保留 2 个。控制台同时输出。
+文件位于 exe 目录的 `logs\GameSnap.log`，UTF-8，单文件 8 MB、保留 2 个。
+
+控制台输出是**按运行时有没有控制台**自动开关的：
+
+| 场景 | 控制台输出 |
+|---|---|
+| 双击启动（Windows 子系统，没有控制台） | 无，只写文件 |
+| 从 cmd / PowerShell 启动 | 有：`AttachConsole(ATTACH_PARENT_PROCESS)` 挂上父控制台并重定向标准流 |
+| stdout 已重定向到文件/管道 | 有，且写进重定向目标（不会去抢控制台） |
+
+程序是 Windows 子系统，双击不会弹出控制台窗口；启动期的致命错误（CPU 不支持 AVX2、配置解析失败）
+在没有控制台时会用 MessageBox 提示，不会静默退出。
+
 格式：
 
 ```text

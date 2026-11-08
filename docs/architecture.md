@@ -126,7 +126,9 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 - **右键菜单**：`退出`（`StopSource::request_stop()`，和 Ctrl+C 走同一条收尾路径）。双击图标也弹出这个菜单。
 - 收到 `TaskbarCreated` 广播（explorer 重启）时重新添加图标，否则图标会凭空消失。
 - 捕获资源初始化成功后调 `SystemEventThread::notify_ready()`：向窗口投递 `kTrayNotifyReady`，由线程用 `NIF_INFO` 气球通知（Win10+ 显示为系统通知）。
-- 控制台保持原样可见，不做隐藏/最小化（`SW_HIDE` 对 conhost 窗口不可靠，`FreeConsole` 又会连带丢掉 Ctrl+C，代价大于收益）。
+- 进程是 **Windows 子系统**（`/SUBSYSTEM:WINDOWS` + `wmainCRTStartup`）：双击不会弹控制台窗口。
+  从终端启动时由 `ensure_console_available()` 调 `AttachConsole(ATTACH_PARENT_PROCESS)` 挂上父控制台，
+  日志额外输出到终端；没有控制台（双击）时就只写 `logs\GameSnap.log`。
 
 托盘相关操作全部在 system-events 线程内完成，跨线程只有一个 `std::atomic<HWND>` 和 `PostMessageW`。
 - 捕获资源初始化成功后调 `SystemEventThread::notify_ready()`：向窗口投递 `kTrayNotifyReady`，由线程用 `NIF_INFO` 气球通知（Win10+ 显示为系统通知）。

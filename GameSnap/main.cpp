@@ -162,6 +162,11 @@ int wmain(int argc, wchar_t** argv) {
     gamesnap::install_new_handler();
     gamesnap::init_logging();
     if (!gamesnap::check_cpu_features()) {
+        // Windows 子系统（双击启动）没有控制台，critical 日志没人看得见：补一个对话框。
+        if (::GetConsoleWindow() == nullptr) {
+            (void)::MessageBoxW(nullptr, L"CPU 不支持 AVX2 / F16C，GameSnap 无法运行。", L"GameSnap",
+                                MB_ICONERROR | MB_OK);
+        }
         spdlog::shutdown();
         return 1;
     }
@@ -174,6 +179,12 @@ int wmain(int argc, wchar_t** argv) {
                                     return arg != nullptr &&
                                            (std::wcscmp(arg, L"--help") == 0 || std::wcscmp(arg, L"-h") == 0);
                                 });
+        // 同样：没有控制台时把"配置有问题"这件事弹出来，别让它只躺在日志里。
+        if (!help_requested && ::GetConsoleWindow() == nullptr) {
+            (void)::MessageBoxW(nullptr,
+                                L"启动参数或配置文件有误。\n详细信息见 exe 目录下的 logs\\GameSnap.log。",
+                                L"GameSnap", MB_ICONERROR | MB_OK);
+        }
         spdlog::shutdown();
         return help_requested ? 0 : 2;
     }

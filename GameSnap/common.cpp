@@ -24,6 +24,7 @@
 
 #include <cxxopts.hpp>
 
+#include <spdlog/sinks/null_sink.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
@@ -48,6 +49,32 @@ namespace gamesnap {
                 return std::filesystem::path(buffer).parent_path();
             }();
             return kDir;
+        }
+
+        // 控制台是否可用，按“有没有真的控制台”判断，而不是靠编译期子系统宏：
+        //   * Console 子系统（/SUBSYSTEM:CONSOLE）：从资源管理器或终端启动都会带控制台，
+        //     GetConsoleWindow() 非空 → 直接用；
+        //   * Windows 子系统（/SUBSYSTEM:WINDOWS）：默认没有控制台；从终端启动时用
+        //     AttachConsole 挂上父进程的控制台，并把标准流重定向过去（否则 spdlog 写无效句柄）。
+        //     但如果 stdout 已经被重定向到文件/管道（GetStdHandle 有效），就不要抢过来改，
+        //     否则 `GameSnap --help > out.txt` 会写进控制台而不是文件。
+        // 返回 false 表示既没有控制台也没别的可写目标，调用方就不要加控制台 sink。
+        bool ensure_console_available() {
+            if (::GetConsoleWindow() != nullptr)
+                return true;
+
+            const HANDLE stdout_handle = ::GetStdHandle(STD_OUTPUT_HANDLE);
+            if (stdout_handle != nullptr && stdout_handle != INVALID_HANDLE_VALUE)
+                return true;
+
+            if (::AttachConsole(ATTACH_PARENT_PROCESS) == FALSE)
+                return false;
+
+            std::FILE* reopened = nullptr;
+            (void)::freopen_s(&reopened, "CONOUT$", "w", stdout);
+            (void)::freopen_s(&reopened, "CONOUT$", "w", stderr);
+            (void)::freopen_s(&reopened, "CONIN$", "r", stdin);
+            return true;
         }
 
         // 日志放在 exe 旁边，和启动时的当前目录无关。
@@ -459,7 +486,12 @@ namespace gamesnap {
 
     void init_logging() {
         std::vector<spdlog::sink_ptr> sinks;
-        sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
+
+        // 只有真的有控制台（Console 子系统，或 Windows 子系统从终端启动）才加控制台 sink；
+        // 否则日志只进文件，避免往无效句柄写、也避免多创建一个看不见的控制台。
+        const bool console = ensure_console_available();
+        if (console)
+            sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
 
         const auto log_path = log_file_path();
         if (!probe_writable(log_path)) {
@@ -480,6 +512,11 @@ namespace gamesnap {
                 (void)std::fwrite(message.data(), 1, message.size(), stderr);
             }
         }
+
+        // 两个 sink 都可能没建起来（无控制台 + 日志文件不可写）：这时至少给一个空 sink，
+        // 否则 spdlog 的 logger 构造会崩。
+        if (sinks.empty())
+            sinks.push_back(std::make_shared<spdlog::sinks::null_sink_mt>());
 
         auto logger = std::make_shared<spdlog::logger>("gamesnap", sinks.begin(), sinks.end());
         logger->set_level(spdlog::level::info);

@@ -484,6 +484,31 @@ namespace gamesnap {
             ::RoUninitialize();
     }
 
+    void write_console_utf8(std::string_view text, bool to_stderr) {
+        if (text.empty())
+            return;
+        const HANDLE handle = ::GetStdHandle(to_stderr ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE);
+        if (handle != nullptr && handle != INVALID_HANDLE_VALUE) {
+            // 控制台句柄：用 WriteConsoleW 输出宽字符，绕开会话代码页
+            // （cmd 默认 936，直接写 UTF-8 字节会变成乱码）。
+            const int length = static_cast<int>(text.size());
+            const int wide_length = ::MultiByteToWideChar(CP_UTF8, 0, text.data(), length, nullptr, 0);
+            if (wide_length > 0) {
+                std::wstring wide(static_cast<std::size_t>(wide_length), L'\0');
+                if (::MultiByteToWideChar(CP_UTF8, 0, text.data(), length, wide.data(), wide_length) ==
+                    wide_length) {
+                    DWORD written = 0;
+                    if (::WriteConsoleW(handle, wide.data(), static_cast<DWORD>(wide.size()), &written, nullptr) != 0)
+                        return;
+                }
+            }
+        }
+        // 不是控制台（重定向到文件/管道）：按原始 UTF-8 字节写，交给下游解码。
+        std::FILE* const file = to_stderr ? stderr : stdout;
+        (void)std::fwrite(text.data(), 1, text.size(), file);
+        (void)std::fflush(file);
+    }
+
     void init_logging() {
         std::vector<spdlog::sink_ptr> sinks;
 
@@ -497,7 +522,7 @@ namespace gamesnap {
         if (!probe_writable(log_path)) {
             const std::string message =
                 fmt::format("GameSnap: 无法写入日志文件 {}，仅输出到控制台\n", log_path.string());
-            (void)std::fwrite(message.data(), 1, message.size(), stderr);
+            write_console_utf8(message, true);
         } else {
             try {
                 auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
@@ -506,10 +531,10 @@ namespace gamesnap {
             } catch (std::exception const& e) {
                 const std::string message =
                     fmt::format("GameSnap: cannot open log file ({}), logging to console only\n", e.what());
-                (void)std::fwrite(message.data(), 1, message.size(), stderr);
+                write_console_utf8(message, true);
             } catch (...) {
                 constexpr std::string_view message = "GameSnap: cannot open log file, logging to console only\n";
-                (void)std::fwrite(message.data(), 1, message.size(), stderr);
+                write_console_utf8(message, true);
             }
         }
 
@@ -547,8 +572,7 @@ namespace gamesnap {
             std::set_new_handler(nullptr);
 
             constexpr std::string_view message = "GameSnap: out of memory\n";
-            (void)std::fwrite(message.data(), 1, message.size(), stderr);
-            (void)std::fflush(stderr);
+            write_console_utf8(message, true);
 
             try {
                 SPDLOG_CRITICAL("std::bad_alloc: 内存分配失败");
@@ -744,8 +768,7 @@ namespace gamesnap {
         const auto print_help = [&options] {
             std::string help = options.help();
             help += "\n手柄：按 Xbox Share 键触发截图。\n退出：Ctrl+C。日志位于 exe 目录下的 logs\\GameSnap.log。\n";
-            (void)std::fwrite(help.data(), 1, help.size(), stdout);
-            (void)std::fflush(stdout);
+            write_console_utf8(help);
         };
 
         cxxopts::ParseResult result;

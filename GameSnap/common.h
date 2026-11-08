@@ -89,6 +89,11 @@ namespace gamesnap {
     std::wstring utf8_to_wstring(std::string_view str);
 
     // ── 日志 / 崩溃 ──────────────────────────────────────────────────────────
+    // 交给控制台（或重定向目标）的一段 UTF-8 文本。
+    // 控制台用 WriteConsoleW，绕开会话代码页（cmd 默认 936 时中文会乱码）；
+    // 句柄不是控制台（重定向到文件/管道）时退回 fwrite 原始 UTF-8 字节。
+    void write_console_utf8(std::string_view text, bool to_stderr = false);
+
     void init_logging();
     void install_terminate_handler();
     void install_new_handler();

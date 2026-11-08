@@ -45,8 +45,7 @@ namespace {
             // 走 std::terminate() 再写日志会直接死锁。
             if (ctrl_c_count().fetch_add(1, std::memory_order_acq_rel) >= 1) {
                 constexpr std::string_view kMessage = "GameSnap: 收尾卡住，强制退出\n";
-                (void)std::fwrite(kMessage.data(), 1, kMessage.size(), stderr);
-                (void)std::fflush(stderr);
+                gamesnap::write_console_utf8(kMessage, true);
                 ::_exit(1);
             }
             return TRUE;

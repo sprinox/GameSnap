@@ -73,3 +73,5 @@
 **GNU General Public License v3.0 or later**，见 [LICENSE](LICENSE)。
 
 各依赖的许可证与静态链接合规说明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+
+感谢 [LINUX DO](https://linux.do/) 社区

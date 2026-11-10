@@ -1,6 +1,6 @@
 # GameSnap 配置示例
 #
-# 用法：复制本文件为 config.yaml，按需修改（config.yaml 才是程序实际加载的文件）。
+# 用法：首次启动会在 exe 目录自动生成一份 config.yaml；也可以复制本文件为 config.yaml 再改。
 # 查找顺序：--config <路径> → exe 目录\config.yaml → 当前目录\config.yaml。
 # 命令行参数优先于配置文件；所有项都可省略，省略即使用默认值。
 # 值非法（未知热键、类型不对等）会记录 error 并回退默认值。
@@ -8,6 +8,16 @@
 # ── 输出 ────────────────────────────────────────────────────────────────────
 # 截图目录；不存在会自动创建。省略 = %USERPROFILE%\Pictures\GameSnap
 # output_dir: D:\GameSnapShots
+
+# 文件名模板（不含 _HDR/_SDR 与扩展名）。可用占位符：
+#   {title}   截图时前台窗口的标题
+#   {exe}     前台进程的 exe 名（不含扩展名）
+#   {process} 前台进程的显示名（exe 版本信息里的 FileDescription，取不到时等于 {exe}）
+#   {time}    时间戳 YYYYMMDD_HHMMSS_mmm
+#   {seq}     本次运行的截图序号（4 位）
+# 建议保留 {time} 或 {seq}，否则同一秒内多张截图会重名覆盖。
+# 例："{title}_{time}_{seq}"、"{process} {time}"、"{exe}-{seq}"
+filename_pattern: "{title}_{time}_{seq}"
 
 # ── 编码 ────────────────────────────────────────────────────────────────────
 # 编码线程数（1..8）。截图在 capture 线程串行，转换/写盘按线程并行。

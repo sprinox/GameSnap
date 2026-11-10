@@ -6,14 +6,15 @@
 2. exe 目录下的 `config.yaml`
 3. 当前目录下的 `config.yaml`
 
-YAML 先加载，命令行参数随后覆盖。仓库根的 [config.example.yaml](../config.example.yaml) 是带注释的模板，
-复制成 `config.yaml` 再修改。
+YAML 先加载，命令行参数随后覆盖。**首次启动**如果三处都没有配置文件，程序会在 exe 目录自动生成一份
+带注释的 `config.yaml`（等价于 [config.example.yaml](../config.example.yaml)），直接改就行。
 
 ## YAML 字段
 
 | 键 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `output_dir` | 字符串 | `%USERPROFILE%\Pictures\GameSnap` | 截图目录，不存在时自动创建 |
+| `filename_pattern` | 字符串 | `{title}_{time}_{seq}` | 文件名模板，见下表 |
 | `encode_threads` | 整数 1–8 | `2` | 编码线程数，决定并行写盘能力 |
 | `hotkey` | 字符串 | `F12` | `F1..F24`、字母/数字、`printscreen`、`scrolllock`、`insert`、`home`、`end`、`space`、`0x7B`；可加 `ctrl+` / `shift+` / `alt+` / `win+` |
 | `swallow` | 布尔 | `false` | 是否吞掉热键，`true` 时游戏收不到 |
@@ -48,6 +49,30 @@ YAML 先加载，命令行参数随后覆盖。仓库根的 [config.example.yaml
 JPEG 只有有损 quality，没有无损模式；WebP 支持 quality/lossless/method；
 AVIF 支持 quality/lossless/speed；HEIC（x265）支持 quality/lossless/preset。
 
+## 文件名模板
+
+`filename_pattern` 支持这些占位符（未知的 `{…}` 原样保留）：
+
+| 占位符 | 内容 |
+| --- | --- |
+| `{title}` | 截图时前台窗口的标题 |
+| `{exe}` | 前台进程的 exe 名，**不含扩展名** |
+| `{process}` | 前台进程的显示名：exe 版本信息里的 `FileDescription`（任务管理器“描述”那列），取不到时等于 `{exe}` |
+| `{time}` | 时间戳 `YYYYMMDD_HHMMSS_mmm` |
+| `{seq}` | 本次运行的截图序号（4 位，从 0001 开始） |
+
+要点：
+
+- 模板里**最好带 `{time}` 或 `{seq}`**，否则同一秒内的多张截图会重名覆盖；
+- **模板里没出现的占位符不会去取**：不写 `{title}` 就不读窗口标题，不写 `{exe}`/`{process}` 就不
+  `OpenProcess`，不写 `{process}` 就不读 exe 的版本资源，不写 `{time}` 就不查时区——都省在截图的关键路径上；
+- 替换后还会做一次文件名清洗：非法字符（`< > : " / \ | ? *`）换成 `_`，去掉首尾空格和点，超长截断；
+- 结果为空时回退成 `GameSnap`；HDR 截图仍会自动加 `_HDR` / `_SDR` 后缀；
+- 命令行也可以用 `--filename-pattern` 临时覆盖。
+
+示例：`{title}_{time}_{seq}`（默认）→ `Game_20261110_204005_363_0001.jxl`；
+`{process} {time}` → `Sora No Kiseki the 1st 20261110_204005_363.jxl`。
+
 ## 命令行参数
 
 | 参数 | 说明 |
@@ -55,6 +80,7 @@ AVIF 支持 quality/lossless/speed；HEIC（x265）支持 quality/lossless/prese
 | `--config <路径>` | 指定 YAML 配置文件 |
 | `--key <名称>` | 截图热键，取值同 `hotkey` |
 | `--out <目录>` | 输出目录 |
+| `--filename-pattern <模板>` | 文件名模板，占位符见上 |
 | `--threads <1-8>` | 编码线程数 |
 | `--monitor <primary\|foreground>` | 截主显示器 / 前台窗口所在显示器 |
 | `--swallow` | 吞掉热键 |

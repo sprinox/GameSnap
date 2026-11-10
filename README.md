@@ -32,7 +32,11 @@ GameSnap.exe --key printscreen --out D:\shots
 ## 配置
 
 启动时依次查找 `--config <路径>`、exe 目录 `config.yaml`、当前目录 `config.yaml`；命令行参数覆盖 YAML。
-仓库根目录的 [config.example.yaml](config.example.yaml) 是带注释的模板。字段说明见 [docs/config.md](docs/config.md)。
+**首次启动若一处都没有，会在 exe 目录自动生成一份带注释的 `config.yaml`**，直接改完重启即可。
+仓库根目录的 [config.example.yaml](config.example.yaml) 是同款模板。字段说明见 [docs/config.md](docs/config.md)。
+
+文件名可以用 `filename_pattern` 定制，占位符包括 `{title}`（窗口标题）、`{exe}`（前台进程 exe 名）、
+`{process}`（进程显示名）、`{time}`（时间戳）、`{seq}`（序号），默认 `{title}_{time}_{seq}`。
 
 ## 文档
 

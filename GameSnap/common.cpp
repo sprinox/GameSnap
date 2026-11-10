@@ -77,6 +77,79 @@ namespace gamesnap {
             return true;
         }
 
+        // 自动生成的默认配置：带注释，键值和 Config/CodecOptions 的默认值一致。
+        // 用户改完重启即可生效（程序只在“一个配置都找不到”时才写这个文件）。
+        constexpr std::string_view kDefaultConfigYaml = R"(# GameSnap 配置（首次启动自动生成，可随意修改后重启生效）
+# 查找顺序：--config <路径> → exe 目录\config.yaml → 当前目录\config.yaml。
+
+# ── 输出 ────────────────────────────────────────────────────────────────────
+# 截图目录；不存在会自动创建。留空 = %USERPROFILE%\Pictures\GameSnap
+# output_dir: D:\GameSnapShots
+
+# 文件名模板，占位符：
+#   {title}   截图时前台窗口的标题
+#   {exe}     前台进程的 exe 名（不含扩展名）
+#   {process} 前台进程的显示名（exe 的 FileDescription，取不到时等于 {exe}）
+#   {time}    时间戳 YYYYMMDD_HHMMSS_mmm
+#   {seq}     本次运行的截图序号（4 位）
+# 例："{title}_{time}_{seq}"、"{process} {time}"、"{exe}-{seq}"
+filename_pattern: "{title}_{time}_{seq}"
+
+# ── 编码 ────────────────────────────────────────────────────────────────────
+encode_threads: 2
+format_hdr: avif
+format_sdr: jxl
+
+png_compression: 6
+jpeg_quality: 95
+
+webp_quality: 90
+webp_lossless: false
+webp_method: 4
+
+avif_quality: 90
+avif_lossless: false
+avif_speed: 10
+
+heic_quality: 90
+heic_lossless: false
+heic_preset: fast
+
+# JXL：distance 0 = 数学无损（配合 jxl_lossless），effort 1..10，越高越慢越小
+jxl_distance: 0.0
+jxl_lossless: true
+jxl_effort: 5
+
+av1_encoder: auto
+aom_cpu_used: -1
+svt_preset: -1
+chroma_subsampling: auto
+
+# ── 色调映射 ────────────────────────────────────────────────────────────────
+tone_map: spline
+tone_map_backend: auto
+
+# ── 采集 ────────────────────────────────────────────────────────────────────
+hotkey: F12
+swallow: false
+monitor: primary
+
+# 日志级别：false = info，true = debug
+verbose: false
+)";
+
+        bool write_default_config(std::filesystem::path const& path) {
+            std::ofstream file(path, std::ios::binary | std::ios::trunc);
+            if (!file)
+                return false;
+            file.write(kDefaultConfigYaml.data(), static_cast<std::streamsize>(kDefaultConfigYaml.size()));
+            file.flush();
+            if (!file.good())
+                return false;
+            SPDLOG_INFO("未找到配置文件，已生成默认配置: {}", wstring_to_utf8(path.wstring()));
+            return true;
+        }
+
         // 日志放在 exe 旁边，和启动时的当前目录无关。
         std::filesystem::path log_file_path() {
             return executable_dir() / L"logs" / L"GameSnap.log";
@@ -264,6 +337,13 @@ namespace gamesnap {
                 } else {
                     if (const auto dir = read_key<std::string>(root, "output_dir"); dir && !dir->empty())
                         parsed.output_dir = utf8_to_wstring(*dir);
+                    if (const auto pattern = read_key<std::string>(root, "filename_pattern"); pattern) {
+                        const std::wstring text = utf8_to_wstring(*pattern);
+                        if (text.empty())
+                            SPDLOG_WARN("filename_pattern 为空，保持默认值");
+                        else
+                            parsed.filename_pattern = text;
+                    }
                     if (const auto value = read_key<int>(root, "encode_threads"); value)
                         parsed.encode_threads = *value;
                     if (const auto text = read_key<std::string>(root, "hotkey"); text) {
@@ -276,8 +356,7 @@ namespace gamesnap {
                     }
                     if (const auto value = read_key<bool>(root, "swallow"); value)
                         parsed.hotkey_swallow = *value;
-                    if (const auto text = read_key<std::string>(root, "format_hdr"); text) {
-                        const auto format = parse_image_format(*text);
+                    if (const auto text = read_key<std::string>(root, "format_hdr"); text) {                        const auto format = parse_image_format(*text);
                         if (!format || !format_supports_hdr(*format))
                             throw ConfigError(fmt::format("format_hdr 只支持 avif / heic / jxl，实际为 {}", *text));
                         parsed.hdr_format = *format;
@@ -482,6 +561,16 @@ namespace gamesnap {
     ComApartment::~ComApartment() {
         if (initialized_)
             ::RoUninitialize();
+    }
+
+    FilenamePlaceholders parse_filename_placeholders(std::wstring_view pattern) {
+        FilenamePlaceholders placeholders;
+        placeholders.title = pattern.find(L"{title}") != std::wstring_view::npos;
+        placeholders.exe = pattern.find(L"{exe}") != std::wstring_view::npos;
+        placeholders.process = pattern.find(L"{process}") != std::wstring_view::npos;
+        placeholders.time = pattern.find(L"{time}") != std::wstring_view::npos;
+        placeholders.seq = pattern.find(L"{seq}") != std::wstring_view::npos;
+        return placeholders;
     }
 
     void write_console_utf8(std::string_view text, bool to_stderr) {
@@ -753,6 +842,8 @@ namespace gamesnap {
             ("config", "配置文件（默认 exe 目录 / 当前目录的 config.yaml）", cxxopts::value<std::string>())
             ("key", "截图热键：F1..F24 / printscreen / scrolllock / 0x7B，可加 ctrl+shift+alt+win", cxxopts::value<std::string>())
             ("out", "输出目录", cxxopts::value<std::string>())
+            ("filename-pattern", "文件名模板，占位符 {title} {exe} {process} {time} {seq}",
+             cxxopts::value<std::string>())
             ("threads", "编码线程数 1..8", cxxopts::value<int>())
             ("monitor", "primary / foreground", cxxopts::value<std::string>())
             ("swallow", "吞掉热键（游戏收不到）")
@@ -801,6 +892,12 @@ namespace gamesnap {
                 if (std::filesystem::exists(cwd_config, ec))
                     config_path = cwd_config;
             }
+            if (config_path.empty()) {
+                // 一处配置都没找到：在 exe 目录生成一份带注释的默认配置，方便用户直接改。
+                const auto created = exe_config;
+                if (write_default_config(created))
+                    config_path = created;
+            }
         }
         const bool explicit_config = result.count("config") != 0;
         if (!config_path.empty() && !load_config_file(config_path, config) && explicit_config) {
@@ -821,6 +918,14 @@ namespace gamesnap {
         }
         if (result.count("out") != 0)
             config.output_dir = utf8_to_wstring(result["out"].as<std::string>());
+        if (result.count("filename-pattern") != 0) {
+            const std::wstring pattern = utf8_to_wstring(result["filename-pattern"].as<std::string>());
+            if (pattern.empty()) {
+                SPDLOG_ERROR("--filename-pattern 不能为空");
+                return std::nullopt;
+            }
+            config.filename_pattern = pattern;
+        }
         if (result.count("threads") != 0)
             config.encode_threads = result["threads"].as<int>();
         if (result.count("monitor") != 0) {
@@ -881,6 +986,7 @@ namespace gamesnap {
 
     void log_config(Config const& config) {
         SPDLOG_INFO("输出目录: {}", wstring_to_utf8(config.output_dir.wstring()));
+        SPDLOG_INFO("文件名模板: {}", wstring_to_utf8(config.filename_pattern));
         const std::string_view backend = config.tone_map_backend == ToneMapBackend::Cpu   ? "cpu"
                                          : config.tone_map_backend == ToneMapBackend::Gpu ? "gpu"
                                                                                           : "auto";

@@ -241,7 +241,8 @@ namespace gamesnap {
             }
 
             auto jobs = std::make_shared<EncodeQueue>();
-            EncodeWorkers workers(config.output_dir, jobs, config.codec, config.tone_map_backend, {});
+            EncodeWorkers workers(config.output_dir, jobs, config.codec, config.tone_map_backend,
+                              config.filename_pattern, {});
             workers.start(1);
 
             std::error_code ec;
@@ -262,6 +263,8 @@ namespace gamesnap {
             job.tone_map = config.tone_map;
             job.sequence = 7777;
             job.title = L"GameSnap SelfTest";
+            job.process_exe = L"GameSnap";
+            job.process_name = L"GameSnap SelfTest";
             job.local_time = Clock::now();
             job.timings.input = SteadyClock::now();
             job.timings.dequeued = job.timings.input;

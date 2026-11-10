@@ -89,6 +89,17 @@ namespace gamesnap {
     std::wstring utf8_to_wstring(std::string_view str);
 
     // ── 日志 / 崩溃 ──────────────────────────────────────────────────────────
+    // 文件名模板里出现了哪些占位符。采集线程据此只取需要的信息：
+    // 没用到 {exe}/{process} 就不必 OpenProcess，没用到 {process} 就不必读版本资源。
+    struct FilenamePlaceholders {
+        bool title = false;
+        bool exe = false;
+        bool process = false;
+        bool time = false;
+        bool seq = false;
+    };
+    FilenamePlaceholders parse_filename_placeholders(std::wstring_view pattern);
+
     // 交给控制台（或重定向目标）的一段 UTF-8 文本。
     // 控制台用 WriteConsoleW，绕开会话代码页（cmd 默认 936 时中文会乱码）；
     // 句柄不是控制台（重定向到文件/管道）时退回 fwrite 原始 UTF-8 字节。
@@ -212,6 +223,14 @@ namespace gamesnap {
 
     struct Config {
         std::filesystem::path output_dir;
+        // 文件名模板，支持占位符：
+        //   {title}   截图时前台窗口的标题
+        //   {exe}     前台进程的 exe 名（不含扩展名）
+        //   {process} 前台进程的显示名（exe 版本信息里的 FileDescription，取不到时等于 {exe}）
+        //   {time}    时间戳 YYYYMMDD_HHMMSS_mmm
+        //   {seq}     本次运行的截图序号（4 位）
+        // 未知的 {…} 原样保留；替换完会再做一次文件名清洗（非法字符换成 _，裁掉首尾空格/点）。
+        std::wstring filename_pattern = L"{title}_{time}_{seq}";
         int encode_threads = 2;       // 编码线程数（同时决定并行落盘能力）
         UINT hotkey_vk = VK_F12;      // 键盘热键
         UINT hotkey_modifiers = 0;    // 修饰键组合

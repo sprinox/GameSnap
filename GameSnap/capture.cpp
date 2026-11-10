@@ -78,24 +78,103 @@ namespace gamesnap {
             return texture;
         }
 
-        // 前台窗口标题，用作文件名前缀；拿不到就由编码侧回退到 GameSnap。
-        std::wstring foreground_window_title() {
-            const HWND window = ::GetForegroundWindow();
-            if (window == nullptr)
+        // 前台窗口及其所属进程，用作文件名模板的占位符来源。
+        struct ForegroundInfo {
+            std::wstring title;    // 窗口标题
+            std::wstring exe;      // exe 文件名，不含扩展名
+            std::wstring process;  // exe 版本信息里的 FileDescription，取不到时等于 exe
+        };
+
+        // exe 的版本信息里取 FileDescription（就是任务管理器"描述"那一列）。
+        std::wstring file_description(std::wstring const& path) {
+            DWORD ignored = 0;
+            const DWORD size = ::GetFileVersionInfoSizeW(path.c_str(), &ignored);
+            if (size == 0)
                 return {};
-            const int length = ::GetWindowTextLengthW(window);
-            if (length <= 0)
+            std::vector<std::uint8_t> buffer(size);
+            if (::GetFileVersionInfoW(path.c_str(), 0, size, buffer.data()) == 0)
                 return {};
 
-            const int clamped = std::min(length, 512);
-            std::wstring title(static_cast<std::size_t>(clamped) + 1, L'\0');
-            // GetWindowTextW 的 nMaxCount 包含结尾 NUL：传 clamped 只能拷到 clamped-1 个字符，
-            // 之前文件名里的窗口标题永远少最后一位。缓冲区已经多留了一个位置，这里传 clamped + 1。
-            const int copied = ::GetWindowTextW(window, title.data(), clamped + 1);
-            if (copied <= 0)
+            struct Translation {
+                WORD language = 0;
+                WORD codepage = 0;
+            };
+            Translation* translations = nullptr;
+            UINT translations_size = 0;
+            if (::VerQueryValueW(buffer.data(), L"\\VarFileInfo\\Translation",
+                                 reinterpret_cast<void**>(&translations), &translations_size) == 0 ||
+                translations == nullptr) {
                 return {};
-            title.resize(static_cast<std::size_t>(copied));
-            return title;
+            }
+            const std::size_t count = translations_size / sizeof(Translation);
+            for (std::size_t i = 0; i < count; ++i) {
+                const wchar_t* query = nullptr;
+                wchar_t query_buffer[80];
+                (void)::swprintf_s(query_buffer, L"\\StringFileInfo\\%04x%04x\\FileDescription",
+                                   translations[i].language, translations[i].codepage);
+                query = query_buffer;
+                wchar_t* value = nullptr;
+                UINT value_size = 0;
+                if (::VerQueryValueW(buffer.data(), query, reinterpret_cast<void**>(&value), &value_size) != 0 &&
+                    value != nullptr && value_size > 1) {
+                    return std::wstring(value, value_size - 1);  // value_size 含结尾 NUL
+                }
+            }
+            return {};
+        }
+
+        // 前台窗口标题 + 所属进程的 exe 名/显示名；拿不到的字段留空，由文件名逻辑兜底。
+        // 模板里没出现的占位符一律不取：读版本资源（{process}）和 OpenProcess 都会拖慢截图路径。
+        ForegroundInfo foreground_info(FilenamePlaceholders const& need) {
+            ForegroundInfo info;
+            if (!need.title && !need.exe && !need.process)
+                return info;
+
+            const HWND window = ::GetForegroundWindow();
+            if (window == nullptr)
+                return info;
+
+            if (need.title) {
+                const int length = ::GetWindowTextLengthW(window);
+                if (length > 0) {
+                    const int clamped = std::min(length, 512);
+                    std::wstring title(static_cast<std::size_t>(clamped) + 1, L'\0');
+                    // GetWindowTextW 的 nMaxCount 包含结尾 NUL：传 clamped 只能拷到 clamped-1 个字符，
+                    // 之前文件名里的窗口标题永远少最后一位。缓冲区已经多留了一个位置，这里传 clamped + 1。
+                    const int copied = ::GetWindowTextW(window, title.data(), clamped + 1);
+                    if (copied > 0) {
+                        title.resize(static_cast<std::size_t>(copied));
+                        info.title = std::move(title);
+                    }
+                }
+            }
+
+            if (!need.exe && !need.process)
+                return info;
+
+            DWORD process_id = 0;
+            (void)::GetWindowThreadProcessId(window, &process_id);
+            if (process_id == 0)
+                return info;
+
+            const HANDLE process = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+            if (process == nullptr)
+                return info;
+
+            std::wstring path(0x8000, L'\0');
+            DWORD path_size = static_cast<DWORD>(path.size());
+            if (::QueryFullProcessImageNameW(process, 0, path.data(), &path_size) != 0 && path_size > 0) {
+                path.resize(path_size);
+                info.exe = std::filesystem::path(path).stem().wstring();
+                // {process} 才会用到版本信息；只写了 {exe} 就不必去读 exe 的资源节。
+                if (need.process)
+                    info.process = file_description(path);
+            }
+            ::CloseHandle(process);
+
+            if (info.process.empty())
+                info.process = info.exe;
+            return info;
         }
 
         // FrameArrived 回调里只做 GPU 侧的事：取帧 → CopyResource 到 staging → 入队。
@@ -183,6 +262,8 @@ namespace gamesnap {
             job.sdr_white_nits = shot.sdr_white_nits;
             job.sequence = shot.sequence;
             job.title = std::move(shot.title);
+            job.process_exe = std::move(shot.process_exe);
+            job.process_name = std::move(shot.process_name);
             job.local_time = Clock::now();
             job.timings = shot.timings;
 
@@ -444,7 +525,13 @@ namespace gamesnap {
           jobs_(std::move(jobs)),
           stop_(std::move(stop)),
           ui_(std::move(ui)),
-          command_token_(*commands_) {}
+          command_token_(*commands_) {
+        // 只取文件名模板真正用到的信息：没写 {exe}/{process} 就不必 OpenProcess。
+        filename_placeholders_ = parse_filename_placeholders(config_.filename_pattern);
+        SPDLOG_DEBUG("文件名模板用到: title={} exe={} process={} time={} seq={}", filename_placeholders_.title,
+                     filename_placeholders_.exe, filename_placeholders_.process, filename_placeholders_.time,
+                     filename_placeholders_.seq);
+    }
 
     void CaptureWorker::run() {
         // 启动阶段的资源初始化：无论成功还是失败都必须放行主线程的 wait_ready()。
@@ -643,7 +730,10 @@ namespace gamesnap {
         shot->timings.input = command.enqueued;
         shot->sequence = ++sequence_;
         shot->timings.dequeued = dequeued;
-        shot->title = foreground_window_title();
+        ForegroundInfo foreground = foreground_info(filename_placeholders_);
+        shot->title = std::move(foreground.title);
+        shot->process_exe = std::move(foreground.exe);
+        shot->process_name = std::move(foreground.process);
         shot->timings.title_done = SteadyClock::now();
         // WGC 抓的是 DWM 的合成表面，FP16 帧的编码是合成色彩空间（CCCS）：scRGB，
         // 即 BT.709 原色 + 线性伽马，1.0 = 80 nits，HDR 高光会超过 1.0。

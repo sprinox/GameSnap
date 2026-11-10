@@ -65,7 +65,9 @@ namespace gamesnap {
         std::uint32_t sdr_white_nits = 80;
         std::uint64_t sequence = 0;
         std::uint64_t gpu_fence = 0;
-        std::wstring title;            // 截图时前台窗口的标题，用作文件名前缀
+        std::wstring title;            // 截图时前台窗口的标题，用于 {title}
+        std::wstring process_exe;      // 前台进程 exe 名（不含扩展名），用于 {exe}
+        std::wstring process_name;     // 前台进程显示名（版本信息 FileDescription），用于 {process}
         Clock::time_point local_time;  // 墙上时间，只用于文件名
         ShotTimings timings{};
     };

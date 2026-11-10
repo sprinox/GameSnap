@@ -19,7 +19,7 @@ namespace gamesnap {
 
         // 去掉 Windows 文件名里不允许的字符；空标题回退到 GameSnap。
         // 按值接收，直接原地修改后返回，省掉一次拷贝。
-        std::wstring sanitize_filename(std::wstring title) {
+        std::wstring sanitize_filename(std::wstring title, std::size_t max_length = 80, bool fallback = true) {
             for (wchar_t& ch : title) {
                 const bool invalid = ch < 0x20 || ch == L'<' || ch == L'>' || ch == L':' || ch == L'"' ||
                                      ch == L'/' || ch == L'\\' || ch == L'|' || ch == L'?' || ch == L'*';
@@ -33,14 +33,13 @@ namespace gamesnap {
             else
                 title = title.substr(first, last - first + 1);
 
-            constexpr std::size_t max_title_length = 80;
-            if (title.size() > max_title_length) {
-                title.resize(max_title_length);
+            if (title.size() > max_length) {
+                title.resize(max_length);
                 // 不要把 UTF-16 代理对截成半个字符。
                 if (!title.empty() && title.back() >= 0xD800 && title.back() <= 0xDBFF)
                     title.pop_back();
             }
-            if (title.empty())
+            if (title.empty() && fallback)
                 title = L"GameSnap";
             return title;
         }
@@ -57,28 +56,61 @@ namespace gamesnap {
                                clock.minutes().count(), clock.seconds().count());
         }
 
-        // 输出文件的基本名：<标题>_<时间戳>_<序号>，不含 _HDR/_SDR 与扩展名。
-        // 面板在编码开始前就先显示这个名字，写盘成功后再补上后缀和扩展名。
-        std::wstring make_base_name(std::wstring const& title, Clock::time_point time, std::uint64_t sequence) {
-            // fmt 没有 zoned_time 的 formatter，用 C++20 chrono 拆出本地日期/时间再格式化。
-            const auto local = std::chrono::zoned_time(std::chrono::current_zone(), time).get_local_time();
-            const auto days = std::chrono::floor<std::chrono::days>(local);
-            const std::chrono::year_month_day date{days};
-            const std::chrono::hh_mm_ss clock{local - days};
-            const auto millis =
-                std::chrono::duration_cast<std::chrono::milliseconds>(local.time_since_epoch()).count() % 1000;
-            const std::string stamp = fmt::format(
-                "{:04}{:02}{:02}_{:02}{:02}{:02}_{:03}_{:04}",
-                static_cast<int>(date.year()), static_cast<unsigned>(date.month()), static_cast<unsigned>(date.day()),
-                clock.hours().count(), clock.minutes().count(), clock.seconds().count(),
-                millis, static_cast<unsigned>(sequence % 10000U));
-            return sanitize_filename(title) + L"_" + utf8_to_wstring(stamp);
+        // 输出文件的基本名，由 filename_pattern 决定（不含 _HDR/_SDR 与扩展名）：
+        //   {title}   前台窗口标题
+        //   {exe}     前台进程 exe 名（去扩展名）
+        //   {process} 前台进程显示名（版本信息 FileDescription，取不到时等于 exe 名）
+        //   {time}    YYYYMMDD_HHMMSS_mmm
+        //   {seq}     截图序号（4 位）
+        // 未知的 {…} 原样保留；替换后整体再清洗一次（非法字符、首尾空格、长度）。
+        // 只对模板里出现的占位符做替换：{time} 要查时区，没用到就不查。
+        std::wstring make_base_name(std::wstring const& title, std::wstring const& process_exe,
+                                    std::wstring const& process_name, Clock::time_point time,
+                                    std::uint64_t sequence, std::wstring const& pattern) {
+            const auto replace_all = [](std::wstring& text, std::wstring_view from, std::wstring const& to) {
+                if (from.empty())
+                    return;
+                std::size_t position = 0;
+                while ((position = text.find(from, position)) != std::wstring::npos) {
+                    text.replace(position, from.size(), to);
+                    position += to.size();
+                }
+            };
+
+            std::wstring name = pattern.empty() ? std::wstring{L"{title}_{time}_{seq}"} : pattern;
+            if (name.find(L"{title}") != std::wstring::npos)
+                replace_all(name, L"{title}", sanitize_filename(title, 80, false));
+            if (name.find(L"{exe}") != std::wstring::npos)
+                replace_all(name, L"{exe}", sanitize_filename(process_exe, 60, false));
+            if (name.find(L"{process}") != std::wstring::npos)
+                replace_all(name, L"{process}", sanitize_filename(process_name, 60, false));
+            if (name.find(L"{seq}") != std::wstring::npos) {
+                replace_all(name, L"{seq}",
+                            utf8_to_wstring(fmt::format("{:04}", static_cast<unsigned>(sequence % 10000U))));
+            }
+            if (name.find(L"{time}") != std::wstring::npos) {
+                // fmt 没有 zoned_time 的 formatter，用 C++20 chrono 拆出本地日期/时间再格式化。
+                const auto local = std::chrono::zoned_time(std::chrono::current_zone(), time).get_local_time();
+                const auto days = std::chrono::floor<std::chrono::days>(local);
+                const std::chrono::year_month_day date{days};
+                const std::chrono::hh_mm_ss clock{local - days};
+                const auto millis =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(local.time_since_epoch()).count() % 1000;
+                replace_all(name, L"{time}",
+                            utf8_to_wstring(fmt::format("{:04}{:02}{:02}_{:02}{:02}{:02}_{:03}",
+                                                        static_cast<int>(date.year()),
+                                                        static_cast<unsigned>(date.month()),
+                                                        static_cast<unsigned>(date.day()), clock.hours().count(),
+                                                        clock.minutes().count(), clock.seconds().count(), millis)));
+            }
+
+            // 整体清洗：模板里可能出现 < > : 等非法字符，也可能替换后变成空串。
+            return sanitize_filename(std::move(name), 180, true);
         }
 
-        std::filesystem::path make_output_path(std::filesystem::path const& dir, Clock::time_point time,
-                                               std::wstring title, std::uint64_t sequence,
+        std::filesystem::path make_output_path(std::filesystem::path const& dir, std::wstring const& base_name,
                                                std::wstring_view extension, std::wstring_view suffix) {
-            std::wstring name = make_base_name(title, time, sequence);
+            std::wstring name = base_name;
             if (!suffix.empty()) {
                 name += L"_";
                 name += suffix;
@@ -484,8 +516,9 @@ namespace gamesnap {
 
     EncodeWorkers::EncodeWorkers(std::filesystem::path output_dir, std::shared_ptr<EncodeQueue> jobs,
                                  CodecOptions options, ToneMapBackend tone_map_backend,
-                                 std::shared_ptr<UiBridge> ui)
-        : output_dir_(std::move(output_dir)), jobs_(std::move(jobs)), ui_(std::move(ui)), options_(options), tone_map_backend_(tone_map_backend) {
+                                 std::wstring filename_pattern, std::shared_ptr<UiBridge> ui)
+        : output_dir_(std::move(output_dir)), jobs_(std::move(jobs)), ui_(std::move(ui)), options_(options),
+          tone_map_backend_(tone_map_backend), filename_pattern_(std::move(filename_pattern)) {
         set_codec_options(options_);
     }
 
@@ -598,7 +631,8 @@ namespace gamesnap {
 
         // 一进编码就先把基本名推给面板（不含 _HDR/_SDR 与扩展名）：
         // 文件名和时间戳在开拍时就定了，没必要等编码完。
-        const std::wstring base_name = make_base_name(job.title, job.local_time, job.sequence);
+        const std::wstring base_name = make_base_name(job.title, job.process_exe, job.process_name, job.local_time,
+                                                      job.sequence, filename_pattern_);
         if (ui_)
             ui_->publish(job.sequence, base_name, nullptr);
 
@@ -652,7 +686,7 @@ namespace gamesnap {
             if (ui_)
                 ui_->publish(job.sequence, base_name, &sdr);
 
-            const auto hdr_path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
+            const auto hdr_path = make_output_path(output_dir_, base_name,
                                                    image_extension(hdr_format), L"HDR");
             bool hdr_ok = false;
             if (gpu_ok) {
@@ -677,7 +711,7 @@ namespace gamesnap {
 
             if (job.sdr_format == ImageFormat::Heic)
                 SPDLOG_WARN("[#{:04}] libheif 不支持 gain map，HEIC SDR 不包含 HDR 重建信息", job.sequence);
-            const auto sdr_path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
+            const auto sdr_path = make_output_path(output_dir_, base_name,
                                                    image_extension(job.sdr_format), L"SDR");
             const bool sdr_ok =
                 (!hdr10.empty() && job.sdr_format == ImageFormat::Avif)
@@ -697,7 +731,7 @@ namespace gamesnap {
             if (ui_)
                 ui_->publish(job.sequence, base_name, &sdr);
 
-            const auto path = make_output_path(output_dir_, job.local_time, job.title, job.sequence,
+            const auto path = make_output_path(output_dir_, base_name,
                                                image_extension(job.sdr_format), {});
             if (!write_sdr(path, job.sdr_format, sdr, error)) {
                 SPDLOG_ERROR("[#{:04}] 编码失败 ({}): {}", job.sequence, to_string(job.sdr_format), error);

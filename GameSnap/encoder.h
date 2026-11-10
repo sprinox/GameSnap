@@ -23,7 +23,7 @@ namespace gamesnap {
     class EncodeWorkers {
     public:
         EncodeWorkers(std::filesystem::path output_dir, std::shared_ptr<EncodeQueue> jobs,
-                      CodecOptions options, ToneMapBackend tone_map_backend,
+                      CodecOptions options, ToneMapBackend tone_map_backend, std::wstring filename_pattern,
                       std::shared_ptr<UiBridge> ui);
         ~EncodeWorkers();
 
@@ -47,6 +47,7 @@ namespace gamesnap {
         std::shared_ptr<UiBridge> ui_;
         CodecOptions options_;
         ToneMapBackend tone_map_backend_ = ToneMapBackend::Auto;
+        std::wstring filename_pattern_;  // 文件名模板，见 Config::filename_pattern
         std::vector<std::thread> threads_;
         std::size_t worker_count_ = 0;
         std::atomic<std::size_t> stopped_{0};  // 已消费 stop 哨兵的线程数

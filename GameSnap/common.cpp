@@ -16,6 +16,7 @@
 #include <cwctype>
 #include <exception>
 #include <fstream>
+#include <io.h>  // _get_osfhandle / _fileno：把 CRT 流的新句柄写回 STD_*
 #include <iterator>
 #include <stdexcept>
 
@@ -51,29 +52,65 @@ namespace gamesnap {
             return kDir;
         }
 
-        // 控制台是否可用，按“有没有真的控制台”判断，而不是靠编译期子系统宏：
-        //   * Console 子系统（/SUBSYSTEM:CONSOLE）：从资源管理器或终端启动都会带控制台，
-        //     GetConsoleWindow() 非空 → 直接用；
-        //   * Windows 子系统（/SUBSYSTEM:WINDOWS）：默认没有控制台；从终端启动时用
-        //     AttachConsole 挂上父进程的控制台，并把标准流重定向过去（否则 spdlog 写无效句柄）。
-        //     但如果 stdout 已经被重定向到文件/管道（GetStdHandle 有效），就不要抢过来改，
-        //     否则 `GameSnap --help > out.txt` 会写进控制台而不是文件。
-        // 返回 false 表示既没有控制台也没别的可写目标，调用方就不要加控制台 sink。
-        bool ensure_console_available() {
-            if (::GetConsoleWindow() != nullptr)
-                return true;
+        // 这个流是否已经被重定向到文件/管道——是的话必须原样保留，不能抢去写控制台。
+        bool stream_already_redirected(DWORD std_handle) {
+            const HANDLE existing = ::GetStdHandle(std_handle);
+            if (existing == nullptr || existing == INVALID_HANDLE_VALUE)
+                return false;
+            const DWORD type = ::GetFileType(existing);
+            return type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE;
+        }
 
+        // 把 CRT 流重新绑到设备，并把新的 OS 句柄写回 STD_*。
+        // 只 freopen 是不够的：spdlog 的 wincolor_sink 在构造时取 GetStdHandle(STD_OUTPUT_HANDLE)，
+        // 不 SetStdHandle 的话它拿到 NULL 就直接放弃，日志一条也进不了控制台。
+        // 已经重定向的流直接返回 true，保留用户的重定向（2> err.txt、< in.txt 不能被抢）。
+        bool redirect_std_stream(DWORD std_handle, char const* device, std::FILE* stream, char const* mode) {
+            if (stream_already_redirected(std_handle))
+                return true;
+            std::FILE* reopened = nullptr;
+            if (::freopen_s(&reopened, device, mode, stream) != 0 || reopened == nullptr)
+                return false;
+            const intptr_t os_handle = ::_get_osfhandle(::_fileno(stream));
+            if (os_handle == -1)
+                return false;
+            return ::SetStdHandle(std_handle, reinterpret_cast<HANDLE>(os_handle)) != 0;
+        }
+
+        // 控制台是否可用，按“有没有真的控制台”判断，而不是靠编译期子系统宏：
+        //   * Console 子系统：从资源管理器或终端启动都会带控制台 → GetConsoleWindow() 非空；
+        //   * Windows 子系统：默认没有控制台；从终端启动时用 AttachConsole 挂上父控制台，
+        //     再把标准流重定向过去（见 redirect_std_stream）。
+        // 但如果 stdout 已经被重定向到文件/管道（GetFileType 是 DISK/PIPE），就不要抢过来改，
+        // 否则 `GameSnap --help > out.txt` 会写进控制台而不是文件。
+        // 返回值表示 **stdout** 可用（日志 sink 写的就是它）；不可用时调用方不要加控制台 sink。
+        bool ensure_console_available() {
             const HANDLE stdout_handle = ::GetStdHandle(STD_OUTPUT_HANDLE);
-            if (stdout_handle != nullptr && stdout_handle != INVALID_HANDLE_VALUE)
+            if (stdout_handle != nullptr && stdout_handle != INVALID_HANDLE_VALUE) {
+                const DWORD type = ::GetFileType(stdout_handle);
+                // DISK / PIPE：真的是重定向，保留句柄不动。
+                if (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE)
+                    return true;
+                // CHAR：可能已经是控制台；GetConsoleWindow 非空才算数，
+                // 否则可能是 NUL 之类的字符设备，继续走 AttachConsole。
+                if (type == FILE_TYPE_CHAR && ::GetConsoleWindow() != nullptr)
+                    return true;
+            }
+            if (::GetConsoleWindow() != nullptr)
                 return true;
 
             if (::AttachConsole(ATTACH_PARENT_PROCESS) == FALSE)
                 return false;
 
-            std::FILE* reopened = nullptr;
-            (void)::freopen_s(&reopened, "CONOUT$", "w", stdout);
-            (void)::freopen_s(&reopened, "CONOUT$", "w", stderr);
-            (void)::freopen_s(&reopened, "CONIN$", "r", stdin);
+            // 附加成功后进程通常还没有标准句柄（GUI 进程），这里补齐 CRT 流 + STD_*。
+            // stderr/stdin 各自保留已有的重定向；返回值只看 stdout，因为 sink 写的是它。
+            const bool out_ok = redirect_std_stream(STD_OUTPUT_HANDLE, "CONOUT$", stdout, "w");
+            (void)redirect_std_stream(STD_ERROR_HANDLE, "CONOUT$", stderr, "w");
+            (void)redirect_std_stream(STD_INPUT_HANDLE, "CONIN$", stdin, "r");
+            if (!out_ok) {
+                ::FreeConsole();  // stdout 接不上 = 日志没法进控制台，就当没有控制台
+                return false;
+            }
             return true;
         }
 
@@ -89,7 +126,8 @@ namespace gamesnap {
 # 文件名模板，占位符：
 #   {title}   截图时前台窗口的标题
 #   {exe}     前台进程的 exe 名（不含扩展名）
-#   {process} 前台进程的显示名（exe 的 FileDescription，取不到时等于 {exe}）
+#   {process} 前台进程的显示名（exe 的 FileDescription；拿不到描述时为 exe 名，
+#             连进程都打不开（权限不足）时为空）
 #   {time}    时间戳 YYYYMMDD_HHMMSS_mmm
 #   {seq}     本次运行的截图序号（4 位）
 # 例："{title}_{time}_{seq}"、"{process} {time}"、"{exe}-{seq}"
@@ -139,13 +177,42 @@ verbose: false
 )";
 
         bool write_default_config(std::filesystem::path const& path) {
-            std::ofstream file(path, std::ios::binary | std::ios::trunc);
-            if (!file)
-                return false;
-            file.write(kDefaultConfigYaml.data(), static_cast<std::streamsize>(kDefaultConfigYaml.size()));
-            file.flush();
-            if (!file.good())
-                return false;
+            // 先写临时文件再 rename：中途崩溃/断电不会留下半个 YAML，
+            // 否则下次启动会把"配置有语法错误"报给用户。
+            std::filesystem::path temporary = path;
+            temporary += L".tmp";
+            {
+                std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+                if (!file) {
+                    SPDLOG_WARN("无法在 {} 生成默认配置（目录可能只读，例如装在 Program Files），本次使用内置默认值",
+                                wstring_to_utf8(path.parent_path().wstring()));
+                    return false;
+                }
+                file.write(kDefaultConfigYaml.data(), static_cast<std::streamsize>(kDefaultConfigYaml.size()));
+                file.flush();
+                if (!file.good()) {
+                    file.close();
+                    std::error_code ignored;
+                    std::filesystem::remove(temporary, ignored);
+                    SPDLOG_WARN("写默认配置失败: {}", wstring_to_utf8(temporary.wstring()));
+                    return false;
+                }
+            }
+            std::error_code ec;
+            std::filesystem::rename(temporary, path, ec);
+            if (ec) {
+                // rename 失败（目标已存在/跨卷）就退回到覆盖写，至少别留 .tmp。
+                std::filesystem::remove(temporary, ec);
+                std::ofstream file(path, std::ios::binary | std::ios::trunc);
+                if (!file) {
+                    SPDLOG_WARN("无法写入默认配置: {}", wstring_to_utf8(path.wstring()));
+                    return false;
+                }
+                file.write(kDefaultConfigYaml.data(), static_cast<std::streamsize>(kDefaultConfigYaml.size()));
+                file.flush();
+                if (!file.good())
+                    return false;
+            }
             SPDLOG_INFO("未找到配置文件，已生成默认配置: {}", wstring_to_utf8(path.wstring()));
             return true;
         }
@@ -302,8 +369,8 @@ verbose: false
         }
 
         bool is_known_config_key(std::string_view key) {
-            constexpr std::array<std::string_view, 28> keys{
-                "output_dir", "encode_threads", "hotkey", "swallow", "monitor",
+            constexpr std::array<std::string_view, 29> keys{
+                "output_dir", "filename_pattern", "encode_threads", "hotkey", "swallow", "monitor",
                 "format_hdr", "format_sdr", "tone_map", "tone_map_backend", "verbose",
                 "png_compression", "jpeg_quality",
                 "webp_quality", "webp_lossless", "webp_method",
@@ -356,7 +423,8 @@ verbose: false
                     }
                     if (const auto value = read_key<bool>(root, "swallow"); value)
                         parsed.hotkey_swallow = *value;
-                    if (const auto text = read_key<std::string>(root, "format_hdr"); text) {                        const auto format = parse_image_format(*text);
+                    if (const auto text = read_key<std::string>(root, "format_hdr"); text) {
+                        const auto format = parse_image_format(*text);
                         if (!format || !format_supports_hdr(*format))
                             throw ConfigError(fmt::format("format_hdr 只支持 avif / heic / jxl，实际为 {}", *text));
                         parsed.hdr_format = *format;
@@ -598,12 +666,33 @@ verbose: false
         (void)std::fflush(file);
     }
 
+    // 不分配堆内存的版本：给 OOM 处理器和控制台控制处理器用。
+    // 前者此时再 new 会直接抛 bad_alloc，后者有超时限制、也不该在 CRT 锁里纠缠。
+    void write_console_utf8_fixed(std::string_view text, bool to_stderr) {
+        constexpr std::size_t kStackChars = 512;
+        wchar_t wide[kStackChars];
+        const int length = static_cast<int>(std::min(text.size(), kStackChars - 1));
+        const int wide_length = ::MultiByteToWideChar(CP_UTF8, 0, text.data(), length, wide, kStackChars);
+        const HANDLE handle = ::GetStdHandle(to_stderr ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE);
+        if (handle == nullptr || handle == INVALID_HANDLE_VALUE)
+            return;
+        if (wide_length > 0) {
+            DWORD written = 0;
+            if (::WriteConsoleW(handle, wide, static_cast<DWORD>(wide_length), &written, nullptr) != 0)
+                return;
+        }
+        // 重定向到文件/管道：直接写原始 UTF-8 字节，同样不走 CRT。
+        DWORD written = 0;
+        (void)::WriteFile(handle, text.data(), static_cast<DWORD>(length), &written, nullptr);
+    }
+
     void init_logging() {
         std::vector<spdlog::sink_ptr> sinks;
 
         // 只有真的有控制台（Console 子系统，或 Windows 子系统从终端启动）才加控制台 sink；
         // 否则日志只进文件，避免往无效句柄写、也避免多创建一个看不见的控制台。
         const bool console = ensure_console_available();
+        const HANDLE console_handle = console ? ::GetStdHandle(STD_OUTPUT_HANDLE) : nullptr;
         if (console)
             sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
 
@@ -638,6 +727,17 @@ verbose: false
         logger->flush_on(spdlog::level::warn);
         spdlog::set_default_logger(logger);
         spdlog::flush_every(std::chrono::seconds(2));
+        if (console) {
+            // 放在 set_default_logger 之后：之前还没装好 sink，这条会丢。
+            // 用 info：用户最常问的就是“终端里怎么没有日志”，这行直接回答。
+            const DWORD type = ::GetFileType(console_handle);
+            SPDLOG_INFO("{}（STD_OUTPUT_HANDLE={:#x}）",
+                        type == FILE_TYPE_CHAR   ? "控制台输出已启用"
+                        : type == FILE_TYPE_PIPE ? "标准输出已重定向到管道"
+                        : type == FILE_TYPE_DISK ? "标准输出已重定向到文件"
+                                                 : "标准输出句柄类型未知（FILE_TYPE_UNKNOWN）",
+                        reinterpret_cast<std::uintptr_t>(console_handle));
+        }
     }
 
     bool check_cpu_features() {
@@ -661,7 +761,8 @@ verbose: false
             std::set_new_handler(nullptr);
 
             constexpr std::string_view message = "GameSnap: out of memory\n";
-            write_console_utf8(message, true);
+            // 这里已经 OOM：不能再走会分配 std::wstring 的版本，用不分配的固定版本。
+            write_console_utf8_fixed(message, true);
 
             try {
                 SPDLOG_CRITICAL("std::bad_alloc: 内存分配失败");
@@ -852,7 +953,11 @@ verbose: false
             ("tone-map", "色调映射 spline / analysis", cxxopts::value<std::string>())
             ("verbose", "输出调试日志")
             ("selftest", "用合成纹理跑编码链路自检")
-            ("bench", "编码基准：对指定 PNG 跑格式/参数矩阵", cxxopts::value<std::string>())
+            ("bench", "编码基准：给一张 PNG 跑格式矩阵；给一个目录则用当前配置逐张编码并算压缩率",
+             cxxopts::value<std::string>())
+            ("bench-scale", "基准：把源缩放到指定高度（例如 1080）再编码",
+             cxxopts::value<int>())
+            ("bench-verify", "基准：JXL 无损编码后解码回来逐像素校验")
             ("h,help", "显示帮助");
         // clang-format on
 
@@ -979,6 +1084,16 @@ verbose: false
             }
             config.bench_source = source;
         }
+        if (result.count("bench-scale") != 0) {
+            const int scale = result["bench-scale"].as<int>();
+            if (scale <= 0 || scale > 4320) {
+                SPDLOG_ERROR("--bench-scale 只支持 1..4320");
+                return std::nullopt;
+            }
+            config.bench_scale_height = static_cast<std::uint32_t>(scale);
+        }
+        if (result.count("bench-verify") != 0)
+            config.bench_verify = true;
 
         config.encode_threads = std::clamp(config.encode_threads, 1, 8);
         return config;

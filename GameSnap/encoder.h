@@ -20,6 +20,13 @@ namespace gamesnap {
     // 创建一块 CPU 可读的 staging 纹理（失败返回空）。com_ptr：独占，不可拷贝。
     winrt::com_ptr<ID3D11Texture2D> create_staging_texture(ID3D11Device* device, D3D11_TEXTURE2D_DESC const& desc);
 
+    // FP16 像素 → SDR BGRA8，走和 tonemap.hlsl 完全相同的 spline + IPT 链路。
+    // color_space 决定输入是 PQ 还是 scRGB（非 PQ 一律按 scRGB，1.0 = 80 nits 处理）。
+    // 编码线程内部用它做 GPU 失败时的回退，基准工具也用它生成 SDR 底图。
+    bool tone_map_hdr_to_sdr(std::uint16_t const* fp16, std::uint32_t width, std::uint32_t height,
+                             std::uint32_t stride_bytes, DXGI_COLOR_SPACE_TYPE color_space,
+                             std::uint32_t sdr_white_nits, Image& out);
+
     class EncodeWorkers {
     public:
         EncodeWorkers(std::filesystem::path output_dir, std::shared_ptr<EncodeQueue> jobs,

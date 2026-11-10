@@ -7,6 +7,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <cwctype>
 #include <fstream>
 
 #include "codecs.h"
@@ -26,22 +27,53 @@ namespace gamesnap {
                 if (invalid)
                     ch = L'_';
             }
-            const auto first = title.find_first_not_of(L" .");  // 把字符串开头和结尾的“空格”和“点”全部删掉
-            const auto last = title.find_last_not_of(L" .");
-            if (first == std::wstring::npos)
-                title.clear();
-            else
-                title = title.substr(first, last - first + 1);
+            const auto trim = [](std::wstring& text) {
+                const auto first = text.find_first_not_of(L" .");  // 开头和结尾的空格、点全部删掉
+                const auto last = text.find_last_not_of(L" .");
+                if (first == std::wstring::npos)
+                    text.clear();
+                else
+                    text = text.substr(first, last - first + 1);
+            };
+            trim(title);
 
             if (title.size() > max_length) {
                 title.resize(max_length);
                 // 不要把 UTF-16 代理对截成半个字符。
                 if (!title.empty() && title.back() >= 0xD800 && title.back() <= 0xDBFF)
                     title.pop_back();
+                // 截断后可能正好停在空格/点上，Windows 建文件时会把它们去掉，
+                // 那样 UI 显示的名字和真实文件名就对不上了，所以再 trim 一次。
+                trim(title);
             }
             if (title.empty() && fallback)
                 title = L"GameSnap";
             return title;
+        }
+
+        // CON / PRN / AUX / NUL / COM1-9 / LPT1-9 是设备名：拿它们当文件名会写到设备上，
+        // 或者干脆失败。模板是用户可控的，这里兜底加下划线。
+        // 注意 Windows 只看**第一个点之前**的部分，所以不能简单在末尾补 "_"：
+        // "CON.txt" + "_" 还是 CON 设备名；这里改成在前面加 "_"。
+        std::wstring avoid_reserved_device_name(std::wstring name) {
+            std::wstring stem = name;
+            if (const auto dot = stem.find(L'.'); dot != std::wstring::npos)
+                stem.resize(dot);
+            std::ranges::transform(stem, stem.begin(),
+                                   [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+
+            bool reserved = false;
+            constexpr std::wstring_view kFixed[] = {L"con", L"prn", L"aux", L"nul"};
+            for (const std::wstring_view fixed : kFixed)
+                reserved = reserved || stem == fixed;
+            if (!reserved && stem.size() == 4) {
+                const std::wstring_view prefix = std::wstring_view(stem).substr(0, 3);
+                const wchar_t digit = stem[3];
+                reserved = (prefix == L"com" || prefix == L"lpt") && digit >= L'1' && digit <= L'9';
+            }
+            if (reserved)
+                name.insert(0, L"_");
+            return name;
         }
 
         // 文件名：<标题>_YYYYMMDD_HHMMSS_mmm_序号[_HDR|_SDR].<ext>
@@ -67,28 +99,14 @@ namespace gamesnap {
         std::wstring make_base_name(std::wstring const& title, std::wstring const& process_exe,
                                     std::wstring const& process_name, Clock::time_point time,
                                     std::uint64_t sequence, std::wstring const& pattern) {
-            const auto replace_all = [](std::wstring& text, std::wstring_view from, std::wstring const& to) {
-                if (from.empty())
-                    return;
-                std::size_t position = 0;
-                while ((position = text.find(from, position)) != std::wstring::npos) {
-                    text.replace(position, from.size(), to);
-                    position += to.size();
-                }
-            };
+            // 单遍扫描模板：替换进去的值直接追加到输出，不会再被后面的占位符命中
+            // （否则标题里字面的 "{time}" 会被当成占位符二次替换）。
+            const std::wstring& source = pattern.empty() ? std::wstring{L"{title}_{time}_{seq}"} : pattern;
 
-            std::wstring name = pattern.empty() ? std::wstring{L"{title}_{time}_{seq}"} : pattern;
-            if (name.find(L"{title}") != std::wstring::npos)
-                replace_all(name, L"{title}", sanitize_filename(title, 80, false));
-            if (name.find(L"{exe}") != std::wstring::npos)
-                replace_all(name, L"{exe}", sanitize_filename(process_exe, 60, false));
-            if (name.find(L"{process}") != std::wstring::npos)
-                replace_all(name, L"{process}", sanitize_filename(process_name, 60, false));
-            if (name.find(L"{seq}") != std::wstring::npos) {
-                replace_all(name, L"{seq}",
-                            utf8_to_wstring(fmt::format("{:04}", static_cast<unsigned>(sequence % 10000U))));
-            }
-            if (name.find(L"{time}") != std::wstring::npos) {
+            std::wstring time_text;  // 只有真的遇到 {time} 才去查时区/格式化
+            const auto time_stamp = [&]() -> std::wstring const& {
+                if (!time_text.empty())
+                    return time_text;
                 // fmt 没有 zoned_time 的 formatter，用 C++20 chrono 拆出本地日期/时间再格式化。
                 const auto local = std::chrono::zoned_time(std::chrono::current_zone(), time).get_local_time();
                 const auto days = std::chrono::floor<std::chrono::days>(local);
@@ -96,16 +114,48 @@ namespace gamesnap {
                 const std::chrono::hh_mm_ss clock{local - days};
                 const auto millis =
                     std::chrono::duration_cast<std::chrono::milliseconds>(local.time_since_epoch()).count() % 1000;
-                replace_all(name, L"{time}",
-                            utf8_to_wstring(fmt::format("{:04}{:02}{:02}_{:02}{:02}{:02}_{:03}",
+                time_text = utf8_to_wstring(fmt::format("{:04}{:02}{:02}_{:02}{:02}{:02}_{:03}",
                                                         static_cast<int>(date.year()),
                                                         static_cast<unsigned>(date.month()),
                                                         static_cast<unsigned>(date.day()), clock.hours().count(),
-                                                        clock.minutes().count(), clock.seconds().count(), millis)));
+                                                        clock.minutes().count(), clock.seconds().count(), millis));
+                return time_text;
+            };
+
+            std::wstring name;
+            name.reserve(source.size() + 32);
+            for (std::size_t index = 0; index < source.size();) {
+                const std::wstring_view rest = std::wstring_view(source).substr(index);
+                // 值用 lambda 传：只有 key 命中才求值。否则像 "{title}_{seq}" 这种模板
+                // 在检查 {time} 时会先调用 time_stamp()，变成“没写 {time} 也查时区”。
+                const auto take = [&](std::wstring_view key, auto&& make_value) {
+                    if (rest.size() < key.size() || rest.substr(0, key.size()) != key)
+                        return false;
+                    name += make_value();
+                    index += key.size();
+                    return true;
+                };
+                if (rest.front() == L'{') {
+                    if (take(L"{title}", [&] { return sanitize_filename(title, 80, false); }))
+                        continue;
+                    if (take(L"{exe}", [&] { return sanitize_filename(process_exe, 60, false); }))
+                        continue;
+                    if (take(L"{process}", [&] { return sanitize_filename(process_name, 60, false); }))
+                        continue;
+                    if (take(L"{time}", [&]() -> std::wstring const& { return time_stamp(); }))
+                        continue;
+                    if (take(L"{seq}", [&] {
+                            return utf8_to_wstring(
+                                fmt::format("{:04}", static_cast<unsigned>(sequence % 10000U)));
+                        }))
+                        continue;
+                }
+                name += source[index++];
             }
 
             // 整体清洗：模板里可能出现 < > : 等非法字符，也可能替换后变成空串。
-            return sanitize_filename(std::move(name), 180, true);
+            name = sanitize_filename(std::move(name), 180, true);
+            return avoid_reserved_device_name(std::move(name));
         }
 
         std::filesystem::path make_output_path(std::filesystem::path const& dir, std::wstring const& base_name,
@@ -382,6 +432,89 @@ namespace gamesnap {
             return true;
         }
 
+        // FP16 像素（scRGB 或 PQ）→ SDR BGRA8，走 spline + IPT 链路（与 tonemap.hlsl 逐行对应）。
+        // 单独抽出来，供 convert_pixels 和外部工具（--bench 目录模式）共用。
+        bool tone_map_fp16_to_sdr(std::uint16_t const* fp16, std::uint32_t width, std::uint32_t height,
+                                  std::uint32_t stride_bytes, DXGI_COLOR_SPACE_TYPE color_space,
+                                  std::uint32_t sdr_white_nits, Image& out) {
+            out.width = width;
+            out.height = height;
+            out.stride = width * 4;
+            out.pixels.resize(static_cast<std::size_t>(out.stride) * height);
+
+            // FP16：HDR10(PQ) 或 scRGB 的色调映射到 SDR（独立函数版本，供外部工具复用）。
+            // 走的是和 shader 完全相同的 spline + IPT 链路（见上面的 tone_map_ipt），
+            // 所以 GPU 失败回退到 CPU 时 SDR 结果不会变。
+            // 代价是每像素十几次 pow，比原来的逐通道 LUT 慢；只在 GPU 不可用时才会走到。
+            const bool is_pq = color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+                               color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020;
+            const float sdr_white = static_cast<float>(std::max<std::uint32_t>(sdr_white_nits, 1));
+
+            std::vector<float> row_floats(static_cast<std::size_t>(width) * 4);
+
+            // Pass 1：峰值。GPU 用 peak pass 取“最大通道 → 10-bit PQ 码值”，这里做同样的事，
+            // 否则 CPU 和 GPU 的 in_max 不同，曲线就不同。
+            const auto load_row = [&](std::uint32_t y) {
+                const auto* src = reinterpret_cast<const std::uint16_t*>(
+                    reinterpret_cast<const std::uint8_t*>(fp16) + (static_cast<std::size_t>(y) * stride_bytes));
+                half_to_float_row(src, row_floats.data(), static_cast<std::size_t>(width) * 4);
+            };
+            const auto pixel_nits_2020 = [is_pq](float const rgb[3], float out[3]) {
+                if (is_pq) {
+                    out[0] = pq_to_nits(rgb[0]);
+                    out[1] = pq_to_nits(rgb[1]);
+                    out[2] = pq_to_nits(rgb[2]);
+                } else {
+                    float scaled[3]{rgb[0] * 80.0F, rgb[1] * 80.0F, rgb[2] * 80.0F};
+                    mat3_mul(kSrgbToBt2020, scaled, out);
+                }
+            };
+
+            float peak_pq = 0.0F;
+            for (std::uint32_t y = 0; y < height; ++y) {
+                load_row(y);
+                for (std::uint32_t x = 0; x < width; ++x) {
+                    const float rgb[3]{row_floats[(static_cast<std::size_t>(x) * 4) + 0],
+                                       row_floats[(static_cast<std::size_t>(x) * 4) + 1],
+                                       row_floats[(static_cast<std::size_t>(x) * 4) + 2]};
+                    float nits2020[3];
+                    pixel_nits_2020(rgb, nits2020);
+                    const float m = std::max({nits2020[0], nits2020[1], nits2020[2], 0.0F});
+                    peak_pq = std::max(peak_pq, nits_to_pq(m));
+                }
+            }
+            // 和 shader 一样把峰值量化到 10-bit 码值，再和 SDR 白点取大。
+            const float peak_code = std::round(std::clamp(peak_pq, 0.0F, 1.0F) * 1023.0F) / 1023.0F;
+            const float in_max = std::max(nits_to_pq(sdr_white), peak_code);
+            const float white_scale = 100.0F / sdr_white;
+            const SplineCurve curve = make_spline(in_max, sdr_white);
+
+            // Pass 2：逐像素 tone map → sRGB → BGRA。
+            for (std::uint32_t y = 0; y < height; ++y) {
+                load_row(y);
+                std::uint8_t* dst = out.pixels.data() + (static_cast<std::size_t>(y) * out.stride);
+                for (std::uint32_t x = 0; x < width; ++x) {
+                    const float rgb[3]{row_floats[(static_cast<std::size_t>(x) * 4) + 0],
+                                       row_floats[(static_cast<std::size_t>(x) * 4) + 1],
+                                       row_floats[(static_cast<std::size_t>(x) * 4) + 2]};
+                    float nits2020[3];
+                    pixel_nits_2020(rgb, nits2020);
+                    // shader 里是 nits2020 → BT.709 → *0.01 再进 IPT，这里照做。
+                    float nits709[3];
+                    mat3_mul(kBt2020To709, nits2020, nits709);
+                    const float relative[3]{nits709[0] * 0.01F, nits709[1] * 0.01F, nits709[2] * 0.01F};
+                    float linear[3];
+                    tone_map_ipt(relative, curve, linear);
+                    std::uint8_t* q = dst + (static_cast<std::size_t>(x) * 4);
+                    q[0] = linear_to_srgb8(linear[2] * white_scale);  // B
+                    q[1] = linear_to_srgb8(linear[1] * white_scale);  // G
+                    q[2] = linear_to_srgb8(linear[0] * white_scale);  // R
+                    q[3] = 255;
+                }
+            }
+            return true;
+        }
+
         // 把原始像素转换成 BMP 需要的 32bpp BGRA（HDR 的 FP16 顺便做色调映射）。
         bool convert_pixels(RawCopy& raw, DXGI_COLOR_SPACE_TYPE color_space, std::uint32_t sdr_white_nits, Image& out) {
             const bool is_bgra = raw.format == DXGI_FORMAT_B8G8R8A8_UNORM || raw.format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
@@ -424,82 +557,23 @@ namespace gamesnap {
                 return true;
             }
 
-            // FP16：HDR10(PQ) 或 scRGB 的色调映射到 SDR。
-            // 走的是和 shader 完全相同的 spline + IPT 链路（见上面的 tone_map_ipt），
-            // 所以 GPU 失败回退到 CPU 时 SDR 结果不会变。
-            // 代价是每像素十几次 pow，比原来的逐通道 LUT 慢；只在 GPU 不可用时才会走到。
-            const bool is_pq = color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
-                               color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020;
-            const float sdr_white = static_cast<float>(std::max<std::uint32_t>(sdr_white_nits, 1));
-
-            std::vector<float> row_floats(static_cast<std::size_t>(raw.width) * 4);
-
-            // Pass 1：峰值。GPU 用 peak pass 取“最大通道 → 10-bit PQ 码值”，这里做同样的事，
-            // 否则 CPU 和 GPU 的 in_max 不同，曲线就不同。
-            const auto load_row = [&](std::uint32_t y) {
-                const auto* src = reinterpret_cast<const std::uint16_t*>(
-                    raw.pixels.data() + (static_cast<std::size_t>(y) * raw.stride));
-                half_to_float_row(src, row_floats.data(), static_cast<std::size_t>(raw.width) * 4);
-            };
-            const auto pixel_nits_2020 = [is_pq](float const rgb[3], float out[3]) {
-                if (is_pq) {
-                    out[0] = pq_to_nits(rgb[0]);
-                    out[1] = pq_to_nits(rgb[1]);
-                    out[2] = pq_to_nits(rgb[2]);
-                } else {
-                    float scaled[3]{rgb[0] * 80.0F, rgb[1] * 80.0F, rgb[2] * 80.0F};
-                    mat3_mul(kSrgbToBt2020, scaled, out);
-                }
-            };
-
-            float peak_pq = 0.0F;
-            for (std::uint32_t y = 0; y < raw.height; ++y) {
-                load_row(y);
-                for (std::uint32_t x = 0; x < raw.width; ++x) {
-                    const float rgb[3]{row_floats[(static_cast<std::size_t>(x) * 4) + 0],
-                                       row_floats[(static_cast<std::size_t>(x) * 4) + 1],
-                                       row_floats[(static_cast<std::size_t>(x) * 4) + 2]};
-                    float nits2020[3];
-                    pixel_nits_2020(rgb, nits2020);
-                    const float m = std::max({nits2020[0], nits2020[1], nits2020[2], 0.0F});
-                    peak_pq = std::max(peak_pq, nits_to_pq(m));
-                }
-            }
-            // 和 shader 一样把峰值量化到 10-bit 码值，再和 SDR 白点取大。
-            const float peak_code = std::round(std::clamp(peak_pq, 0.0F, 1.0F) * 1023.0F) / 1023.0F;
-            const float in_max = std::max(nits_to_pq(sdr_white), peak_code);
-            const float white_scale = 100.0F / sdr_white;
-            const SplineCurve curve = make_spline(in_max, sdr_white);
-
-            // Pass 2：逐像素 tone map → sRGB → BGRA。
-            for (std::uint32_t y = 0; y < raw.height; ++y) {
-                load_row(y);
-                std::uint8_t* dst = out.pixels.data() + (static_cast<std::size_t>(y) * out.stride);
-                for (std::uint32_t x = 0; x < raw.width; ++x) {
-                    const float rgb[3]{row_floats[(static_cast<std::size_t>(x) * 4) + 0],
-                                       row_floats[(static_cast<std::size_t>(x) * 4) + 1],
-                                       row_floats[(static_cast<std::size_t>(x) * 4) + 2]};
-                    float nits2020[3];
-                    pixel_nits_2020(rgb, nits2020);
-                    // shader 里是 nits2020 → BT.709 → *0.01 再进 IPT，这里照做。
-                    float nits709[3];
-                    mat3_mul(kBt2020To709, nits2020, nits709);
-                    const float relative[3]{nits709[0] * 0.01F, nits709[1] * 0.01F, nits709[2] * 0.01F};
-                    float linear[3];
-                    tone_map_ipt(relative, curve, linear);
-                    std::uint8_t* q = dst + (static_cast<std::size_t>(x) * 4);
-                    q[0] = linear_to_srgb8(linear[2] * white_scale);  // B
-                    q[1] = linear_to_srgb8(linear[1] * white_scale);  // G
-                    q[2] = linear_to_srgb8(linear[0] * white_scale);  // R
-                    q[3] = 255;
-                }
-            }
-            return true;
+            // FP16：HDR10(PQ) 或 scRGB 的色调映射到 SDR（和 shader 同一条 spline + IPT 链路）。
+            return tone_map_fp16_to_sdr(reinterpret_cast<const std::uint16_t*>(raw.pixels.data()), raw.width,
+                                        raw.height, raw.stride, color_space, sdr_white_nits, out);
         }
 
     }  // namespace
 
     // ── staging 纹理 ─────────────────────────────────────────────────────────
+
+    // 公开包装：匿名命名空间里的实现只给编码线程用，基准工具也需要同一条链路。
+    bool tone_map_hdr_to_sdr(std::uint16_t const* fp16, std::uint32_t width, std::uint32_t height,
+                             std::uint32_t stride_bytes, DXGI_COLOR_SPACE_TYPE color_space,
+                             std::uint32_t sdr_white_nits, Image& out) {
+        if (fp16 == nullptr || width == 0 || height == 0)
+            return false;
+        return tone_map_fp16_to_sdr(fp16, width, height, stride_bytes, color_space, sdr_white_nits, out);
+    }
 
     // 纹理都是“谁持有谁释放”，用 com_ptr 表达独占（不可拷贝，只能移动）。
     winrt::com_ptr<ID3D11Texture2D> create_staging_texture(ID3D11Device* device, D3D11_TEXTURE2D_DESC const& desc) {
@@ -517,8 +591,14 @@ namespace gamesnap {
     EncodeWorkers::EncodeWorkers(std::filesystem::path output_dir, std::shared_ptr<EncodeQueue> jobs,
                                  CodecOptions options, ToneMapBackend tone_map_backend,
                                  std::wstring filename_pattern, std::shared_ptr<UiBridge> ui)
-        : output_dir_(std::move(output_dir)), jobs_(std::move(jobs)), ui_(std::move(ui)), options_(options),
-          tone_map_backend_(tone_map_backend), filename_pattern_(std::move(filename_pattern)) {
+        // clang-format off
+        : output_dir_(std::move(output_dir))
+        , jobs_(std::move(jobs))
+        , ui_(std::move(ui))
+        , options_(options)
+        , tone_map_backend_(tone_map_backend)
+        , filename_pattern_(std::move(filename_pattern)) {
+        // clang-format on
         set_codec_options(options_);
     }
 

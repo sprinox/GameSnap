@@ -371,9 +371,10 @@ namespace gamesnap {
                 if (result != nullptr) {
                     SPDLOG_INFO("overlay 字体: {}", wstring_to_utf8(font_path.wstring()));
                     if (!cjk_capable) {
-                        SPDLOG_WARN("{} 不含中文字形，overlay 的中文文案会显示为方框"
-                                    "（装一次微软雅黑/黑体/宋体即可）",
-                                    wstring_to_utf8(font_path.filename().wstring()));
+                        SPDLOG_WARN(
+                            "{} 不含中文字形，overlay 的中文文案会显示为方框"
+                            "（装一次微软雅黑/黑体/宋体即可）",
+                            wstring_to_utf8(font_path.filename().wstring()));
                     }
                 }
             }

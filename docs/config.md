@@ -8,6 +8,8 @@
 
 YAML 先加载，命令行参数随后覆盖。**首次启动**如果三处都没有配置文件，程序会在 exe 目录自动生成一份
 带注释的 `config.yaml`（等价于 [config.example.yaml](../config.example.yaml)），直接改就行。
+生成用“写临时文件再 rename”，崩溃不会留下半个 YAML；如果 exe 目录不可写（例如装在 `Program Files`），
+会打一条 warning 并继续使用内置默认值，不影响使用。
 
 ## YAML 字段
 
@@ -57,7 +59,7 @@ AVIF 支持 quality/lossless/speed；HEIC（x265）支持 quality/lossless/prese
 | --- | --- |
 | `{title}` | 截图时前台窗口的标题 |
 | `{exe}` | 前台进程的 exe 名，**不含扩展名** |
-| `{process}` | 前台进程的显示名：exe 版本信息里的 `FileDescription`（任务管理器“描述”那列），取不到时等于 `{exe}` |
+| `{process}` | 前台进程的显示名：exe 版本信息里的 `FileDescription`（任务管理器“描述”那列）。拿不到描述时等于 `{exe}`；连进程都打不开（权限不足/保护进程）时为空 |
 | `{time}` | 时间戳 `YYYYMMDD_HHMMSS_mmm` |
 | `{seq}` | 本次运行的截图序号（4 位，从 0001 开始） |
 
@@ -66,8 +68,11 @@ AVIF 支持 quality/lossless/speed；HEIC（x265）支持 quality/lossless/prese
 - 模板里**最好带 `{time}` 或 `{seq}`**，否则同一秒内的多张截图会重名覆盖；
 - **模板里没出现的占位符不会去取**：不写 `{title}` 就不读窗口标题，不写 `{exe}`/`{process}` 就不
   `OpenProcess`，不写 `{process}` 就不读 exe 的版本资源，不写 `{time}` 就不查时区——都省在截图的关键路径上；
-- 替换后还会做一次文件名清洗：非法字符（`< > : " / \ | ? *`）换成 `_`，去掉首尾空格和点，超长截断；
-- 结果为空时回退成 `GameSnap`；HDR 截图仍会自动加 `_HDR` / `_SDR` 后缀；
+- 替换后还会做一次文件名清洗：非法字符（`< > : " / \ | ? *`）换成 `_`，去掉首尾空格和点（截断后也会再清一次），
+  超长截断到 180 字符；
+- 结果为空时回退成 `GameSnap`；模板是用户可控的，若生成的是 `CON` / `NUL` / `COM1` / `LPT9` 这类设备保留名，
+  会在名字**前面**补一个 `_`（Windows 只看第一个点之前的部分，所以补在后面没用：`CON.txt` 仍然是设备名）；
+  HDR 截图仍会自动加 `_HDR` / `_SDR` 后缀；
 - 命令行也可以用 `--filename-pattern` 临时覆盖。
 
 示例：`{title}_{time}_{seq}`（默认）→ `Game_20261110_204005_363_0001.jxl`；
@@ -90,6 +95,10 @@ AVIF 支持 quality/lossless/speed；HEIC（x265）支持 quality/lossless/prese
 | `--verbose` | 调试日志 |
 | `--selftest` | 合成纹理自检编码链路，不经过 WGC |
 | `--help` | 显示帮助 |
+
+> **基准参数（`--bench` / `--bench-scale` / `--bench-verify`）** 属于开发者自用的测试工具，
+> **不受支持**：默认不编入（需要 `GAMESNAP_ENABLE_BENCH=1` 重新编译），参数和输出格式可能随时变动，
+> [benchmark.md](benchmark.md) 里的数据也可能已经过时。不要把它们写进脚本或依赖其输出格式。
 
 ## 错误处理
 

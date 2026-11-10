@@ -242,7 +242,7 @@ namespace gamesnap {
 
             auto jobs = std::make_shared<EncodeQueue>();
             EncodeWorkers workers(config.output_dir, jobs, config.codec, config.tone_map_backend,
-                              config.filename_pattern, {});
+                                  config.filename_pattern, {});
             workers.start(1);
 
             std::error_code ec;

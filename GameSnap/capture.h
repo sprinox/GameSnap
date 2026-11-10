@@ -39,9 +39,9 @@ namespace gamesnap {
         std::atomic<bool> failed{false};              // CopyResource / 设备移除失败
         ShotTimings timings;                          // 各阶段时刻，随 EncodeJob 一起传递
         std::uint64_t sequence = 0;
-        std::wstring title;          // 前台窗口标题，用于文件名 {title}
-        std::wstring process_exe;    // 前台进程 exe 名（去扩展名），用于 {exe}
-        std::wstring process_name;   // 前台进程显示名（FileDescription），用于 {process}
+        std::wstring title;         // 前台窗口标题，用于文件名 {title}
+        std::wstring process_exe;   // 前台进程 exe 名（去扩展名），用于 {exe}
+        std::wstring process_name;  // 前台进程显示名（FileDescription），用于 {process}
         DXGI_COLOR_SPACE_TYPE color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         std::uint32_t sdr_white_nits = 80;
         bool hdr = false;

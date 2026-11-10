@@ -45,7 +45,9 @@ namespace {
             // 走 std::terminate() 再写日志会直接死锁。
             if (ctrl_c_count().fetch_add(1, std::memory_order_acq_rel) >= 1) {
                 constexpr std::string_view kMessage = "GameSnap: 收尾卡住，强制退出\n";
-                gamesnap::write_console_utf8(kMessage, true);
+                // 控制台控制处理器有超时限制，且此时清理流程可能卡着日志/CRT 锁：
+                // 用不分配内存、不碰 CRT 的固定版本。
+                gamesnap::write_console_utf8_fixed(kMessage, true);
                 ::_exit(1);
             }
             return TRUE;
@@ -83,7 +85,7 @@ namespace {
         overlay.start();
 
         gamesnap::EncodeWorkers encoders(config.output_dir, jobs, config.codec, config.tone_map_backend,
-                                    config.filename_pattern, ui);
+                                         config.filename_pattern, ui);
         encoders.start(config.encode_threads);
 
         gamesnap::InputThread input(config, commands, ui);
@@ -149,14 +151,22 @@ namespace {
 
         ::SetConsoleCtrlHandler(console_ctrl_handler, FALSE);
         SPDLOG_INFO("已退出");
-        return (capture.fatal_error() || capture_crashed.load(std::memory_order_relaxed)) ? 1 : 0;
+        const bool failed = capture.fatal_error() || capture_crashed.load(std::memory_order_relaxed);
+        if (failed && ::GetConsoleWindow() == nullptr) {
+            // 双击启动时没有控制台：捕获失败（权限不足、WGC 不可用等）不能只躺在日志里。
+            (void)::MessageBoxW(nullptr,
+                                L"GameSnap 因错误退出。\n详细信息见 exe 目录下的 logs\\GameSnap.log。",
+                                L"GameSnap", MB_ICONERROR | MB_OK);
+        }
+        return failed ? 1 : 0;
     }
 
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    ::SetConsoleCP(CP_UTF8);
-    ::SetConsoleOutputCP(CP_UTF8);
+    // 不再改控制台代码页：所有控制台输出都走 WriteConsoleW（spdlog 有
+    // SPDLOG_UTF8_TO_WCHAR_CONSOLE，自己的输出走 write_console_utf8），
+    // 而 SetConsoleOutputCP 改的是父终端共享的属性，退出后会把 cmd 留在 UTF-8 上。
 
     gamesnap::install_terminate_handler();
     gamesnap::install_new_handler();

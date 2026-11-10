@@ -12,7 +12,8 @@
 # 文件名模板（不含 _HDR/_SDR 与扩展名）。可用占位符：
 #   {title}   截图时前台窗口的标题
 #   {exe}     前台进程的 exe 名（不含扩展名）
-#   {process} 前台进程的显示名（exe 版本信息里的 FileDescription，取不到时等于 {exe}）
+#   {process} 前台进程的显示名（FileDescription；拿不到描述时为 {exe}，
+#             连进程都打不开（权限不足）时为空）
 #   {time}    时间戳 YYYYMMDD_HHMMSS_mmm
 #   {seq}     本次运行的截图序号（4 位）
 # 建议保留 {time} 或 {seq}，否则同一秒内多张截图会重名覆盖。

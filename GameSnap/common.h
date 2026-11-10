@@ -104,6 +104,8 @@ namespace gamesnap {
     // 控制台用 WriteConsoleW，绕开会话代码页（cmd 默认 936 时中文会乱码）；
     // 句柄不是控制台（重定向到文件/管道）时退回 fwrite 原始 UTF-8 字节。
     void write_console_utf8(std::string_view text, bool to_stderr = false);
+    // 不分配内存的版本：OOM 处理器 / 控制台控制处理器这类不能分配的场景专用。
+    void write_console_utf8_fixed(std::string_view text, bool to_stderr);
 
     void init_logging();
     void install_terminate_handler();
@@ -245,8 +247,12 @@ namespace gamesnap {
         CodecOptions codec;
         bool verbose = false;
         bool selftest = false;  // 不经过 WGC，用合成纹理验证编码链路
-    // 编码基准：给定一张 PNG，用各种格式/参数重新编码，量体积与耗时。
-    std::optional<std::filesystem::path> bench_source;
+        // 编码基准：给定一张 PNG，用各种格式/参数重新编码，量体积与耗时。
+        std::optional<std::filesystem::path> bench_source;
+        // 基准的缩放高度（0 = 不缩放）。用来把 4K 源降到 1080p 做对比。
+        std::uint32_t bench_scale_height = 0;
+        // 基准：编码完 JXL 无损后再解码回来，逐像素比对，确认真的是无损。
+        bool bench_verify = false;
     };
 
     std::filesystem::path default_output_dir();

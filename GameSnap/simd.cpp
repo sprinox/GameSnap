@@ -34,6 +34,28 @@ namespace gamesnap {
             return result;
         }
 
+        std::uint16_t float_to_half_scalar(float value) {
+            std::uint32_t bits = 0;
+            std::memcpy(&bits, &value, sizeof(bits));
+            const std::uint32_t sign = (bits >> 16) & 0x8000U;
+            const std::uint32_t raw_exponent = (bits >> 23) & 0xFFU;
+            std::uint32_t mantissa = bits & 0x7FFFFFU;
+            if (raw_exponent == 0xFFU)  // inf / NaN
+                return static_cast<std::uint16_t>(sign | 0x7C00U | (mantissa != 0 ? 0x200U : 0U));
+            const int exponent = static_cast<int>(raw_exponent) - 127 + 15;
+            if (exponent >= 31)  // 溢出成 inf
+                return static_cast<std::uint16_t>(sign | 0x7C00U);
+            if (exponent <= 0) {  // 次正规数或下溢
+                if (exponent < -10)
+                    return static_cast<std::uint16_t>(sign);
+                mantissa |= 0x800000U;
+                const auto shift = static_cast<std::uint32_t>(14 - exponent);
+                return static_cast<std::uint16_t>(sign | (mantissa >> shift));
+            }
+            return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(exponent) << 10) |
+                                              (mantissa >> 13));
+        }
+
     }  // namespace
 
     void half_to_float_row(std::uint16_t const* src, float* dst, std::size_t count) {
@@ -44,6 +66,17 @@ namespace gamesnap {
         }
         for (; i < count; ++i)
             dst[i] = half_to_float_scalar(src[i]);
+    }
+
+    void float_to_half_row(float const* src, std::uint16_t* dst, std::size_t count) {
+        std::size_t i = 0;
+        for (; i + 8 <= count; i += 8) {
+            const __m256 v = _mm256_loadu_ps(src + i);
+            const __m128i half = _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), half);
+        }
+        for (; i < count; ++i)
+            dst[i] = float_to_half_scalar(src[i]);
     }
 
     void bgra_set_alpha_row(std::uint8_t* pixels, std::size_t count) {

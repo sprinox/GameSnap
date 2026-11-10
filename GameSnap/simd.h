@@ -8,6 +8,9 @@ namespace gamesnap {
     // FP16 → FP32。F16C（AVX2 平台默认可用）一次转换 8 个 half。
     void half_to_float_row(std::uint16_t const* src, float* dst, std::size_t count);
 
+    // FP32 → FP16（就近舍入，溢出按 half 的 inf 处理）。
+    void float_to_half_row(float const* src, std::uint16_t* dst, std::size_t count);
+
     // BGRA8 行内把 alpha 置为 255。
     void bgra_set_alpha_row(std::uint8_t* pixels, std::size_t count);
 

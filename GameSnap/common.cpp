@@ -15,8 +15,9 @@
 #include <cwchar>
 #include <cwctype>
 #include <exception>
+#include <fcntl.h>  // _O_RDWR / _O_TEXT：把控制台句柄绑到 CRT 流
 #include <fstream>
-#include <io.h>  // _get_osfhandle / _fileno：把 CRT 流的新句柄写回 STD_*
+#include <io.h>  // _open_osfhandle / _dup2：把控制台句柄绑到 CRT 流
 #include <iterator>
 #include <stdexcept>
 
@@ -52,35 +53,71 @@ namespace gamesnap {
             return kDir;
         }
 
-        // 这个流是否已经被重定向到文件/管道——是的话必须原样保留，不能抢去写控制台。
-        bool stream_already_redirected(DWORD std_handle) {
-            const HANDLE existing = ::GetStdHandle(std_handle);
-            if (existing == nullptr || existing == INVALID_HANDLE_VALUE)
+        // 这个句柄是不是用户重定向出去的文件/管道——是的话必须原样保留，不能抢去写控制台。
+        bool is_redirect_handle(HANDLE handle) {
+            if (handle == nullptr || handle == INVALID_HANDLE_VALUE)
                 return false;
-            const DWORD type = ::GetFileType(existing);
+            const DWORD type = ::GetFileType(handle);
             return type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE;
         }
 
-        // 把 CRT 流重新绑到设备，并把新的 OS 句柄写回 STD_*。
-        // 只 freopen 是不够的：spdlog 的 wincolor_sink 在构造时取 GetStdHandle(STD_OUTPUT_HANDLE)，
-        // 不 SetStdHandle 的话它拿到 NULL 就直接放弃，日志一条也进不了控制台。
-        // 已经重定向的流直接返回 true，保留用户的重定向（2> err.txt、< in.txt 不能被抢）。
-        bool redirect_std_stream(DWORD std_handle, char const* device, std::FILE* stream, char const* mode) {
-            if (stream_already_redirected(std_handle))
-                return true;
-            std::FILE* reopened = nullptr;
-            if (::freopen_s(&reopened, device, mode, stream) != 0 || reopened == nullptr)
+        // 让 CRT 的 FILE* 也指向控制台设备。_open_osfhandle 会接管句柄所有权，
+        // 所以先复制一份给它，我们自己的句柄还要留给 SetStdHandle。
+        void rebind_crt(std::FILE* stream, HANDLE handle) {
+            HANDLE duplicate = nullptr;
+            if (::DuplicateHandle(::GetCurrentProcess(), handle, ::GetCurrentProcess(), &duplicate, 0, TRUE,
+                                  DUPLICATE_SAME_ACCESS) == FALSE) {
+                return;
+            }
+            const int fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(duplicate), _O_RDWR | _O_TEXT);
+            if (fd == -1) {
+                ::CloseHandle(duplicate);
+                return;
+            }
+            (void)::_dup2(fd, ::_fileno(stream));
+            (void)::_close(fd);
+        }
+
+        // 打开控制台设备并把句柄写回 STD_*，同时让 CRT 的 stdin/stdout/stderr 指向同一个设备。
+        // 必须用 CreateFileW 而不是 freopen_s：freopen(..., "w") 拿到的是**只可写**的句柄，
+        // 而 spdlog 的 wincolor_sink 是靠 GetConsoleMode 判断"是不是控制台"的
+        // （GetConsoleMode 需要 GENERIC_READ）。只可写 → 它判定不是控制台 →
+        // 不打颜色，并且改走 WriteFile 写 UTF-8 字节，在 936 代码页的控制台里就是乱码。
+        //
+        // err/in 传 false 表示"用户已经把 stderr/stdin 重定向到文件/管道"，此时不要动它们；
+        // 注意要在 AttachConsole **之前**采样：attach 会把 STD_* 换成控制台句柄。
+        bool open_console_streams(bool keep_stderr, bool keep_stdin) {
+            const auto open_device = [](wchar_t const* name, DWORD access) {
+                return ::CreateFileW(name, access, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
+                                     nullptr);
+            };
+            const HANDLE out = open_device(L"CONOUT$", GENERIC_READ | GENERIC_WRITE);
+            if (out == INVALID_HANDLE_VALUE)
                 return false;
-            const intptr_t os_handle = ::_get_osfhandle(::_fileno(stream));
-            if (os_handle == -1)
-                return false;
-            return ::SetStdHandle(std_handle, reinterpret_cast<HANDLE>(os_handle)) != 0;
+            ::SetStdHandle(STD_OUTPUT_HANDLE, out);
+            rebind_crt(stdout, out);
+            // stdout 不用判断——能走到这里说明它要么无效、要么是只可写控制台，替换才是对的。
+            if (!keep_stderr) {
+                if (const HANDLE err = open_device(L"CONOUT$", GENERIC_READ | GENERIC_WRITE);
+                    err != INVALID_HANDLE_VALUE) {
+                    ::SetStdHandle(STD_ERROR_HANDLE, err);
+                    rebind_crt(stderr, err);
+                }
+            }
+            if (!keep_stdin) {
+                if (const HANDLE in = open_device(L"CONIN$", GENERIC_READ | GENERIC_WRITE);
+                    in != INVALID_HANDLE_VALUE) {
+                    ::SetStdHandle(STD_INPUT_HANDLE, in);
+                    rebind_crt(stdin, in);
+                }
+            }
+            return true;
         }
 
         // 控制台是否可用，按“有没有真的控制台”判断，而不是靠编译期子系统宏：
         //   * Console 子系统：从资源管理器或终端启动都会带控制台 → GetConsoleWindow() 非空；
         //   * Windows 子系统：默认没有控制台；从终端启动时用 AttachConsole 挂上父控制台，
-        //     再把标准流重定向过去（见 redirect_std_stream）。
+        //     再把标准流重定向过去（见 open_console_streams）。
         // 但如果 stdout 已经被重定向到文件/管道（GetFileType 是 DISK/PIPE），就不要抢过来改，
         // 否则 `GameSnap --help > out.txt` 会写进控制台而不是文件。
         // 返回值表示 **stdout** 可用（日志 sink 写的就是它）；不可用时调用方不要加控制台 sink。
@@ -91,25 +128,35 @@ namespace gamesnap {
                 // DISK / PIPE：真的是重定向，保留句柄不动。
                 if (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE)
                     return true;
-                // CHAR：可能已经是控制台；GetConsoleWindow 非空才算数，
-                // 否则可能是 NUL 之类的字符设备，继续走 AttachConsole。
-                if (type == FILE_TYPE_CHAR && ::GetConsoleWindow() != nullptr)
+                // 真控制台句柄：GetConsoleMode 能成功（也就意味着有读权限，spdlog 才认）。
+                DWORD console_mode = 0;
+                if (::GetConsoleMode(stdout_handle, &console_mode) != 0)
                     return true;
             }
-            if (::GetConsoleWindow() != nullptr)
-                return true;
+            // AttachConsole 会把 STD_* 换成控制台句柄（哪怕原来是用户重定向的文件/管道），
+            // 所以要在 attach 之前把重定向状态和句柄记下来，attach 之后再按需还原。
+            const HANDLE saved_stderr = ::GetStdHandle(STD_ERROR_HANDLE);
+            const bool stderr_redirected = is_redirect_handle(saved_stderr);
+            const HANDLE saved_stdin = ::GetStdHandle(STD_INPUT_HANDLE);
+            const bool stdin_redirected = is_redirect_handle(saved_stdin);
 
-            if (::AttachConsole(ATTACH_PARENT_PROCESS) == FALSE)
+            if (::GetConsoleWindow() == nullptr && ::AttachConsole(ATTACH_PARENT_PROCESS) == FALSE)
                 return false;
 
-            // 附加成功后进程通常还没有标准句柄（GUI 进程），这里补齐 CRT 流 + STD_*。
-            // stderr/stdin 各自保留已有的重定向；返回值只看 stdout，因为 sink 写的是它。
-            const bool out_ok = redirect_std_stream(STD_OUTPUT_HANDLE, "CONOUT$", stdout, "w");
-            (void)redirect_std_stream(STD_ERROR_HANDLE, "CONOUT$", stderr, "w");
-            (void)redirect_std_stream(STD_INPUT_HANDLE, "CONIN$", stdin, "r");
-            if (!out_ok) {
-                ::FreeConsole();  // stdout 接不上 = 日志没法进控制台，就当没有控制台
+            // 走到这里说明要么刚 attach（GUI 进程没有标准句柄），要么句柄是只可写/无效的。
+            // 统一重新打开一份读写的控制台句柄：stdout 拿不到就当没有控制台。
+            if (!open_console_streams(stderr_redirected, stdin_redirected)) {
+                ::FreeConsole();
                 return false;
+            }
+            // 还原用户的重定向：attach 把它们冲掉了，这里塞回去（CRT 流也一起）。
+            if (stderr_redirected) {
+                ::SetStdHandle(STD_ERROR_HANDLE, saved_stderr);
+                rebind_crt(stderr, saved_stderr);
+            }
+            if (stdin_redirected) {
+                ::SetStdHandle(STD_INPUT_HANDLE, saved_stdin);
+                rebind_crt(stdin, saved_stdin);
             }
             return true;
         }
@@ -731,12 +778,15 @@ verbose: false
             // 放在 set_default_logger 之后：之前还没装好 sink，这条会丢。
             // 用 info：用户最常问的就是“终端里怎么没有日志”，这行直接回答。
             const DWORD type = ::GetFileType(console_handle);
-            SPDLOG_INFO("{}（STD_OUTPUT_HANDLE={:#x}）",
+            DWORD console_mode = 0;
+            // GetConsoleMode 能成，spdlog 才会当它是控制台（打颜色 + WriteConsoleW）。
+            const BOOL console_ok = ::GetConsoleMode(console_handle, &console_mode);
+            SPDLOG_INFO("{}（STD_OUTPUT_HANDLE={:#x}, GetConsoleMode={}）",
                         type == FILE_TYPE_CHAR   ? "控制台输出已启用"
                         : type == FILE_TYPE_PIPE ? "标准输出已重定向到管道"
                         : type == FILE_TYPE_DISK ? "标准输出已重定向到文件"
                                                  : "标准输出句柄类型未知（FILE_TYPE_UNKNOWN）",
-                        reinterpret_cast<std::uintptr_t>(console_handle));
+                        reinterpret_cast<std::uintptr_t>(console_handle), static_cast<int>(console_ok));
         }
     }
 

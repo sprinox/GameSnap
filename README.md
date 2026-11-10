@@ -50,9 +50,9 @@
 
 ## HDR / SDR 对比
 
-|   HDR（AVIF 10-bit PQ / BT.2020）    |     SDR（spline + IPT 色调映射）     |
-| :----------------------------------: | :----------------------------------: |
-| ![HDR 输出](assets/3_1080p_HDR.avif) | ![SDR 输出](assets/3_1080p_SDR.avif) |
+| HDR（AVIF 10-bit PQ / BT.2020） | SDR（spline + IPT 色调映射） |
+| :---: | :---: |
+| [3_1080p_HDR.avif](assets/3_1080p_HDR.avif)（273 KB） | [3_1080p_SDR.avif](assets/3_1080p_SDR.avif)（254 KB） |
 
 ## 配置
 

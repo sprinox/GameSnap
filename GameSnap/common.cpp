@@ -61,21 +61,38 @@ namespace gamesnap {
             return type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE;
         }
 
-        // 让 CRT 的 FILE* 也指向控制台设备。_open_osfhandle 会接管句柄所有权，
+        // 让 CRT 的 FILE* 也指向这个设备。_open_osfhandle 会接管句柄所有权，
         // 所以先复制一份给它，我们自己的句柄还要留给 SetStdHandle。
-        void rebind_crt(std::FILE* stream, HANDLE handle) {
+        // flags 必须和句柄的真实权限匹配：用户 `2> err.txt` 的句柄通常只可写，
+        // 用 _O_RDWR 可能让 _open_osfhandle 失败（那 CRT 就还停在旧流上）。
+        bool rebind_crt(std::FILE* stream, HANDLE handle, int flags) {
             HANDLE duplicate = nullptr;
             if (::DuplicateHandle(::GetCurrentProcess(), handle, ::GetCurrentProcess(), &duplicate, 0, TRUE,
                                   DUPLICATE_SAME_ACCESS) == FALSE) {
-                return;
+                return false;
             }
-            const int fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(duplicate), _O_RDWR | _O_TEXT);
+            int fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(duplicate), flags | _O_TEXT);
+            if (fd == -1)  // 权限猜错了就退回读写试试（失败的 _open_osfhandle 不接管所有权）
+                fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(duplicate), _O_RDWR | _O_TEXT);
             if (fd == -1) {
                 ::CloseHandle(duplicate);
-                return;
+                return false;
             }
             (void)::_dup2(fd, ::_fileno(stream));
             (void)::_close(fd);
+            return true;
+        }
+
+        // 复制一份句柄：AttachConsole 不保证旧的标准句柄还开着，直接存原值可能拿到失效句柄。
+        HANDLE duplicate_handle(HANDLE handle) {
+            if (handle == nullptr || handle == INVALID_HANDLE_VALUE)
+                return INVALID_HANDLE_VALUE;
+            HANDLE duplicate = nullptr;
+            if (::DuplicateHandle(::GetCurrentProcess(), handle, ::GetCurrentProcess(), &duplicate, 0, TRUE,
+                                  DUPLICATE_SAME_ACCESS) == FALSE) {
+                return INVALID_HANDLE_VALUE;
+            }
+            return duplicate;
         }
 
         // 打开控制台设备并把句柄写回 STD_*，同时让 CRT 的 stdin/stdout/stderr 指向同一个设备。
@@ -95,20 +112,20 @@ namespace gamesnap {
             if (out == INVALID_HANDLE_VALUE)
                 return false;
             ::SetStdHandle(STD_OUTPUT_HANDLE, out);
-            rebind_crt(stdout, out);
+            (void)rebind_crt(stdout, out, _O_WRONLY);
             // stdout 不用判断——能走到这里说明它要么无效、要么是只可写控制台，替换才是对的。
             if (!keep_stderr) {
                 if (const HANDLE err = open_device(L"CONOUT$", GENERIC_READ | GENERIC_WRITE);
                     err != INVALID_HANDLE_VALUE) {
                     ::SetStdHandle(STD_ERROR_HANDLE, err);
-                    rebind_crt(stderr, err);
+                    (void)rebind_crt(stderr, err, _O_WRONLY);
                 }
             }
             if (!keep_stdin) {
                 if (const HANDLE in = open_device(L"CONIN$", GENERIC_READ | GENERIC_WRITE);
                     in != INVALID_HANDLE_VALUE) {
                     ::SetStdHandle(STD_INPUT_HANDLE, in);
-                    rebind_crt(stdin, in);
+                    (void)rebind_crt(stdin, in, _O_RDONLY);
                 }
             }
             return true;
@@ -134,10 +151,10 @@ namespace gamesnap {
                     return true;
             }
             // AttachConsole 会把 STD_* 换成控制台句柄（哪怕原来是用户重定向的文件/管道），
-            // 所以要在 attach 之前把重定向状态和句柄记下来，attach 之后再按需还原。
-            const HANDLE saved_stderr = ::GetStdHandle(STD_ERROR_HANDLE);
+            // 而且不保证旧句柄还开着——所以先复制一份再 attach，还原的是这份副本。
+            const HANDLE saved_stderr = duplicate_handle(::GetStdHandle(STD_ERROR_HANDLE));
             const bool stderr_redirected = is_redirect_handle(saved_stderr);
-            const HANDLE saved_stdin = ::GetStdHandle(STD_INPUT_HANDLE);
+            const HANDLE saved_stdin = duplicate_handle(::GetStdHandle(STD_INPUT_HANDLE));
             const bool stdin_redirected = is_redirect_handle(saved_stdin);
 
             if (::GetConsoleWindow() == nullptr && ::AttachConsole(ATTACH_PARENT_PROCESS) == FALSE)
@@ -150,13 +167,14 @@ namespace gamesnap {
                 return false;
             }
             // 还原用户的重定向：attach 把它们冲掉了，这里塞回去（CRT 流也一起）。
+            // 句柄是 attach 前复制的副本，寿命到进程结束（SetStdHandle 存的就是它）。
             if (stderr_redirected) {
                 ::SetStdHandle(STD_ERROR_HANDLE, saved_stderr);
-                rebind_crt(stderr, saved_stderr);
+                (void)rebind_crt(stderr, saved_stderr, _O_WRONLY);
             }
             if (stdin_redirected) {
                 ::SetStdHandle(STD_INPUT_HANDLE, saved_stdin);
-                rebind_crt(stdin, saved_stdin);
+                (void)rebind_crt(stdin, saved_stdin, _O_RDONLY);
             }
             return true;
         }

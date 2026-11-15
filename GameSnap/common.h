@@ -233,7 +233,7 @@ namespace gamesnap {
         //   {seq}     本次运行的截图序号（4 位）
         // 未知的 {…} 原样保留；替换完会再做一次文件名清洗（非法字符换成 _，裁掉首尾空格/点）。
         std::wstring filename_pattern = L"{title}_{time}_{seq}";
-        int encode_threads = 2;       // 编码线程数（同时决定并行落盘能力）
+        int encode_tasks = 2;        // 同时处理的编码任务数；任务内部并行度由 codec.threads 控制
         UINT hotkey_vk = VK_F12;      // 键盘热键
         UINT hotkey_modifiers = 0;    // 修饰键组合
         bool hotkey_swallow = false;  // 是否吞掉热键（默认不吞，游戏仍能收到）

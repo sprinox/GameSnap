@@ -16,6 +16,7 @@ namespace gamesnap {
         // 两次以上廉价自检之间的最小间隔。WM_SETTINGCHANGE 会随主题、输入法、显示器设置
         // 和各种应用广播频繁到来，每次自检都要枚举 DXGI 输出，必须合并。
         constexpr auto kValidateThrottle = std::chrono::milliseconds(500);
+        constexpr UINT_PTR kValidateTimer = 1;
 
         // 托盘：回调消息 + 菜单命令 ID。
         constexpr UINT kTrayCallbackMessage = WM_APP + 1;
@@ -261,8 +262,24 @@ namespace gamesnap {
     void SystemEventThread::post_validate(ReloadReason reason) {
         const auto now = SteadyClock::now();
         if (last_validate_ != SteadyClock::time_point{} && now - last_validate_ < kValidateThrottle) {
-            SPDLOG_DEBUG("自检请求过于频繁，合并本次（{}ms 节流）", kValidateThrottle.count());
+            // 尾部合并必须保留显示事件：DeviceChange 的廉价验证不检查 HDR/白点。
+            if (!validate_pending_ || reason == ReloadReason::DisplayChange)
+                pending_validate_reason_ = reason;
+            validate_pending_ = true;
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                kValidateThrottle - (now - last_validate_)).count();
+            if (::SetTimer(window_, kValidateTimer, static_cast<UINT>(remaining + 1), nullptr) == 0) {
+                validate_pending_ = false;
+                last_validate_ = now;
+                post(CommandKind::Validate, pending_validate_reason_);
+            }
             return;
+        }
+        if (validate_pending_) {
+            if (pending_validate_reason_ == ReloadReason::DisplayChange)
+                reason = pending_validate_reason_;
+            validate_pending_ = false;
+            ::KillTimer(window_, kValidateTimer);
         }
         last_validate_ = now;
         post(CommandKind::Validate, reason);
@@ -311,6 +328,17 @@ namespace gamesnap {
 
         try {
             switch (message) {
+            case WM_TIMER:
+                if (wparam == kValidateTimer) {
+                    ::KillTimer(hwnd, kValidateTimer);
+                    if (self->validate_pending_) {
+                        self->validate_pending_ = false;
+                        self->last_validate_ = SteadyClock::now();
+                        self->post(CommandKind::Validate, self->pending_validate_reason_);
+                    }
+                    return 0;
+                }
+                break;
             case kTrayCallbackMessage:
                 switch (LOWORD(lparam)) {
                 case WM_RBUTTONUP:

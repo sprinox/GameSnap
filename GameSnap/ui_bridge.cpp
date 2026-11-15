@@ -88,17 +88,23 @@ namespace gamesnap {
             ::CloseHandle(trigger_event_);
     }
 
-    void UiBridge::on_trigger() noexcept {
-        // 这个函数在 WH_KEYBOARD_LL 钩子回调里被调用：超过 LowLevelHooksTimeout（默认 1s）
-        // 系统会静默摘掉钩子。所以这里只做递增 + SetEvent，不拿互斥量、不释放堆内存。
-        // 丢弃上一张文件名/缩略图的工作挪到 overlay 线程的 snapshot() 里惰性完成。
-        trigger_serial_.fetch_add(1, std::memory_order_acq_rel);
+    void UiBridge::notify() noexcept {
         if (trigger_event_ != nullptr)
             ::SetEvent(trigger_event_);
     }
 
+    std::uint64_t UiBridge::on_trigger() noexcept {
+        // 这个函数在 WH_KEYBOARD_LL 钩子回调里被调用：超过 LowLevelHooksTimeout（默认 1s）
+        // 系统会静默摘掉钩子。所以这里只做递增 + SetEvent，不拿互斥量、不释放堆内存。
+        // 丢弃上一张文件名/缩略图的工作挪到 overlay 线程的 snapshot() 里惰性完成。
+        const auto sequence = trigger_serial_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        notify();
+        return sequence;
+    }
+
     void UiBridge::job_enqueued() noexcept {
         remaining_.fetch_add(1, std::memory_order_acq_rel);
+        notify();
     }
 
     void UiBridge::job_finished() noexcept {
@@ -107,6 +113,7 @@ namespace gamesnap {
                                                               std::memory_order_acq_rel,
                                                               std::memory_order_acquire)) {
         }
+        notify();
     }
 
     void UiBridge::publish(std::uint64_t sequence, std::wstring filename, Image const* image) {
@@ -117,7 +124,7 @@ namespace gamesnap {
             {
                 // 先探一次：晚到的旧作业就别白算一次 320x180 采样了。
                 std::scoped_lock lock(mutex_);
-                if (sequence < published_sequence_)
+                if (sequence < published_sequence_ || sequence != trigger_serial_.load(std::memory_order_acquire))
                     return;
             }
             thumbnail = std::make_shared<Thumbnail>();
@@ -125,21 +132,22 @@ namespace gamesnap {
         }
 
         std::scoped_lock lock(mutex_);
-        if (sequence < published_sequence_)
+        if (sequence < published_sequence_ || sequence != trigger_serial_.load(std::memory_order_acquire))
             return;
         published_sequence_ = sequence;
         filename_ = std::move(filename);
         if (thumbnail)
             thumbnail_ = std::move(thumbnail);
         ++info_serial_;
+        notify();
     }
 
     UiBridge::Snapshot UiBridge::snapshot() {
         Snapshot result;
-        result.trigger_serial = trigger_serial_.load(std::memory_order_acquire);
         result.remaining = remaining_.load(std::memory_order_acquire);
         {
             std::scoped_lock lock(mutex_);
+            result.trigger_serial = trigger_serial_.load(std::memory_order_acquire);
             // 惰性丢弃上一张：新触发已经发生、但还没有比它更新的结果发布出来时，
             // 清掉旧文件名/缩略图，避免面板在 publish() 之前继续显示上一张。
             // 每次触发只清一次（cleared_trigger_），否则每帧都会把 info_serial_ 顶上去。

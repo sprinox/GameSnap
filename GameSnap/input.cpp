@@ -205,11 +205,11 @@ namespace gamesnap {
         Command command;
         command.kind = CommandKind::Trigger;
         command.enqueued = when;
+        if (ui_)
+            command.sequence = ui_->on_trigger();
         // 键盘钩子线程和 GameInput 回调线程都会调用；一次按键只入队一次，
         // 用不带 token 的 enqueue，避免两个线程共享同一个 ProducerToken。
         commands_->enqueue(command);
-        if (ui_)
-            ui_->on_trigger();
     }
 
     void CALLBACK InputThread::device_callback([[maybe_unused]] gi::GameInputCallbackToken callback_token,

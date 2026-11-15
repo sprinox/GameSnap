@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <vector>
 
 #pragma comment(lib, "dcomp.lib")
@@ -587,7 +588,7 @@ namespace gamesnap {
         if (!apartment.ok())
             SPDLOG_WARN("overlay 线程初始化 COM 失败: {}", describe_hresult(apartment.result()));
 
-        std::uint64_t last_trigger = bridge_->snapshot().trigger_serial;
+        std::uint64_t last_trigger = 0;
         auto idle_since = SteadyClock::now();
         while (!stop_.load(std::memory_order_acquire)) {
             // 没有保留的 overlay 资源时无限等待；有就等到 linger 到期。
@@ -606,12 +607,21 @@ namespace gamesnap {
 
             HANDLE handles[2]{bridge_->trigger_event(), stop_event_};
             const DWORD waited = (handles[0] != nullptr && stop_event_ != nullptr)
-                                     ? ::WaitForMultipleObjects(2, handles, FALSE, timeout)
+                                     ? ::MsgWaitForMultipleObjectsEx(2, handles, timeout, QS_ALLINPUT,
+                                                                    MWMO_INPUTAVAILABLE)
                                      : WAIT_FAILED;
             if (waited == WAIT_OBJECT_0 + 1)
                 break;
             if (stop_.load(std::memory_order_acquire))
                 break;
+            if (waited == WAIT_OBJECT_0 + 2) {
+                MSG message;
+                while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                    ::TranslateMessage(&message);
+                    ::DispatchMessageW(&message);
+                }
+                continue;  // 消息不能重置原来的 linger 截止时间。
+            }
             if (waited == WAIT_TIMEOUT) {
                 SPDLOG_INFO("overlay 闲置超过 {}s，释放窗口/设备/字体/播放器", kOverlayLinger.count());
                 release_all();
@@ -685,10 +695,17 @@ namespace gamesnap {
         std::shared_ptr<const UiBridge::Thumbnail> last_thumbnail;
         auto last_trigger_time = session_start;
         auto last_frame = session_start;
+        bool redraw = true;
+        int last_remaining = -1;
+        int last_x = std::numeric_limits<int>::min();
+        int last_y = std::numeric_limits<int>::min();
 
         while (!stop_.load(std::memory_order_acquire)) {
             MSG message;
             while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) > 0) {
+                if (message.message == WM_PAINT || message.message == WM_DPICHANGED ||
+                    message.message == WM_DISPLAYCHANGE)
+                    redraw = true;
                 ::TranslateMessage(&message);
                 ::DispatchMessageW(&message);
             }
@@ -699,6 +716,7 @@ namespace gamesnap {
             const UiBridge::Snapshot snapshot = bridge_->snapshot();
 
             if (snapshot.trigger_serial != last_trigger) {
+                redraw = true;
                 last_trigger = snapshot.trigger_serial;
                 last_trigger_time = now;
                 shown = true;
@@ -722,6 +740,7 @@ namespace gamesnap {
                 anim_start = now;
             }
 
+            const bool was_animating = animating;
             if (animating) {
                 const float t = std::min(1.0F, std::chrono::duration<float>(now - anim_start).count() / 0.30F);
                 const float eased = 1.0F - (1.0F - t) * (1.0F - t) * (1.0F - t);
@@ -734,6 +753,7 @@ namespace gamesnap {
                 break;
 
             if (snapshot.info_serial != last_info) {
+                redraw = true;
                 last_info = snapshot.info_serial;
                 if (snapshot.filename != state.font_filename) {
                     state.font_filename = snapshot.filename;
@@ -757,6 +777,24 @@ namespace gamesnap {
                 }
             }
 
+            if (!redraw && !was_animating && !animating && snapshot.remaining == last_remaining) {
+                DWORD timeout = INFINITE;
+                if (!min_time_elapsed) {
+                    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        kMinShowTime - (now - last_trigger_time)).count();
+                    timeout = static_cast<DWORD>(std::max<std::int64_t>(1, remaining + 1));
+                }
+                HANDLE handles[]{bridge_->trigger_event(), stop_event_};
+                const DWORD waited = ::MsgWaitForMultipleObjectsEx(2, handles, timeout, QS_ALLINPUT,
+                                                                   MWMO_INPUTAVAILABLE);
+                if (waited == WAIT_OBJECT_0 + 1)
+                    break;
+                if (waited == WAIT_FAILED)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                continue;
+            }
+            redraw = false;
+            last_remaining = snapshot.remaining;
             io.DisplaySize = ImVec2(static_cast<float>(panel_width), static_cast<float>(panel_height));
             io.DeltaTime = delta > 0.0F ? delta : 1.0F / 60.0F;
             ImGui_ImplDX11_NewFrame();
@@ -784,9 +822,14 @@ namespace gamesnap {
             // 表面底边落在“屏幕底 - margin”，卡片又贴着表面底部，所以下边距正好等于右边距。
             const int panel_y =
                 screen_bottom - static_cast<int>(panel_height) - static_cast<int>(std::lround(margin));
-            ::SetWindowPos(state.hwnd, HWND_TOPMOST, static_cast<int>(std::lround(panel_x)), panel_y,
-                           static_cast<int>(panel_width), static_cast<int>(panel_height),
-                           SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            const int current_x = static_cast<int>(std::lround(panel_x));
+            if (current_x != last_x || panel_y != last_y) {
+                ::SetWindowPos(state.hwnd, HWND_TOPMOST, current_x, panel_y,
+                               static_cast<int>(panel_width), static_cast<int>(panel_height),
+                               SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                last_x = current_x;
+                last_y = panel_y;
+            }
 
             ImDrawList* background = ImGui::GetBackgroundDrawList();
             background->AddRectFilled(ImVec2(0, card_top), ImVec2(static_cast<float>(panel_width), card_top + card_height),

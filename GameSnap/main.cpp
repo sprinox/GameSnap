@@ -86,7 +86,7 @@ namespace {
 
         gamesnap::EncodeWorkers encoders(config.output_dir, jobs, config.codec, config.tone_map_backend,
                                          config.filename_pattern, ui);
-        encoders.start(config.encode_threads);
+        encoders.start(config.encode_tasks);
 
         gamesnap::InputThread input(config, commands, ui);
         input.start();

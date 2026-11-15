@@ -40,6 +40,10 @@ namespace gamesnap {
         T const& operator[](std::size_t index) const noexcept { return data_[index]; }
 
         void clear() noexcept { size_ = 0; }
+        void release() noexcept {
+            data_.reset();
+            size_ = 0;
+        }
 
         // 变大时重新分配并保留旧内容；新增区域不初始化。变小时只缩短长度。
         void resize(std::size_t count) {
@@ -116,6 +120,8 @@ namespace gamesnap {
 
     // 各编码器的质量/无损/速度参数。BMP 固定无损，PNG 固定无损（compression 控制速度）。
     struct CodecOptions {
+        // 每任务的编码并行预算；不支持任意线程数的库按其能力映射，见 docs/config.md。
+        int threads = 1;
         int png_compression = 6;  // 0..9，高=更慢/更小
 
         int jpeg_quality = 95;  // 1..100

@@ -31,6 +31,8 @@ flowchart LR
 - 消费端阻塞等待，不做超时轮询；capture 线程靠 `CommandKind::Shutdown` 退出，编码线程靠 `EncodeJob::stop` 哨兵退出；
 - 消息内的 `shared_ptr` 负责跨线程生命周期（`EncodeJob` 持有 staging 纹理与 D3D 设备）。
 
+任务并行数为 `encode_tasks`，每个任务的编码并行预算为 `codec_threads`，详见 [config.md](config.md)。
+
 文件名用 `std::chrono::system_clock`（`Clock`）；阶段耗时用 `std::chrono::steady_clock`（`SteadyClock`），系统时间校准不会让延迟出现负值。
 
 ## 提示面板与提示音
@@ -157,7 +159,10 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 - 每个编码 job 临时分配 `raw` / `sdr` / `hdr10` 缓冲，编码完成后立即释放；不再使用 `thread_local EncodeScratch`。
   这些缓冲用未初始化的 `UninitBuffer`（`resize` 只分配不置零），避免整帧清零后立刻被覆盖。
 - SDR AVIF 内嵌 ISO 21496-1 gain map；HEIC 的 libheif 1.23 没有 gain map 写入 API，只输出 SDR 基图。
-- 文件名：`<前台窗口标题>_YYYYMMDD_HHMMSS_mmm_序号[_HDR|_SDR].<扩展名>`；标题在命令出队时取，非法字符替换为 `_`。
+- 文件名：`<前台窗口标题>_YYYYMMDD_HHMMSS_mmm_序号[_HDR|_SDR].<扩展名>`；标题在命令出队时取，非法字符替换为 `_`。`CREATE_NEW` 原子占名；重名在扩展名前追加 `_1`、`_2`、`_3`…，成功才保留占名文件。
+- PQ JXL 的 `intensity_target` 固定为 10000 nit（PQ 归一化上界），不是显示器峰值；PNG/JPEG EXIF 使用库原生接口，JPEG 不写 alpha。
+- 峰值归约先在非负线性亮度域取 max，再转换为同样的 10-bit PQ 值；GPU 每个 8×8 线程组只做一次峰值 PQ 转换，CPU 每帧一次。
+- Overlay 动画期间逐帧绘制，静态期间等待 UI 更新/窗口消息；隐藏期间仍泵消息。显示事件 500 ms 节流保留尾部请求，显示/HDR 变化优先于设备廉价验证。
 
 ## 内存与显存分配策略
 

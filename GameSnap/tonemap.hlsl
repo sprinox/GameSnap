@@ -286,10 +286,12 @@ void peak(uint3 tid : SV_DispatchThreadID, uint gi : SV_GroupIndex)
         const float3 hdr = Hdr.Load(int3(tid.xy, 0)).rgb;
         const float3 nits = Pq ? pq_to_nits3(hdr) : srgb_to_bt2020(hdr * 80.0);
         const float m = max(max(nits.r, nits.g), nits.b);
-        v = uint(round(saturate(nits_to_pq(max(m, 0.0))) * 1023.0));
+        // 正有限 float 的 IEEE 位表示与数值同序；线性归约后每组只做一次 PQ。
+        // 10000 nit 上界与 nits_to_pq 的 saturate 完全一致，也排除 Inf。
+        v = m > 0.0 ? asuint(min(m, 10000.0)) : 0;  // 同时把 -0 / NaN 规范成 +0
     }
     InterlockedMax(g_peak, v);
     GroupMemoryBarrierWithGroupSync();
     if (gi == 0)
-        InterlockedMax(PeakOut[0], g_peak);
+        InterlockedMax(PeakOut[0], uint(round(saturate(nits_to_pq(asfloat(g_peak))) * 1023.0)));
 }

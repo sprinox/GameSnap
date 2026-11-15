@@ -35,25 +35,9 @@ namespace gamesnap {
         }
 
         std::uint16_t float_to_half_scalar(float value) {
-            std::uint32_t bits = 0;
-            std::memcpy(&bits, &value, sizeof(bits));
-            const std::uint32_t sign = (bits >> 16) & 0x8000U;
-            const std::uint32_t raw_exponent = (bits >> 23) & 0xFFU;
-            std::uint32_t mantissa = bits & 0x7FFFFFU;
-            if (raw_exponent == 0xFFU)  // inf / NaN
-                return static_cast<std::uint16_t>(sign | 0x7C00U | (mantissa != 0 ? 0x200U : 0U));
-            const int exponent = static_cast<int>(raw_exponent) - 127 + 15;
-            if (exponent >= 31)  // 溢出成 inf
-                return static_cast<std::uint16_t>(sign | 0x7C00U);
-            if (exponent <= 0) {  // 次正规数或下溢
-                if (exponent < -10)
-                    return static_cast<std::uint16_t>(sign);
-                mantissa |= 0x800000U;
-                const auto shift = static_cast<std::uint32_t>(14 - exponent);
-                return static_cast<std::uint16_t>(sign | (mantissa >> shift));
-            }
-            return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(exponent) << 10) |
-                                              (mantissa >> 13));
+            // 与 AVX2 主循环使用同一个 F16C 舍入规则，覆盖次正规数、溢出和 NaN。
+            return static_cast<std::uint16_t>(_mm_cvtsi128_si32(
+                _mm_cvtps_ph(_mm_set_ss(value), _MM_FROUND_TO_NEAREST_INT)));
         }
 
     }  // namespace

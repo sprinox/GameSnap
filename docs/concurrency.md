@@ -33,6 +33,8 @@
 4. **队列无界，积压不丢。**
    `CommandQueue` / `EncodeQueue` 都是 `moodycamel::BlockingConcurrentQueue`。
    连按热键时在途帧会增加内存/显存占用，这是产品决策。
+   **审查约定：这是已接受的设计，不是漏做容量限制。不要再次把“无界队列可能积压”列为待修复问题，
+   也不要擅自加入丢帧、限长或生产者阻塞。** 本项目不针对假设性的 OOM 做恢复或哨兵入队补救。
 
 5. **不做纹理/大缓冲复用。**
    capture 纹理、编码 `raw` / `sdr` / `hdr10`、`ToneMapper` 纹理全部按 job 动态分配，
@@ -103,7 +105,8 @@ U16Buffer hdr10;      // HDR 10-bit
 ```
 
 三者都是 `UninitBuffer`（`resize()` 只分配、不置零），写满即整体覆盖，省掉 4K HDR 一张图近百 MiB 的 memset。
-函数返回即释放，不使用 `thread_local EncodeScratch`，也没有 ScratchPool。
+完成最后一次消费便释放：HDR 写完释放 CPU 原帧；不是 AVIF gain map 时也立即释放 `hdr10`；SDR 转换后释放剩余 `raw`。
+不使用 `thread_local EncodeScratch`，也没有 ScratchPool。
 SDR 的 BGRA→BGRA 路径仍通过 `pixels.swap()` 避免一次整帧复制。
 
 ### 2.4 ToneMapper
@@ -126,7 +129,8 @@ CPU 回退走的是和 GPU 同一套数学（PQ 域 spline + IPT + hull 色度�
 编码线程之间不需要任何锁；代价是 4K 约几秒。
 
 触发条件有两种：GPU 色调映射不可用/失败，或者用户显式配置 `tone_map_backend: cpu`。
-例外：**`analysis`（false color）只实现了 GPU 版本**，CPU 后端仍然出 spline 的结果。
+例外：**`analysis`（false color）只实现了 GPU 版本**，CPU 后端仍然出 spline 的结果并记录 warning。
+这是已确认的设计，不再作为 CPU/GPU 算法缺失问题报告。
 
 ### 2.6 WGC pool/session 预创建
 
@@ -215,10 +219,19 @@ CPU 回退走的是和 GPU 同一套数学（PQ 域 spline + IPT + hull 色度�
 ### 6.2 例外
 
 - **WGC pool/session**：保留下一张预创建，以压低热键延迟。
-- **libjpeg `thread_local cinfo` / 行缓冲**：`longjmp` 不执行普通局部对象析构，
+- **libjpeg `thread_local cinfo` / EXIF 小缓冲**：`longjmp` 不执行普通局部对象析构，
   改成每张分配会泄漏或破坏状态；这是非纹理的小缓冲。
 
 ---
+
+### 6.3 并行与资源量级
+
+`encode_tasks` 与 `codec_threads` 分别控制任务并发和单任务编码预算，接口差异见 [config.md](config.md)。
+3840×2160 的 BGRA8 / RGB8 / FP16 RGBA 分别为 31.64 / 23.73 / 63.28 MiB。
+GPU 转换时捕获纹理、转换输出、staging 和 CPU 输出的已知像素负载可同时达到约 284.77 MiB/任务；
+这包含系统内存和 GPU 资源，不等于独立显存实际占用，也不包含驱动和编码库内部工作区。
+队列里每张未处理的 4K HDR 纹理约 63.28 MiB，因此无界积压仍按上述既定策略增加占用。
+JPEG 直接读取 BGRA 的 BGRX 输入（忽略第四字节），输出始终三通道、没有 alpha；PNG/JPEG 使用原生 EXIF API，避免再复制整份压缩输出。
 
 ## 7. 审查清单
 

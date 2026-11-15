@@ -11,14 +11,23 @@
 #    include <cstdio>
 #    include <cstring>
 #    include <filesystem>
+#    include <fstream>
+#    include <array>
+#    include <limits>
 #    include <vector>
 
 #    include <spng.h>
+#    include <jxl/decode.h>
 
+#    include "codecs.h"
 #    include "d3d.h"
 #    include "display.h"
 #    include "encoder.h"
 #    include "messages.h"
+#    include "simd.h"
+#    include "tonemap.h"
+#    include "ui_bridge.h"
+#    include "system_events.h"
 
 namespace gamesnap {
     namespace {
@@ -82,31 +91,22 @@ namespace gamesnap {
         }
 
         std::uint16_t float_to_half(float value) {
-            if (!(value > 0.0F))
-                return 0;
-            if (value >= 1.0F)
-                return 0x3C00;  // 1.0
-            std::uint32_t bits = 0;
-            std::memcpy(&bits, &value, sizeof(bits));
-            const int exponent = static_cast<int>((bits >> 23) & 0xFFU) - 127;
-            const std::uint32_t mantissa = bits & 0x7FFFFFU;
-            if (exponent >= -14)
-                return static_cast<std::uint16_t>(((exponent + 15) << 10) | (mantissa >> 13));
-            const double m = std::ldexp(1.0 + (static_cast<double>(mantissa) / 8388608.0), exponent + 24);
-            if (m < 1.0)
-                return 0;
-            return static_cast<std::uint16_t>(std::lround(m));
+            std::uint16_t result = 0;
+            float_to_half_row(&value, &result, 1);
+            return result;
         }
 
         // PQ 编码值 0..0.58 约等于 0..203 nit；HDR 用例的白点故意设成 100 nit，
         // 让渐变的高端超过白点，这样"肩部有没有生效"才会体现在输出上
         // （白点设成 203 时曲线本来就该是恒等，测不出峰值归约失效这类问题）。
-        void fill_pq(std::uint8_t* data, std::uint32_t row_pitch, std::uint32_t width, std::uint32_t height) {
+        void fill_pq(std::uint8_t* data, std::uint32_t row_pitch, std::uint32_t width, std::uint32_t height, bool sc_rgb) {
             for (std::uint32_t y = 0; y < height; ++y) {
                 for (std::uint32_t x = 0; x < width; ++x) {
                     float pq = static_cast<float>(x) / static_cast<float>(width - 1) * kMaxPq;
                     if (y < height / 3)
                         pq = kMaxPq;  // 顶部一条纯白，确认高光裁切正常
+                    if (sc_rgb)
+                        pq = pq / kMaxPq * 12.5F;  // 真正的 scRGB：0..1000 nit
                     auto* pixel = reinterpret_cast<std::uint16_t*>(
                         data + (static_cast<std::size_t>(y) * row_pitch) + (static_cast<std::size_t>(x) * 8));
                     pixel[0] = float_to_half(pq);
@@ -230,7 +230,8 @@ namespace gamesnap {
                 }
                 auto* bytes = static_cast<std::uint8_t*>(mapped.pData);
                 if (test_case.format == DXGI_FORMAT_R16G16B16A16_FLOAT)
-                    fill_pq(bytes, mapped.RowPitch, test_case.width, test_case.height);
+                    fill_pq(bytes, mapped.RowPitch, test_case.width, test_case.height,
+                            test_case.color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
                 else if (test_case.format == DXGI_FORMAT_R8G8B8A8_UNORM ||
                          test_case.format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
                     fill_rgba(bytes, mapped.RowPitch, test_case.width, test_case.height);
@@ -299,9 +300,9 @@ namespace gamesnap {
             bool has_sdr = false;
             for (const auto& path : produced) {
                 const std::wstring name = path.filename().wstring();
-                if (name.find(L"_HDR.") != std::wstring::npos)
+                if (name.find(L"_HDR") != std::wstring::npos)
                     has_hdr = true;
-                if (name.find(L"_SDR.") != std::wstring::npos)
+                if (name.find(L"_SDR") != std::wstring::npos)
                     has_sdr = true;
                 const auto size = std::filesystem::file_size(path, ec);
                 if (ec || size == 0) {
@@ -325,10 +326,13 @@ namespace gamesnap {
             // 所以这里的条件与格式无关，默认配置也会执行。
             if (hdr_job && sdr_format == ImageFormat::Png) {
                 for (const auto& path : produced) {
-                    if (path.filename().wstring().find(L"_SDR.") == std::wstring::npos)
+                    if (path.filename().wstring().find(L"_SDR") == std::wstring::npos)
                         continue;
                     double fraction = 0.0;
-                    if (saturated_fraction(path, fraction)) {
+                    if (!saturated_fraction(path, fraction)) {
+                        SPDLOG_ERROR("自检失败: PNG 无法解码，不能跳过像素验证");
+                        return false;
+                    } else {
                         SPDLOG_INFO("SDR 渐变区饱和像素 {:.2f}%（阈值 5%）", fraction * 100.0);
                         if (fraction > 0.05) {
                             SPDLOG_ERROR("自检失败: SDR 渐变区有 {:.0f}% 像素被裁成纯白，色调映射可能退化了",
@@ -342,6 +346,266 @@ namespace gamesnap {
             SPDLOG_INFO("自检用例通过: {} 个文件", produced.size());
             return true;
         }  // NOLINT(clang-analyzer-cplusplus.NewDeleteLeaks): custom shared_ptr deleter is opaque
+
+        bool check(bool value, std::string const& label) {
+            if (!value)
+                SPDLOG_ERROR("回归失败: {}", label);
+            return value;
+        }
+
+        std::vector<std::uint8_t> read_bytes(std::filesystem::path const& path) {
+            std::ifstream input(path, std::ios::binary);
+            return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+        }
+
+        bool test_half_and_ui() {
+            // 半 ULP 的 ties-to-even、次正规数、符号、溢出；分别覆盖 SIMD 和 1..7 个尾部。
+            const std::array<float, 9> values{1.00048828125F, 1.00146484375F, -1.00146484375F,
+                0x1p-25F, 0x1.8p-24F, 65504.0F, 65520.0F, -0.0F, -2.0F};
+            const std::array<std::uint16_t, 9> expected{0x3c00, 0x3c02, 0xbc02, 0, 2, 0x7bff, 0x7c00, 0x8000, 0xc000};
+            for (std::size_t count = 1; count <= 17; ++count) {
+                for (std::size_t offset = 0; offset < values.size(); ++offset) {
+                    std::array<float, 17> input{};
+                    std::array<std::uint16_t, 17> output{};
+                    for (std::size_t i = 0; i < count; ++i)
+                        input[i] = values[(i + offset) % values.size()];
+                    float_to_half_row(input.data(), output.data(), count);
+                    for (std::size_t i = 0; i < count; ++i)
+                        if (!check(output[i] == expected[(i + offset) % values.size()], "FP16 舍入 / SIMD 尾部"))
+                            return false;
+                }
+            }
+            UiBridge ui;
+            const auto failed_shot = ui.on_trigger();
+            const auto current = ui.on_trigger();
+            ui.publish(current, L"current", nullptr);
+            ui.publish(failed_shot, L"stale", nullptr);
+            if (!check(ui.snapshot().filename == L"current", "跳过失败请求后序号仍匹配"))
+                return false;
+            const auto next = ui.on_trigger();
+            ui.publish(current, L"late", nullptr);
+            if (!check(ui.snapshot().filename.empty(), "新请求不能显示旧任务的迟到结果"))
+                return false;
+            (void)::WaitForSingleObject(ui.trigger_event(), 0);
+            ui.publish(next, L"next", nullptr);
+            if (!check(::WaitForSingleObject(ui.trigger_event(), 0) == WAIT_OBJECT_0, "发布唤醒静态 UI"))
+                return false;
+            ui.job_enqueued();
+            if (!check(ui.snapshot().remaining == 1, "UI 任务计数"))
+                return false;
+            (void)::WaitForSingleObject(ui.trigger_event(), 0);
+            ui.job_finished();
+            return check(ui.snapshot().remaining == 0 &&
+                         ::WaitForSingleObject(ui.trigger_event(), 0) == WAIT_OBJECT_0, "完成唤醒静态 UI");
+        }
+
+        bool test_validate_trailing_event() {
+            auto queue = std::make_shared<CommandQueue>();
+            SystemEventThread events(queue, MonitorChoice::Primary, std::make_shared<StopSource>());
+            events.start();
+            auto stop = ScopeExit{[&] { events.stop(); events.join(); }};
+            HWND target = nullptr;
+            const auto deadline = SteadyClock::now() + std::chrono::seconds(2);
+            while (!target && SteadyClock::now() < deadline) {
+                // 同机可能有用户正在运行的 GameSnap：只能给本自检进程的窗口发消息。
+                ::EnumWindows([](HWND hwnd, LPARAM parameter) -> BOOL {
+                    DWORD process = 0;
+                    ::GetWindowThreadProcessId(hwnd, &process);
+                    wchar_t name[64]{};
+                    if (process == ::GetCurrentProcessId() && ::GetClassNameW(hwnd, name, 64) &&
+                        std::wstring_view(name) == L"GameSnap.SystemEvents") {
+                        *reinterpret_cast<HWND*>(parameter) = hwnd;
+                        return FALSE;
+                    }
+                    return TRUE;
+                }, reinterpret_cast<LPARAM>(&target));
+                if (!target)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            if (!check(target != nullptr, "系统事件窗口初始化"))
+                return false;
+            DWORD_PTR result = 0;
+            const auto send = [&](UINT message) {
+                return ::SendMessageTimeoutW(target, message, 0, 0, SMTO_ABORTIFHUNG, 1000, &result) != 0;
+            };
+            Command first, trailing;
+            if (!check(send(WM_DEVICECHANGE) && queue->wait_dequeue_timed(first, std::chrono::seconds(1)), "首个设备验证"))
+                return false;
+            if (!check(send(WM_SETTINGCHANGE) && send(WM_DEVICECHANGE), "节流区间内发送 HDR 和设备事件"))
+                return false;
+            return check(queue->wait_dequeue_timed(trailing, std::chrono::seconds(2)) &&
+                         trailing.kind == CommandKind::Validate && trailing.reason == ReloadReason::DisplayChange,
+                         "尾部事件不丢失，DisplayChange 优先");
+        }
+
+        bool exif_title_matches(std::uint8_t const* data, std::size_t size, std::string const& title) {
+            // TIFF 结构独立读取：不能用写入函数验证自己。
+            if (size < 10 || data[0] != 'I' || data[1] != 'I')
+                return false;
+            const auto u16 = [&](std::size_t i) { return unsigned(data[i]) | (unsigned(data[i + 1]) << 8); };
+            const auto u32 = [&](std::size_t i) { return u16(i) | (u16(i + 2) << 16); };
+            const std::size_t ifd = u32(4);
+            if (ifd > size - 2)
+                return false;
+            for (std::size_t i = 0; i < u16(ifd); ++i) {
+                const auto pos = ifd + 2 + 12 * i;
+                if (pos + 12 > size)
+                    return false;
+                if (u16(pos) != 0x010e)
+                    continue;
+                const auto count = u32(pos + 4);
+                const auto offset = count <= 4 ? pos + 8 : u32(pos + 8);
+                return u16(pos + 2) == 2 && count == title.size() + 1 && offset + count <= size &&
+                       std::memcmp(data + offset, title.c_str(), count) == 0;
+            }
+            return false;
+        }
+
+        bool test_codec_metadata(Config const& config) {
+            const auto dir = config.output_dir / "regression";
+            std::filesystem::create_directories(dir);
+            Image input;
+            input.width = input.height = 64;
+            input.stride = input.width * 4;
+            input.pixels.resize(static_cast<std::size_t>(input.stride) * input.height);
+            fill_bgra(input.pixels.data(), input.stride, input.width, input.height);
+            // 第四字节故意为零：JPEG BGRX 必须忽略它，不得写 alpha 或变成黑图。
+            for (std::size_t i = 3; i < input.pixels.size(); i += 4)
+                input.pixels[i] = 0;
+            input.metadata.date_time = "2026:11:15 12:34:56";
+            CodecOptions options = config.codec;
+            options.threads = 2;
+            options.av1_encoder = Av1Encoder::Auto;
+            options.aom_cpu_used = 8;
+            options.svt_preset = 10;  // 同时设置，两者不能传给同一个实际编码器。
+            set_codec_options(options);
+            auto restore = ScopeExit{[&] { set_codec_options(config.codec); }};
+            std::string error;
+            for (std::string const title : {"A", "AB", "ABC", "ABCD"}) {
+                input.metadata.title = title;
+                const auto png = dir / (title + ".png");
+                if (!check(write_sdr(png, ImageFormat::Png, input, error), error))
+                    return false;
+                const auto bytes = read_bytes(png);
+                spng_ctx* ctx = spng_ctx_new(0);
+                auto guard = ScopeExit{[&] { spng_ctx_free(ctx); }};
+                spng_exif exif{};
+                if (!check(ctx && spng_set_png_buffer(ctx, bytes.data(), bytes.size()) == 0 &&
+                           spng_get_exif(ctx, &exif) == 0 &&
+                           exif_title_matches(reinterpret_cast<std::uint8_t*>(exif.data), exif.length, title), "PNG 原生 EXIF 短标题"))
+                    return false;
+
+                const auto jpeg = dir / (title + ".jpg");
+                if (!check(write_sdr(jpeg, ImageFormat::Jpeg, input, error), error))
+                    return false;
+                const auto jpg = read_bytes(jpeg);
+                bool found_exif = false;
+                bool rgb_only = false;
+                for (std::size_t i = 2; i + 4 < jpg.size() && jpg[i] == 0xff;) {
+                    const auto marker = jpg[i + 1];
+                    if (marker == 0xda || marker == 0xd9)
+                        break;
+                    const std::size_t length = (std::size_t(jpg[i + 2]) << 8) | jpg[i + 3];
+                    if (length < 2 || i + length + 2 > jpg.size())
+                        return check(false, "JPEG marker 长度");
+                    if (marker == 0xe1 && length > 8 && std::memcmp(jpg.data() + i + 4, "Exif\0\0", 6) == 0)
+                        found_exif = exif_title_matches(jpg.data() + i + 10, length - 8, title);
+                    if ((marker == 0xc0 || marker == 0xc2) && length >= 8)
+                        rgb_only = jpg[i + 9] == 3;
+                    i += length + 2;
+                }
+                if (!check(found_exif && rgb_only, "JPEG 原生 EXIF / 三通道无 alpha"))
+                    return false;
+            }
+            for (const auto format : {ImageFormat::Avif, ImageFormat::Heic, ImageFormat::Jxl, ImageFormat::Webp})
+                if (!check(write_sdr(dir / (L"threads" + std::wstring(image_extension(format))), format, input, error), error))
+                    return false;
+            std::vector<std::uint16_t> pq(64 * 64 * 4, 512);
+            for (std::size_t i = 3; i < pq.size(); i += 4)
+                pq[i] = 1023;
+            const auto jxl = dir / "pq.jxl";
+            if (!check(write_hdr10(jxl, ImageFormat::Jxl, pq.data(), 64, 64, input.metadata, error), error))
+                return false;
+            const auto bytes = read_bytes(jxl);
+            JxlDecoder* decoder = JxlDecoderCreate(nullptr);
+            auto guard = ScopeExit{[&] { JxlDecoderDestroy(decoder); }};
+            JxlBasicInfo info{};
+            return check(decoder && JxlDecoderSubscribeEvents(decoder, JXL_DEC_BASIC_INFO) == JXL_DEC_SUCCESS &&
+                         JxlDecoderSetInput(decoder, bytes.data(), bytes.size()) == JXL_DEC_SUCCESS &&
+                         JxlDecoderProcessInput(decoder) == JXL_DEC_BASIC_INFO &&
+                         JxlDecoderGetBasicInfo(decoder, &info) == JXL_DEC_SUCCESS &&
+                         info.intensity_target == 10000.0F && info.alpha_bits == 0, "HDR JXL 10000 nit / 无 alpha");
+        }
+
+        bool test_tonemap_parity(std::shared_ptr<D3DContext> const& d3d) {
+            // 含负 BT.2020 分量、>1 scRGB、高光及跨线程组的奇数尺寸。
+            constexpr std::array<std::array<float, 4>, 6> colors{{
+                {0, 0, 0, 1}, {-2, 0.1F, 5, 1}, {12.5F, 12.5F, 12.5F, 1},
+                {150, 150, 150, 1}, {0.1F, -0.4F, 8, 1}, {0.3F, 0.5F, 0.1F, 1}}};
+            for (const std::uint32_t width : {1U, 7U, 8U, 9U, 641U}) {
+                constexpr std::uint32_t height = 9;
+                std::vector<std::uint16_t> fp16(width * height * 4);
+                for (std::size_t i = 0; i < width * height; ++i)
+                    float_to_half_row(colors[i % colors.size()].data(), fp16.data() + i * 4, 4);
+                D3D11_TEXTURE2D_DESC desc{};
+                desc.Width = width; desc.Height = height; desc.MipLevels = desc.ArraySize = 1;
+                desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; desc.SampleDesc.Count = 1;
+                desc.Usage = D3D11_USAGE_DEFAULT; desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                D3D11_SUBRESOURCE_DATA data{fp16.data(), width * 8, 0};
+                winrt::com_ptr<ID3D11Texture2D> texture;
+                if (!check(SUCCEEDED(d3d->device()->CreateTexture2D(&desc, &data, texture.put())), "奇数尺寸 HDR 纹理"))
+                    return false;
+                ToneMapper mapper(d3d);
+                Image gpu, cpu;
+                U16Buffer hdr;
+                std::string error;
+                constexpr auto space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+                if (!check(mapper.ok() && mapper.map(texture.get(), space, 203, ToneMapAlgorithm::Spline, gpu, hdr, error), error) ||
+                    !check(tone_map_hdr_to_sdr(fp16.data(), width, height, width * 8, space, 203, cpu), "CPU 转换"))
+                    return false;
+                int max_diff = 0;
+                for (std::size_t i = 0; i < cpu.pixels.size(); ++i)
+                    max_diff = std::max(max_diff, std::abs(int(cpu.pixels[i]) - int(gpu.pixels[i])));
+                SPDLOG_INFO("CPU/GPU {}x{} 最大通道差 {}", width, height, max_diff);
+                if (!check(max_diff <= 3, "CPU/GPU 负色和峰值归约一致性（容许浮点差 3/255）"))
+                    return false;
+            }
+            return true;
+        }
+
+        bool test_collisions(Config const& config, std::shared_ptr<D3DContext> const& d3d) {
+            const auto dir = config.output_dir / ("collision-" + std::to_string(::GetTickCount64()));
+            std::filesystem::create_directories(dir);
+            { std::ofstream existing(dir / "same.png"); existing << "must stay"; }
+            auto queue = std::make_shared<EncodeQueue>();
+            EncodeWorkers workers(dir, queue, config.codec, config.tone_map_backend, L"same", {});
+            workers.start(3);
+            std::array<std::uint8_t, 16 * 16 * 4> pixels{};
+            fill_bgra(pixels.data(), 64, 16, 16);
+            for (unsigned i = 1; i <= 8; ++i) {
+                D3D11_TEXTURE2D_DESC desc{};
+                desc.Width = desc.Height = 16; desc.MipLevels = desc.ArraySize = 1;
+                desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; desc.SampleDesc.Count = 1;
+                desc.Usage = D3D11_USAGE_STAGING; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                D3D11_SUBRESOURCE_DATA data{pixels.data(), 64, 0};
+                EncodeJob job;
+                if (!check(SUCCEEDED(d3d->device()->CreateTexture2D(&desc, &data, job.texture.put())), "重名测试纹理"))
+                    return false;
+                job.d3d = d3d; job.sequence = i; job.sdr_format = ImageFormat::Png; job.local_time = Clock::now();
+                job.timings.input = job.timings.dequeued = job.timings.title_done = job.timings.prepared =
+                    job.timings.start_capture = job.timings.frame_received = job.timings.copied = SteadyClock::now();
+                if (!check(queue->enqueue(std::move(job)), "并发重名任务入队"))
+                    return false;
+            }
+            workers.stop();
+            const auto original = read_bytes(dir / "same.png");
+            if (!check(std::string(original.begin(), original.end()) == "must stay", "已有文件不能覆盖"))
+                return false;
+            for (unsigned i = 1; i <= 8; ++i)
+                if (!check(std::filesystem::file_size(dir / ("same_" + std::to_string(i) + ".png")) > 0, "并发 _1.._8 文件齐全"))
+                    return false;
+            return true;
+        }
 
     }  // namespace
 
@@ -368,6 +632,11 @@ namespace gamesnap {
         }
 
         bool ok = true;
+        ok = test_half_and_ui() && ok;
+        ok = test_validate_trailing_event() && ok;
+        ok = test_codec_metadata(config) && ok;
+        ok = test_tonemap_parity(d3d) && ok;
+        ok = test_collisions(config, d3d) && ok;
         ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_B8G8R8A8_UNORM, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, .sdr_white_nits = 80, .label = "SDR BGRA"}) &&
              ok;
         ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R8G8B8A8_UNORM, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, .sdr_white_nits = 80, .label = "SDR RGBA"}) &&

@@ -728,7 +728,8 @@ namespace gamesnap {
         shot->ui = ui_;
         shot->canceled = std::make_shared<std::atomic<bool>>(false);
         shot->timings.input = command.enqueued;
-        shot->sequence = ++sequence_;
+        shot->sequence = command.sequence != 0 ? command.sequence : ++sequence_;
+        sequence_ = std::max(sequence_, shot->sequence);
         shot->timings.dequeued = dequeued;
         ForegroundInfo foreground = foreground_info(filename_placeholders_);
         shot->title = std::move(foreground.title);

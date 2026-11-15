@@ -8,9 +8,9 @@
 #include <fstream>
 
 #include <avif/avif.h>
-#include <zlib.h>
 #include <jpeglib.h>
 #include <jxl/encode.h>
+#include <jxl/thread_parallel_runner.h>
 #include <libheif/heif.h>
 #include <spng.h>
 #include <webp/encode.h>
@@ -24,6 +24,7 @@
 #include "simd.h"
 
 #pragma comment(lib, "libwebpmux.lib")
+#pragma comment(lib, "jxl_threads.lib")
 
 namespace gamesnap {
 
@@ -135,16 +136,6 @@ namespace gamesnap {
         static_assert(std::endian::native == std::endian::little,
                       "EXIF writer relies on little-endian host layout");
 
-        void write_u16_be(std::uint8_t* out, std::uint16_t value) {
-            const std::uint16_t encoded = std::byteswap(value);
-            std::memcpy(out, &encoded, sizeof(encoded));
-        }
-
-        void write_u32_be(std::uint8_t* out, std::uint32_t value) {
-            const std::uint32_t encoded = std::byteswap(value);
-            std::memcpy(out, &encoded, sizeof(encoded));
-        }
-
 #pragma pack(push, 1)
         struct TiffHeader {
             std::uint16_t byte_order = 0x4949;  // "II"
@@ -198,8 +189,14 @@ namespace gamesnap {
             const TiffHeader header{};
             std::memcpy(base, &header, sizeof(header));
 
+            // TIFF 值含终止符不超过 4 字节时必须内联，不能填写字符串偏移。
+            std::uint32_t title_value = title_offset;
+            if (title.size() < sizeof(title_value)) {
+                title_value = 0;
+                std::memcpy(&title_value, title.c_str(), title.size() + 1);
+            }
             const std::array<ExifEntry, 3> ifd0_entries{{
-                {.tag = 0x010E, .type = 2, .count = static_cast<std::uint32_t>(title.size()) + 1, .value = title_offset},
+                {.tag = 0x010E, .type = 2, .count = static_cast<std::uint32_t>(title.size()) + 1, .value = title_value},
                 {.tag = 0x0131, .type = 2, .count = software_text_size, .value = software_offset},
                 {.tag = 0x8769, .type = 4, .count = 1, .value = exif_ifd_offset},
             }};
@@ -232,50 +229,6 @@ namespace gamesnap {
 
         std::vector<std::uint8_t> make_exif_payload(ImageMetadata const& metadata) {
             return make_exif(metadata, true);
-        }
-
-        // 入参用裸指针 + 长度：调用方手里的压缩缓冲（spng/libjpeg 分配的）不必再拷一份 vector。
-        std::vector<std::uint8_t> add_jpeg_exif(std::uint8_t const* jpeg, std::size_t jpeg_size,
-                                                ImageMetadata const& metadata) {
-            const auto exif = make_exif_payload(metadata);
-            if (jpeg_size < 2 || jpeg[0] != 0xFF || jpeg[1] != 0xD8)
-                return {jpeg, jpeg + jpeg_size};
-            std::vector<std::uint8_t> out(6 + exif.size() + jpeg_size - 2);
-            auto* p = out.data();
-            constexpr std::array<std::uint8_t, 4> app1_marker{0xFF, 0xD8, 0xFF, 0xE1};
-            std::memcpy(p, app1_marker.data(), app1_marker.size());
-            write_u16_be(p + 4, static_cast<std::uint16_t>(exif.size() + 2));
-            std::memcpy(p + 6, exif.data(), exif.size());
-            std::memcpy(p + 6 + exif.size(), jpeg + 2, jpeg_size - 2);
-            return out;
-        }
-
-        std::vector<std::uint8_t> add_png_exif(std::uint8_t const* png, std::size_t png_size,
-                                               ImageMetadata const& metadata) {
-            constexpr std::size_t kIendSize = 12;  // length=0 + "IEND" + crc
-            if (png_size < kIendSize)
-                return {png, png + png_size};
-            const auto tiff = make_exif_tiff(metadata);
-            std::vector<std::uint8_t> chunk(12 + tiff.size());
-            auto* chunk_data = chunk.data();
-            write_u32_be(chunk_data, static_cast<std::uint32_t>(tiff.size()));
-            constexpr std::array<std::uint8_t, 4> exif_type{'e', 'X', 'I', 'f'};
-            std::memcpy(chunk_data + 4, exif_type.data(), exif_type.size());
-            std::memcpy(chunk_data + 8, tiff.data(), tiff.size());
-            uLong crc = ::crc32(0L, Z_NULL, 0);
-            crc = ::crc32(crc, reinterpret_cast<const Bytef*>(chunk_data + 4),
-                          static_cast<uInt>(4 + tiff.size()));
-            write_u32_be(chunk_data + 8 + tiff.size(), static_cast<std::uint32_t>(crc));
-
-            // IEND 固定为最后 12 字节：length=0 + "IEND" + crc。直接在 out 里拼好，
-            // 全程只有这一趟拷贝（不再先构造 png_bytes 再 insert 一次）。
-            const std::size_t insert_at = png_size - kIendSize;
-            std::vector<std::uint8_t> out;
-            out.reserve(png_size + chunk.size());
-            out.insert(out.end(), png, png + insert_at);
-            out.insert(out.end(), chunk.begin(), chunk.end());
-            out.insert(out.end(), png + insert_at, png + png_size);
-            return out;
         }
 
         // 成功时 out 由 WebPMuxAssemble 分配，调用方写完必须 WebPDataClear；失败时 out 为空。
@@ -406,6 +359,13 @@ namespace gamesnap {
                 error = "spng_set_ihdr 失败";
                 return false;
             }
+            auto exif_bytes = make_exif_tiff(image.metadata);
+            spng_exif exif{exif_bytes.size(), reinterpret_cast<char*>(exif_bytes.data())};
+            if (spng_set_exif(ctx, &exif) != 0) {
+                spng_ctx_free(ctx);
+                error = "spng_set_exif 失败";
+                return false;
+            }
             const int encode_result =
                 spng_encode_image(ctx, rgb.data(), rgb.size(), SPNG_FMT_PNG, SPNG_ENCODE_FINALIZE);
             if (encode_result != 0) {
@@ -421,14 +381,13 @@ namespace gamesnap {
                 error = "spng_get_png_buffer 失败";
                 return false;
             }
-            const auto with_exif = add_png_exif(static_cast<std::uint8_t const*>(png), png_size, image.metadata);
-            const bool ok = write_bytes(path, with_exif.data(), with_exif.size(), error);
+            const bool ok = write_bytes(path, png, png_size, error);
             free(png);  // NOLINT(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
             spng_ctx_free(ctx);
             return ok;
         }
 
-        // ── JPEG（需要 RGB 扫描线） ─────────────────────────────────────────
+        // ── JPEG（直接读取 BGRX，输出三通道） ─────────────────────────────────────────
         struct JpegErrorMgr {
             jpeg_error_mgr base{};
             jmp_buf jump{};
@@ -446,7 +405,7 @@ namespace gamesnap {
             unsigned char* mem = nullptr;
             unsigned long mem_size = 0;
             bool created = false;  // 跨 setjmp/longjmp，必须放在 thread_local 里
-            std::vector<std::uint8_t> row;
+            std::vector<std::uint8_t> exif;
         };
 
         JpegScratch& jpeg_scratch() {
@@ -467,7 +426,7 @@ namespace gamesnap {
             scratch.created = false;
             scratch.cinfo.err = jpeg_std_error(&scratch.error.base);
             scratch.error.base.error_exit = jpeg_error_exit;
-            scratch.row.resize(static_cast<std::size_t>(image.width) * 3);
+            scratch.exif = make_exif_payload(image.metadata);
 
             if (setjmp(scratch.error.jump) != 0) {  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
                 if (scratch.created) {
@@ -486,8 +445,9 @@ namespace gamesnap {
 
             scratch.cinfo.image_width = image.width;
             scratch.cinfo.image_height = image.height;
-            scratch.cinfo.input_components = 3;
-            scratch.cinfo.in_color_space = JCS_RGB;
+            // BGRA 只是输入内存布局；BGRX 忽略第四字节，JPEG 输出仍为三通道 YCbCr，无 alpha。
+            scratch.cinfo.input_components = 4;
+            scratch.cinfo.in_color_space = JCS_EXT_BGRX;
             jpeg_set_defaults(&scratch.cinfo);
             jpeg_set_quality(&scratch.cinfo, codec_options.jpeg_quality, TRUE);
             // 色度采样由配置决定：444（默认）/ 422 / 420。
@@ -502,19 +462,17 @@ namespace gamesnap {
                 scratch.cinfo.comp_info[2].v_samp_factor = c_v;
             }
             jpeg_start_compress(&scratch.cinfo, TRUE);
+            jpeg_write_marker(&scratch.cinfo, JPEG_APP0 + 1, scratch.exif.data(),
+                              static_cast<unsigned int>(scratch.exif.size()));
 
             while (scratch.cinfo.next_scanline < scratch.cinfo.image_height) {
                 auto const* src =
                     image.pixels.data() + static_cast<std::size_t>(scratch.cinfo.next_scanline) * image.stride;
-                // 复用 AVX2 的 BGRA→RGB（和 PNG/JXL 同一条路径），别再用逐像素循环。
-                bgra_to_rgb_row(src, scratch.row.data(), image.width);
-                JSAMPROW row_pointer = scratch.row.data();
+                JSAMPROW row_pointer = const_cast<JSAMPROW>(src);
                 jpeg_write_scanlines(&scratch.cinfo, &row_pointer, 1);
             }
             jpeg_finish_compress(&scratch.cinfo);
-            const auto with_exif = add_jpeg_exif(static_cast<std::uint8_t const*>(scratch.mem),
-                                                 static_cast<std::size_t>(scratch.mem_size), image.metadata);
-            const bool ok = write_bytes(path, with_exif.data(), with_exif.size(), error);
+            const bool ok = write_bytes(path, scratch.mem, static_cast<std::size_t>(scratch.mem_size), error);
             jpeg_destroy_compress(&scratch.cinfo);
             scratch.created = false;
             free(scratch.mem);  // NOLINT(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
@@ -533,6 +491,7 @@ namespace gamesnap {
             config.quality = codec_options.webp_lossless ? 100.0F
                                                          : static_cast<float>(codec_options.webp_quality);
             config.method = codec_options.webp_method;
+            config.thread_level = codec_options.threads > 1 ? 1 : 0;
             config.exact = 1;
 
             WebPPicture picture;
@@ -599,28 +558,28 @@ namespace gamesnap {
             const int avif_speed = std::clamp(codec_options.avif_speed, 0, 10);
             const int avif_quality = codec_options.avif_lossless ? 100 : codec_options.avif_quality;
             encoder->speed = avif_speed;
-            encoder->maxThreads = 1;  // 并行度由 encode_threads 提供，避免 N×8 超订
+            encoder->maxThreads = codec_options.threads;
             encoder->quality = avif_quality;
             encoder->qualityAlpha = avif_quality;
             encoder->qualityGainMap = avif_quality;
 
             // AV1 编码库：配置指定了就用它，但库里没编进去时回落到 AUTO，而不是整张图失败。
             encoder->codecChoice = avif_effective_choice();
-            if (encoder->codecChoice == AVIF_CODEC_CHOICE_AUTO &&
-                codec_options.av1_encoder != Av1Encoder::Auto) {
-                SPDLOG_WARN("libavif 未内置 AV1 编码器 {}，回退 auto", to_string(codec_options.av1_encoder));
-            }
-            // 各库专属参数：只设给实际选中的编码器（AUTO 时两个都试，失败静默），
-            // 免得把 svt 的 preset 塞给 aom 还打一条没意义的 warning。
+            // AUTO 已解析到实际编码器；专属选项在 avifEncoderWrite 时才验证，不能交叉试探。
             const auto choice = encoder->codecChoice;
-            if (codec_options.aom_cpu_used >= 0 && choice != AVIF_CODEC_CHOICE_SVT) {
+            if (choice == AVIF_CODEC_CHOICE_SVT) {
+                // SVT 3+ 的 maxThreads 实际对应 1..6 的并行等级，不是任意线程数。
+                encoder->maxThreads = std::min(6, 1 + static_cast<int>(std::bit_width(
+                    static_cast<unsigned>(codec_options.threads - 1))));
+            }
+            if (codec_options.aom_cpu_used >= 0 && choice == AVIF_CODEC_CHOICE_AOM) {
                 const std::string value = std::to_string(codec_options.aom_cpu_used);
                 if (avifEncoderSetCodecSpecificOption(encoder, "cpu-used", value.c_str()) != AVIF_RESULT_OK &&
                     choice == AVIF_CODEC_CHOICE_AOM) {
                     SPDLOG_WARN("aom 不接受 cpu-used={}", value);
                 }
             }
-            if (codec_options.svt_preset >= 0 && choice != AVIF_CODEC_CHOICE_AOM) {
+            if (codec_options.svt_preset >= 0 && choice == AVIF_CODEC_CHOICE_SVT) {
                 const std::string value = std::to_string(codec_options.svt_preset);
                 if (avifEncoderSetCodecSpecificOption(encoder, "preset", value.c_str()) != AVIF_RESULT_OK &&
                     choice == AVIF_CODEC_CHOICE_SVT) {
@@ -648,7 +607,7 @@ namespace gamesnap {
             return ok;
         }
 
-        // 配置里选的 AV1 编码器 → 实际会用的编码器：库里没编进去就回落 AUTO。
+        // 配置里选的 AV1 编码器 → 实际会用的编码器；AUTO 也必须解析为具体实现。
         // 像素格式和 encoder->codecChoice 都以它为准，避免"图像按 4:2:0 建、实际跑 aom 444"这类错配。
         avifCodecChoice avif_effective_choice() {
             switch (codec_options.av1_encoder) {
@@ -661,9 +620,10 @@ namespace gamesnap {
                     return AVIF_CODEC_CHOICE_SVT;
                 break;
             case Av1Encoder::Auto:
-                return AVIF_CODEC_CHOICE_AUTO;
+                break;
             }
-            return AVIF_CODEC_CHOICE_AUTO;  // 配置的编码器不可用
+            const char* name = avifCodecName(AVIF_CODEC_CHOICE_AUTO, AVIF_CODEC_FLAG_CAN_ENCODE);
+            return name ? avifCodecChoiceFromName(name) : AVIF_CODEC_CHOICE_AUTO;
         }
 
         // 色度采样：SVT 插件只接受 4:2:0，其余按配置（auto = 4:4:4，无损场景首选）。
@@ -946,6 +906,11 @@ namespace gamesnap {
             check(heif_encoder_set_parameter_string(encoder, "chroma", heic_chroma_name()), "chroma");
             check(heif_encoder_set_parameter_string(encoder, "preset", std::string(codec_options.heic_preset).c_str()),
                   "preset");
+            const std::string pools = codec_options.threads == 1 ? "none"
+                : std::to_string(codec_options.threads - 1);
+            check(heif_encoder_set_parameter_string(encoder, "x265:pools", pools.c_str()), "x265:pools");
+            check(heif_encoder_set_parameter_string(encoder, "x265:frame-threads", "1"), "x265:frame-threads");
+            check(heif_encoder_set_parameter_string(encoder, "x265:lookahead-threads", "0"), "x265:lookahead-threads");
             if (codec_options.heic_lossless)
                 check(heif_encoder_set_lossless(encoder, 1), "lossless");
         }
@@ -1160,12 +1125,20 @@ namespace gamesnap {
         bool write_jxl_impl(std::filesystem::path const& path, void const* pixels,
                             std::uint32_t width, std::uint32_t height, bool hdr,
                             ImageMetadata const& metadata, std::string& error) {
+            void* runner = codec_options.threads > 1
+                ? JxlThreadParallelRunnerCreate(nullptr, static_cast<std::size_t>(codec_options.threads)) : nullptr;
+            auto runner_guard = ScopeExit{[&] { JxlThreadParallelRunnerDestroy(runner); }};
             JxlEncoder* enc = JxlEncoderCreate(nullptr);
             if (enc == nullptr) {
                 error = "JxlEncoderCreate 失败";
                 return false;
             }
             auto guard = ScopeExit{[&] { JxlEncoderDestroy(enc); }};
+            if (codec_options.threads > 1 && (!runner ||
+                JxlEncoderSetParallelRunner(enc, JxlThreadParallelRunner, runner) != JXL_ENC_SUCCESS)) {
+                error = "JXL 设置并行 runner 失败";
+                return false;
+            }
 
             JxlBasicInfo info{};
             JxlEncoderInitBasicInfo(&info);
@@ -1180,7 +1153,7 @@ namespace gamesnap {
             // 保留我们写入的色彩编码（PQ/BT.2020 或 sRGB），不让编码器换成 ICC。
             info.uses_original_profile = JXL_TRUE;
             if (hdr)
-                info.intensity_target = 1000.0F;
+                info.intensity_target = 10000.0F;  // PQ 最大编码值的绝对亮度，不是显示器峰值/MaxCLL
             if (JxlEncoderSetBasicInfo(enc, &info) != JXL_ENC_SUCCESS) {
                 error = "JxlEncoderSetBasicInfo 失败";
                 return false;
@@ -1291,6 +1264,10 @@ namespace gamesnap {
         SPDLOG_INFO("AV1 编码器: libavif 支持 aom={} svt={}（默认 auto={}），配置选择 {}",
                     aom.empty() ? "否" : "是", svt.empty() ? "否" : "是",
                     name_of(AVIF_CODEC_CHOICE_AUTO), to_string(options.av1_encoder));
+        if ((options.av1_encoder == Av1Encoder::Aom && aom.empty()) ||
+            (options.av1_encoder == Av1Encoder::Svt && svt.empty()))
+            SPDLOG_WARN("libavif 未内置 AV1 编码器 {}，回退 auto={}",
+                        to_string(options.av1_encoder), name_of(AVIF_CODEC_CHOICE_AUTO));
         // 无损与色度抽样冲突时以无损为准，这里提前说清楚，免得看文件时才发现采样被强制改回 444。
         if (options.chroma != ChromaSubsampling::Auto && options.chroma != ChromaSubsampling::Yuv444) {
             if (options.avif_lossless)

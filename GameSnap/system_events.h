@@ -67,6 +67,8 @@ namespace gamesnap {
         HMONITOR foreground_monitor_ = nullptr;
         // 只在 system-events 线程读写；用来合并短时间内的重复 Validate。
         SteadyClock::time_point last_validate_{};
+        bool validate_pending_ = false;
+        ReloadReason pending_validate_reason_ = ReloadReason::DeviceChange;
         NOTIFYICONDATAW tray_{};
         bool tray_added_ = false;
         UINT taskbar_created_ = 0;

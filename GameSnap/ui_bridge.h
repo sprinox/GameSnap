@@ -37,7 +37,7 @@ namespace gamesnap {
             std::shared_ptr<const Thumbnail> thumbnail;
         };
 
-        void on_trigger() noexcept;
+        [[nodiscard]] std::uint64_t on_trigger() noexcept;
         void job_enqueued() noexcept;
         void job_finished() noexcept;
         // sequence 是截图序号：多编码线程下完成顺序不固定，只接受不比已发布结果更旧的作业，
@@ -48,9 +48,11 @@ namespace gamesnap {
 
         // 非 const：会在里面惰性丢弃上一张的文件名/缩略图（on_trigger() 不拿锁）。
         [[nodiscard]] Snapshot snapshot();
+        // 触发、发布、剩余数变化都会唤醒同一个 overlay 消费者。
         [[nodiscard]] HANDLE trigger_event() const noexcept { return trigger_event_; }
 
     private:
+        void notify() noexcept;
         mutable std::mutex mutex_;
         std::wstring filename_;
         std::shared_ptr<const Thumbnail> thumbnail_;

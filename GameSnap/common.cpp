@@ -199,7 +199,8 @@ namespace gamesnap {
 filename_pattern: "{title}_{time}_{seq}"
 
 # ── 编码 ────────────────────────────────────────────────────────────────────
-encode_threads: 2
+encode_tasks: 2
+codec_threads: 1
 format_hdr: avif
 format_sdr: jxl
 
@@ -434,8 +435,8 @@ verbose: false
         }
 
         bool is_known_config_key(std::string_view key) {
-            constexpr std::array<std::string_view, 29> keys{
-                "output_dir", "filename_pattern", "encode_threads", "hotkey", "swallow", "monitor",
+            constexpr auto keys = std::to_array<std::string_view>({
+                "output_dir", "filename_pattern", "encode_tasks", "codec_threads", "encode_threads", "hotkey", "swallow", "monitor",
                 "format_hdr", "format_sdr", "tone_map", "tone_map_backend", "verbose",
                 "png_compression", "jpeg_quality",
                 "webp_quality", "webp_lossless", "webp_method",
@@ -443,7 +444,7 @@ verbose: false
                 "heic_quality", "heic_lossless", "heic_preset",
                 "jxl_distance", "jxl_lossless", "jxl_effort",
                 "av1_encoder", "aom_cpu_used", "svt_preset",
-                "chroma_subsampling"};
+                "chroma_subsampling"});
             return std::ranges::find(keys, key) != keys.end();
         }
 
@@ -476,8 +477,12 @@ verbose: false
                         else
                             parsed.filename_pattern = text;
                     }
-                    if (const auto value = read_key<int>(root, "encode_threads"); value)
-                        parsed.encode_threads = *value;
+                    if (const auto value = read_key<int>(root, "encode_threads"); value) {
+                        parsed.encode_tasks = *value;
+                        SPDLOG_WARN("encode_threads 已更名为 encode_tasks；每任务线程数请设置 codec_threads");
+                    }
+                    if (const auto value = read_key<int>(root, "encode_tasks"); value)
+                        parsed.encode_tasks = *value;
                     if (const auto text = read_key<std::string>(root, "hotkey"); text) {
                         if (auto hotkey = parse_hotkey(utf8_to_wstring(*text)); hotkey) {
                             parsed.hotkey_vk = hotkey->vk;
@@ -526,6 +531,7 @@ verbose: false
                         }
                     };
                     read_range("png_compression", 0, 9, parsed.codec.png_compression);
+                    read_range("codec_threads", 1, 64, parsed.codec.threads);
                     read_range("jpeg_quality", 1, 100, parsed.codec.jpeg_quality);
                     read_range("webp_quality", 0, 100, parsed.codec.webp_quality);
                     read_range("webp_method", 0, 6, parsed.codec.webp_method);
@@ -1013,7 +1019,9 @@ verbose: false
             ("out", "输出目录", cxxopts::value<std::string>())
             ("filename-pattern", "文件名模板，占位符 {title} {exe} {process} {time} {seq}",
              cxxopts::value<std::string>())
-            ("threads", "编码线程数 1..8", cxxopts::value<int>())
+            ("threads", "encode-tasks 的兼容别名，1..8", cxxopts::value<int>())
+            ("encode-tasks", "并行编码任务数 1..8", cxxopts::value<int>())
+            ("codec-threads", "每任务编码并行预算 1..64", cxxopts::value<int>())
             ("monitor", "primary / foreground", cxxopts::value<std::string>())
             ("swallow", "吞掉热键（游戏收不到）")
             ("format-hdr", "HDR 容器 avif / heic / jxl", cxxopts::value<std::string>())
@@ -1100,7 +1108,16 @@ verbose: false
             config.filename_pattern = pattern;
         }
         if (result.count("threads") != 0)
-            config.encode_threads = result["threads"].as<int>();
+            config.encode_tasks = result["threads"].as<int>();
+        if (result.count("encode-tasks") != 0)
+            config.encode_tasks = result["encode-tasks"].as<int>();
+        if (result.count("codec-threads") != 0) {
+            config.codec.threads = result["codec-threads"].as<int>();
+            if (config.codec.threads < 1 || config.codec.threads > 64) {
+                SPDLOG_ERROR("--codec-threads 必须在 1..64 之间");
+                return std::nullopt;
+            }
+        }
         if (result.count("monitor") != 0) {
             const auto text = utf8_to_wstring(result["monitor"].as<std::string>());
             if (text == L"primary") {
@@ -1163,7 +1180,7 @@ verbose: false
         if (result.count("bench-verify") != 0)
             config.bench_verify = true;
 
-        config.encode_threads = std::clamp(config.encode_threads, 1, 8);
+        config.encode_tasks = std::clamp(config.encode_tasks, 1, 8);
         return config;
     }
 
@@ -1180,7 +1197,7 @@ verbose: false
                     hotkey_name({config.hotkey_vk, config.hotkey_modifiers}),
                     config.hotkey_swallow ? "" : "不");
         SPDLOG_INFO("目标显示器: {}", to_string(config.monitor));
-        SPDLOG_INFO("编码线程: {}", config.encode_threads);
+        SPDLOG_INFO("并行编码任务: {}；每任务编码并行预算: {}", config.encode_tasks, config.codec.threads);
         SPDLOG_INFO("编码参数: PNG compression={} JPEG quality={} WebP quality={} lossless={} method={}",
                     config.codec.png_compression, config.codec.jpeg_quality,
                     config.codec.webp_quality, config.codec.webp_lossless, config.codec.webp_method);

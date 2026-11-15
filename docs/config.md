@@ -17,7 +17,8 @@ YAML 先加载，命令行参数随后覆盖。**首次启动**如果三处都�
 | --- | --- | --- | --- |
 | `output_dir` | 字符串 | `%USERPROFILE%\Pictures\GameSnap` | 截图目录，不存在时自动创建 |
 | `filename_pattern` | 字符串 | `{title}_{time}_{seq}` | 文件名模板，见下表 |
-| `encode_threads` | 整数 1–8 | `2` | 编码线程数，决定并行写盘能力 |
+| `encode_tasks` | 整数 1–8 | `2` | 同时处理的编码任务数 |
+| `codec_threads` | 整数 1–64 | `1` | 每个任务的编码库并行预算，见下文 |
 | `hotkey` | 字符串 | `F12` | `F1..F24`、字母/数字、`printscreen`、`scrolllock`、`insert`、`home`、`end`、`space`、`0x7B`；可加 `ctrl+` / `shift+` / `alt+` / `win+` |
 | `swallow` | 布尔 | `false` | 是否吞掉热键，`true` 时游戏收不到 |
 | `monitor` | 字符串 | `primary` | `primary`：主显示器；`foreground`：前台窗口所在显示器 |
@@ -51,6 +52,20 @@ YAML 先加载，命令行参数随后覆盖。**首次启动**如果三处都�
 JPEG 只有有损 quality，没有无损模式；WebP 支持 quality/lossless/method；
 AVIF 支持 quality/lossless/speed；HEIC（x265）支持 quality/lossless/preset。
 
+## 两级编码并行
+
+`encode_tasks` 控制同时处理几张截图；`codec_threads` 控制一张截图的编码并行预算。默认 `2 × 1`。
+旧 YAML `encode_threads` 仍作为 `encode_tasks` 别名读取并提示迁移；同时出现时 `encode_tasks` 优先。
+
+- AVIF/AOM：传给 `maxThreads`；专属参数只传给实际选中的编码器，AUTO 同样先解析。
+- AVIF/SVT 4.x：libavif 的 `maxThreads` 实际是并行等级，预算按 `min(6, 1 + ceil(log2(codec_threads)))` 映射；SVT 还会创建流水线辅助线程，所以这不是操作系统线程数硬上限。
+- JXL：预算大于 1 时创建每任务独立 runner，结束即销毁；1 保持串行。
+- HEIC/x265：固定一个帧线程，预算 1 禁用线程池，大于 1 时池设为预算减 1，关闭 lookahead 池。
+- WebP：接口仅支持开关并行，预算大于 1 时打开。
+- PNG / JPEG / BMP：当前接口保持串行。CPU 色调映射也保持单任务串行。
+
+任务数越大，同时在途的全帧缓冲越多；不要把两个参数都设到最大当作通用提速办法。
+
 ## 文件名模板
 
 `filename_pattern` 支持这些占位符（未知的 `{…}` 原样保留）：
@@ -65,7 +80,7 @@ AVIF 支持 quality/lossless/speed；HEIC（x265）支持 quality/lossless/prese
 
 要点：
 
-- 模板里**最好带 `{time}` 或 `{seq}`**，否则同一秒内的多张截图会重名覆盖；
+- 模板可不含 `{time}` / `{seq}`：使用 `CREATE_NEW` 原子占名，重名自动追加 `_1`、`_2`、`_3`…（如 `shot_HDR_1.avif`），并发写入也不覆盖已有文件；编码失败清理本次占用的文件；
 - **模板里没出现的占位符不会去取**：不写 `{title}` 就不读窗口标题，不写 `{exe}`/`{process}` 就不
   `OpenProcess`，不写 `{process}` 就不读 exe 的版本资源，不写 `{time}` 就不查时区——都省在截图的关键路径上；
 - 替换后还会做一次文件名清洗：非法字符（`< > : " / \ | ? *`）换成 `_`，去掉首尾空格和点（截断后也会再清一次），
@@ -86,7 +101,9 @@ AVIF 支持 quality/lossless/speed；HEIC（x265）支持 quality/lossless/prese
 | `--key <名称>` | 截图热键，取值同 `hotkey` |
 | `--out <目录>` | 输出目录 |
 | `--filename-pattern <模板>` | 文件名模板，占位符见上 |
-| `--threads <1-8>` | 编码线程数 |
+| `--encode-tasks <1-8>` | 并行编码任务数 |
+| `--codec-threads <1-64>` | 每任务编码库并行预算 |
+| `--threads <1-8>` | `--encode-tasks` 的旧别名，新参数优先 |
 | `--monitor <primary\|foreground>` | 截主显示器 / 前台窗口所在显示器 |
 | `--swallow` | 吞掉热键 |
 | `--format-hdr <avif\|heic>` | HDR 输出容器 |

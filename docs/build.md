@@ -51,6 +51,14 @@ Release 默认启用 clang-tidy。机器上没有 `clang-tidy.exe` 时会在 `Mi
 （`--format-sdr` / `--format-hdr`）。例外：HDR 用例的 SDR 伴生文件固定写 PNG，这样自检末尾的
 像素级校验（需要无损解码）在任何配置下都会执行。采集失败仍需看真实运行的日志。
 
+自检还覆盖：FP16 就近偶数舍入及 SIMD 尾部、失败/乱序请求的 UI 序号、显示验证的尾部合并、
+三任务并发重名写入、PNG/JPEG 短 EXIF 标题、JPEG 三通道输出、JXL PQ 10000 nit 元数据、
+AUTO 的 AV1 专属参数隔离，以及负色/超白/奇数尺寸的 CPU/GPU 色调映射对比。
+测试输出写入指定目录（包括 `regression` 和 `collision-*` 子目录）；不会修改已有截图。
+
+2026-11-15 在 RTX 4070 上验证 Debug/Release 构建和 GPU/AOM、CPU/JXL、GPU/SVT 三组自检；
+五组色调映射对比的最大 8-bit 通道差为 0。属于合成纹理正确性验证，不代表真实游戏采集或性能基准。
+
 ## clang-format
 
 ```powershell

@@ -39,6 +39,7 @@ namespace gamesnap {
         CommandKind kind = CommandKind::Validate;
         ReloadReason reason = ReloadReason::Startup;
         SteadyClock::time_point enqueued = SteadyClock::now();
+        std::uint64_t sequence = 0;  // Trigger 的请求 ID，在输入端生成并贯穿采集/编码/UI
     };
 
     // 截图线程 → 编码线程。GPU 拷贝（CopyResource）在回调里做；
@@ -73,6 +74,8 @@ namespace gamesnap {
     };
 
     using CommandQueue = moodycamel::BlockingConcurrentQueue<Command>;
+    // 有意无界：保留每次连拍，不做丢帧/背压。资源随积压增长是已接受的产品取舍，
+    // 不是遗漏限流；变更前需明确产品要求。详见 docs/concurrency.md 的设计决策。
     using EncodeQueue = moodycamel::BlockingConcurrentQueue<EncodeJob>;
 
     // 严格语义：job 里的纹理是独占的，不允许拷贝（队列按值搬运，只需要可移动）。

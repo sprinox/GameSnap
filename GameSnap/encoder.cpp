@@ -158,15 +158,45 @@ namespace gamesnap {
             return avoid_reserved_device_name(std::move(name));
         }
 
-        std::filesystem::path make_output_path(std::filesystem::path const& dir, std::wstring const& base_name,
+        // 原子预留名称：并发任务/进程也不能选中同一路径。失败编码不保留空文件。
+        class ReservedOutput {
+        public:
+            explicit ReservedOutput(std::filesystem::path path) : path_(std::move(path)) {}
+            ~ReservedOutput() {
+                if (!committed_) {
+                    std::error_code ec;
+                    std::filesystem::remove(path_, ec);
+                }
+            }
+            ReservedOutput(ReservedOutput const&) = delete;
+            ReservedOutput& operator=(ReservedOutput const&) = delete;
+            std::filesystem::path const& path() const { return path_; }
+            void commit() noexcept { committed_ = true; }
+        private:
+            std::filesystem::path path_;
+            bool committed_ = false;
+        };
+
+        ReservedOutput make_output_path(std::filesystem::path const& dir, std::wstring const& base_name,
                                                std::wstring_view extension, std::wstring_view suffix) {
             std::wstring name = base_name;
             if (!suffix.empty()) {
                 name += L"_";
                 name += suffix;
             }
-            name += extension;
-            return dir / name;
+            for (std::uint64_t duplicate = 0;; ++duplicate) {
+                const std::wstring tail = duplicate ? L"_" + std::to_wstring(duplicate) : L"";
+                auto path = dir / (name + tail + std::wstring(extension));
+                const HANDLE file = ::CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                                                  nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (file != INVALID_HANDLE_VALUE) {
+                    ::CloseHandle(file);
+                    return ReservedOutput(std::move(path));
+                }
+                const DWORD error = ::GetLastError();
+                if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS)
+                    winrt::throw_hresult(HRESULT_FROM_WIN32(error));
+            }
         }
 
         // ── PQ ───────────────────────────────────────────────────────────────
@@ -470,7 +500,7 @@ namespace gamesnap {
                 }
             };
 
-            float peak_pq = 0.0F;
+            float peak_nits = 0.0F;
             for (std::uint32_t y = 0; y < height; ++y) {
                 load_row(y);
                 for (std::uint32_t x = 0; x < width; ++x) {
@@ -480,11 +510,12 @@ namespace gamesnap {
                     float nits2020[3];
                     pixel_nits_2020(rgb, nits2020);
                     const float m = std::max({nits2020[0], nits2020[1], nits2020[2], 0.0F});
-                    peak_pq = std::max(peak_pq, nits_to_pq(m));
+                    peak_nits = std::max(peak_nits, m);
                 }
             }
             // 和 shader 一样把峰值量化到 10-bit 码值，再和 SDR 白点取大。
-            const float peak_code = std::round(std::clamp(peak_pq, 0.0F, 1.0F) * 1023.0F) / 1023.0F;
+            // PQ 单调：先归约线性亮度，整帧只做一次 PQ OETF，保留原来的 10-bit 量化。
+            const float peak_code = std::round(std::clamp(nits_to_pq(peak_nits), 0.0F, 1.0F) * 1023.0F) / 1023.0F;
             const float in_max = std::max(nits_to_pq(sdr_white), peak_code);
             const float white_scale = 100.0F / sdr_white;
             const SplineCurve curve = make_spline(in_max, sdr_white);
@@ -500,6 +531,8 @@ namespace gamesnap {
                     float nits2020[3];
                     pixel_nits_2020(rgb, nits2020);
                     // shader 里是 nits2020 → BT.709 → *0.01 再进 IPT，这里照做。
+                    for (float& channel : nits2020)
+                        channel = std::max(channel, 0.0F);
                     float nits709[3];
                     mat3_mul(kBt2020To709, nits2020, nits709);
                     const float relative[3]{nits709[0] * 0.01F, nits709[1] * 0.01F, nits709[2] * 0.01F};
@@ -741,7 +774,7 @@ namespace gamesnap {
             }
         }
         // 像素已经在 CPU 手里（或 GPU 路径已经采样完），这里就把全尺寸捕获纹理放掉：
-        // 队列积压时每张 4K FP16 纹理占 33 MiB，早放一刻就能少顶住一次显存峰值。
+        // 队列积压时每张 4K FP16 纹理占 63.28 MiB，早放一刻就能少顶住一次显存峰值。
         job.texture = nullptr;
         const auto mapped_at = SteadyClock::now();
 
@@ -756,6 +789,8 @@ namespace gamesnap {
 
         if (job.hdr) {
             ImageFormat hdr_format = format_supports_hdr(job.hdr_format) ? job.hdr_format : ImageFormat::Avif;
+            if (!gpu_ok && job.tone_map == ToneMapAlgorithm::Analysis)
+                SPDLOG_WARN("[#{:04}] analysis 仅支持 GPU；按设计 CPU 路径使用 spline", job.sequence);
 
             // 先把 SDR 像素转出来并立刻发布缩略图：面板马上显示这一张，
             // 不用等 HDR 那 1 秒多的编码（文件名等写盘成功后再补）。
@@ -766,8 +801,9 @@ namespace gamesnap {
             if (ui_)
                 ui_->publish(job.sequence, base_name, &sdr);
 
-            const auto hdr_path = make_output_path(output_dir_, base_name,
+            auto hdr_output = make_output_path(output_dir_, base_name,
                                                    image_extension(hdr_format), L"HDR");
+            const auto& hdr_path = hdr_output.path();
             bool hdr_ok = false;
             if (gpu_ok) {
                 hdr_ok = write_hdr10(hdr_path, hdr_format, hdr10.data(), texture_desc.Width,
@@ -783,16 +819,21 @@ namespace gamesnap {
                                      .metadata = sdr.metadata};
                 hdr_ok = write_hdr(hdr_path, hdr_format, frame, error, &hdr10);
             }
+            raw.pixels.release();
+            if (job.sdr_format != ImageFormat::Avif)
+                hdr10.release();
             if (!hdr_ok) {
                 SPDLOG_ERROR("[#{:04}] HDR 编码失败 ({}): {}", job.sequence, to_string(hdr_format), error);
             } else {
+                hdr_output.commit();
                 written.push_back(hdr_path);
             }
 
             if (job.sdr_format == ImageFormat::Heic)
                 SPDLOG_WARN("[#{:04}] libheif 不支持 gain map，HEIC SDR 不包含 HDR 重建信息", job.sequence);
-            const auto sdr_path = make_output_path(output_dir_, base_name,
+            auto sdr_output = make_output_path(output_dir_, base_name,
                                                    image_extension(job.sdr_format), L"SDR");
+            const auto& sdr_path = sdr_output.path();
             const bool sdr_ok =
                 (!hdr10.empty() && job.sdr_format == ImageFormat::Avif)
                     ? encode_avif_gainmap(sdr_path, sdr, hdr10.data(), sdr.width, sdr.height, error)
@@ -800,6 +841,7 @@ namespace gamesnap {
             if (!sdr_ok) {
                 SPDLOG_ERROR("[#{:04}] SDR 编码失败 ({}): {}", job.sequence, to_string(job.sdr_format), error);
             } else {
+                sdr_output.commit();
                 written.push_back(sdr_path);
             }
         } else {
@@ -807,16 +849,19 @@ namespace gamesnap {
                 SPDLOG_ERROR("[#{:04}] 不支持的像素格式 {}", job.sequence, static_cast<int>(raw.format));
                 return;
             }
+            raw.pixels.release();
             // 同上：写盘之前就先把缩略图推给面板。
             if (ui_)
                 ui_->publish(job.sequence, base_name, &sdr);
 
-            const auto path = make_output_path(output_dir_, base_name,
+            auto output = make_output_path(output_dir_, base_name,
                                                image_extension(job.sdr_format), {});
+            const auto& path = output.path();
             if (!write_sdr(path, job.sdr_format, sdr, error)) {
                 SPDLOG_ERROR("[#{:04}] 编码失败 ({}): {}", job.sequence, to_string(job.sdr_format), error);
                 return;
             }
+            output.commit();
             written.push_back(path);
             width = static_cast<int>(sdr.width);
             height = static_cast<int>(sdr.height);

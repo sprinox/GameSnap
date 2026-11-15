@@ -16,13 +16,16 @@
 #             连进程都打不开（权限不足）时为空）
 #   {time}    时间戳 YYYYMMDD_HHMMSS_mmm
 #   {seq}     本次运行的截图序号（4 位）
-# 建议保留 {time} 或 {seq}，否则同一秒内多张截图会重名覆盖。
+# 重名时在扩展名前追加 _1、_2、_3…；不会覆盖已有截图（并发任务也适用）。
 # 例："{title}_{time}_{seq}"、"{process} {time}"、"{exe}-{seq}"
 filename_pattern: "{title}_{time}_{seq}"
 
 # ── 编码 ────────────────────────────────────────────────────────────────────
-# 编码线程数（1..8）。截图在 capture 线程串行，转换/写盘按线程并行。
-encode_threads: 2
+# 同时处理的编码任务数（1..8）；每张图的转换、编码、写盘算一个任务。
+encode_tasks: 2
+# 每个任务交给编码库的并行预算（1..64）；支持程度因库而异，见 docs/config.md。
+codec_threads: 1
+# 兼容旧键 encode_threads（仅表示 encode_tasks）；两个键同时出现时新键优先。
 
 # HDR 由目标显示器动态决定；HDR 显示器保存 HDR 容器 + SDR 两份。
 # format_hdr 仅支持 avif / heic / jxl；format_sdr 支持 bmp / png / jpeg / webp / avif / heic / jxl。

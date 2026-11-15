@@ -4,16 +4,15 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
-#include "image.h"
-
 namespace gamesnap {
 
     // capture/input → overlay 的轻量通知桥。
-    // 不能把 Image / D3D 资源直接交给 UI 线程；这里只复制文件名和小缩略图。
+    // 不把整帧 Image / 捕获设备的 D3D 资源交给 UI；小缩略图以不可变 shared_ptr 传递。
     class UiBridge {
     public:
         UiBridge();
@@ -24,9 +23,12 @@ namespace gamesnap {
         UiBridge& operator=(UiBridge&&) = delete;
 
         struct Thumbnail {
+            // SDR: RGBA8/sRGB；HDR: RGBA16F/线性 scRGB（1.0 = 80 nit），不经过 tone map。
             std::vector<std::uint8_t> pixels;
             std::uint32_t width = 0;
             std::uint32_t height = 0;
+            bool hdr = false;
+            std::uint32_t sdr_white_nits = 80;  // HDR 表面上的普通 UI 白点，不改变缩略图亮度
         };
 
         struct Snapshot {
@@ -40,11 +42,10 @@ namespace gamesnap {
         [[nodiscard]] std::uint64_t on_trigger() noexcept;
         void job_enqueued() noexcept;
         void job_finished() noexcept;
-        // sequence 是截图序号：多编码线程下完成顺序不固定，只接受不比已发布结果更旧的作业，
-        // 避免旧截图的面板信息覆盖新截图。
-        // image 非空时刷新缩略图（编码一开始就调，让面板立刻显示这一张）；
-        // filename 留空表示"文件名还没确定"，等写盘成功后再调一次补上。
-        void publish(std::uint64_t sequence, std::wstring filename, Image const* image);
+        // 回调与编码线程分别发布，任何顺序都不能清掉同一请求的另一半信息。
+        [[nodiscard]] bool is_current(std::uint64_t sequence) const noexcept;
+        void publish_filename(std::uint64_t sequence, std::wstring filename);
+        void publish_thumbnail(std::uint64_t sequence, std::shared_ptr<const Thumbnail> thumbnail);
 
         // 非 const：会在里面惰性丢弃上一张的文件名/缩略图（on_trigger() 不拿锁）。
         [[nodiscard]] Snapshot snapshot();
@@ -52,6 +53,7 @@ namespace gamesnap {
         [[nodiscard]] HANDLE trigger_event() const noexcept { return trigger_event_; }
 
     private:
+        bool prepare_publish_locked(std::uint64_t sequence);
         void notify() noexcept;
         mutable std::mutex mutex_;
         std::wstring filename_;

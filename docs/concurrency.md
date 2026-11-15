@@ -52,7 +52,7 @@
 | system-events | `SystemEventThread::run()` | 隐藏窗口 + WinEvent hook；投递 Validate/Reload |
 | encode × N | `EncodeWorkers::worker_main()` | 消费 `EncodeJob`；Map、转换、tone map、编码、写盘 |
 | overlay | `OverlayThread::run()` | DirectComposition + ImGui + MP3；先出声再建 UI，资源在触发后常驻 30s 再整体释放 |
-| WGC 回调 | `FrameSink::on_frame()` | 取帧、创建本张纹理、`CopyResource`、入队、release `done` |
+| WGC 回调 | `FrameSink::on_frame()` | 取帧、复制原帧、GPU 生成/回读小缩略图、发布预览、入队、release `done` |
 | GameInput 回调 | `InputThread::reading_callback()` | 读 Xbox Share 键，投递 Trigger |
 | Ctrl+C | `console_ctrl_handler()` | 只对 `StopSource` 调 `request_stop()` |
 
@@ -156,7 +156,7 @@ CPU 回退走的是和 GPU 同一套数学（PQ 域 spline + IPT + hull 色度�
 
 - 持 `context_mutex` 时不再拿 `FrameSink::mutex_` / `UiBridge::mutex_`；
 - `ToneMapper` 的 fence 等待在 `context_mutex` 外；
-- `UiBridge::publish()` 不进入 D3D 锁；
+- `UiBridge::publish_thumbnail()` / `publish_filename()` 不进入 D3D 锁；小图生成/等待在发布锁之外；
 - `FrameSink::on_frame` 只在取/清 shot 时拿自己的 mutex，`CopyResource` 使用 `context_mutex`。
 
 ---
@@ -168,6 +168,8 @@ CPU 回退走的是和 GPU 同一套数学（PQ 域 spline + IPT + hull 色度�
    - 从 pool 取 frame；
    - 新建目标纹理（`com_ptr`，在捕获回调内独占）；
    - 在 `context_mutex` 内 `CopyResource`，随后 `signal_fence_locked()`；
+   - 仍在回调内生成 SDR/HDR 缩略图：同一个 context 锁保护 Dispatch/Copy/非阻塞 Map/Unmap，等待和小图 memcpy 在锁外；
+   - 发布不可变小图（无 tone map），关闭 WGC frame；预览失败不影响原帧编码；
    - 填 `EncodeJob`，入队；
    - 入队后 `shot.done.release()`。
 3. capture 线程等 `done`，再 `quiesce()`（disarm → 注销 → 等回调退出）→ `stop_capture()`；
@@ -178,7 +180,7 @@ CPU 回退走的是和 GPU 同一套数学（PQ 域 spline + IPT + hull 色度�
    - CPU 行拷贝、转换、编码、写盘全部在锁外。
 5. `EncodeJob` 析构，纹理和缓冲释放。
 
-`done` 只表示帧已经进入目标纹理，不表示已经写盘。
+`done` 表示回调工作（含小图预览尝试）已完成、原帧已进入编码队列，不表示已经写盘。
 
 ---
 
@@ -232,6 +234,13 @@ GPU 转换时捕获纹理、转换输出、staging 和 CPU 输出的已知像素
 这包含系统内存和 GPU 资源，不等于独立显存实际占用，也不包含驱动和编码库内部工作区。
 队列里每张未处理的 4K HDR 纹理约 63.28 MiB，因此无界积压仍按上述既定策略增加占用。
 JPEG 直接读取 BGRA 的 BGRX 输入（忽略第四字节），输出始终三通道、没有 alpha；PNG/JPEG 使用原生 EXIF API，避免再复制整份压缩输出。
+
+### 6.4 回调小图的额外资源
+
+320×180 的 SDR/HDR 小图分别为 225/450 KiB，生成期间各有 GPU output、staging、CPU 小图一份；
+GPU/staging 在回调返回后释放，CPU 小图通过不可变 `shared_ptr` 交给 UI，不按帧再复制。
+HDR 采样已有的 DEFAULT+SRV 目标；SDR 源若不可直接采样，额外临时复制一张 DEFAULT+SRV（4K 为 31.64 MiB），
+仅在本次小图生成期间存在。Overlay 在自己的设备上上传一份小图；SDR/HDR 切换只重建交换链/RTV，不销毁 ImGui 上下文。
 
 ## 7. 审查清单
 

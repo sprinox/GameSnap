@@ -21,6 +21,7 @@ namespace gamesnap {
 
 #if GAMESNAP_SELFTEST
     bool run_selftest(Config const& config);
+    bool run_overlay_selftest();
 #endif
 
 }  // namespace gamesnap

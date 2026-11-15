@@ -169,6 +169,7 @@
     <ClCompile Include="selftest.cpp" />
     <ClCompile Include="simd.cpp" />
     <ClCompile Include="system_events.cpp" />
+    <ClCompile Include="thumbnail.cpp" />
     <ClCompile Include="tonemap.cpp">
       <FloatingPointModel>Precise</FloatingPointModel>
     </ClCompile>
@@ -190,10 +191,27 @@
     <ClInclude Include="selftest.h" />
     <ClInclude Include="simd.h" />
     <ClInclude Include="system_events.h" />
+    <ClInclude Include="thumbnail.h" />
     <ClInclude Include="tonemap.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
+    <FxCompile Include="thumbnail.hlsl">
+      <ShaderType>Compute</ShaderType>
+      <ShaderModel>5.0</ShaderModel>
+      <EntryPointName>main</EntryPointName>
+      <HeaderFileOutput>$(TargetDir)thumbnail_cs.h</HeaderFileOutput>
+      <VariableName>kThumbnailCS</VariableName>
+      <AdditionalOptions Condition="'$(Configuration)'=='Release'">/O3 %(AdditionalOptions)</AdditionalOptions>
+    </FxCompile>
+    <FxCompile Include="overlay_hdr.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <ShaderModel>5.0</ShaderModel>
+      <EntryPointName>main</EntryPointName>
+      <HeaderFileOutput>$(TargetDir)overlay_hdr_ps.h</HeaderFileOutput>
+      <VariableName>kOverlayHdrPS</VariableName>
+      <AdditionalOptions Condition="'$(Configuration)'=='Release'">/O3 %(AdditionalOptions)</AdditionalOptions>
+    </FxCompile>
     <FxCompile Include="tonemap.hlsl">
       <ShaderType>Compute</ShaderType>
       <ShaderModel>5.0</ShaderModel>

@@ -747,7 +747,7 @@ namespace gamesnap {
         const std::wstring base_name = make_base_name(job.title, job.process_exe, job.process_name, job.local_time,
                                                       job.sequence, filename_pattern_);
         if (ui_)
-            ui_->publish(job.sequence, base_name, nullptr);
+            ui_->publish_filename(job.sequence, base_name);
 
         // HDR 优先走 GPU：mapper 直接采样 DEFAULT+SRV 纹理，fence/event 等待 GPU 完成。
         // 只有它失败时才把 DEFAULT 纹理回读到 staging，再走 CPU 回退。
@@ -792,14 +792,11 @@ namespace gamesnap {
             if (!gpu_ok && job.tone_map == ToneMapAlgorithm::Analysis)
                 SPDLOG_WARN("[#{:04}] analysis 仅支持 GPU；按设计 CPU 路径使用 spline", job.sequence);
 
-            // 先把 SDR 像素转出来并立刻发布缩略图：面板马上显示这一张，
-            // 不用等 HDR 那 1 秒多的编码（文件名等写盘成功后再补）。
+            // 生成伴生 SDR 输出；缩略图已经由 capture 回调独立发布。
             if (!gpu_ok && !convert_pixels(raw, job.color_space, job.sdr_white_nits, sdr)) {
                 SPDLOG_ERROR("[#{:04}] 不支持的像素格式 {}", job.sequence, static_cast<int>(raw.format));
                 return;
             }
-            if (ui_)
-                ui_->publish(job.sequence, base_name, &sdr);
 
             auto hdr_output = make_output_path(output_dir_, base_name,
                                                    image_extension(hdr_format), L"HDR");
@@ -850,9 +847,6 @@ namespace gamesnap {
                 return;
             }
             raw.pixels.release();
-            // 同上：写盘之前就先把缩略图推给面板。
-            if (ui_)
-                ui_->publish(job.sequence, base_name, &sdr);
 
             auto output = make_output_path(output_dir_, base_name,
                                                image_extension(job.sdr_format), {});
@@ -871,9 +865,9 @@ namespace gamesnap {
         if (written.empty())
             return;
 
-        // 文件已落盘：补上真实文件名（缩略图早就在上面发布过了，这里不再重算）。
+        // 文件已落盘：补上真实文件名（缩略图已在捕获回调发布，这里不再重算）。
         if (ui_)
-            ui_->publish(job.sequence, written.front().filename().wstring(), nullptr);
+            ui_->publish_filename(job.sequence, written.front().filename().wstring());
 
         std::string paths;
         for (auto const& path : written) {

@@ -43,7 +43,8 @@ namespace gamesnap {
     };
 
     // 截图线程 → 编码线程。GPU 拷贝（CopyResource）在回调里做；
-    // Map/Unmap 这种 GPU→CPU 传输在编码线程里做，所以 job 直接持有 staging 纹理和设备。
+    // 整帧 GPU→CPU 传输在编码线程里做；回调只另外回读小缩略图。
+    // job 直接持有 staging 纹理和设备。
     // 纹理是独占的，因此 EncodeJob 显式只可移动：多一次拷贝就意味着多一次 AddRef 和
     // 一个“谁还拿着这张纹理”的问题。注意 winrt::com_ptr 自己是可以拷贝的（拷贝会 AddRef），
     // 所以这里的 delete 是必要的，不是冗余。

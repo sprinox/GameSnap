@@ -19,6 +19,12 @@
     <ClCompile Include="ui_bridge.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="thumbnail.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClInclude Include="thumbnail.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
     <ClInclude Include="overlay.h">
       <Filter>头文件</Filter>
     </ClInclude>
@@ -121,6 +127,12 @@
   </ItemGroup>
   <ItemGroup>
     <FxCompile Include="tonemap.hlsl">
+      <Filter>源文件</Filter>
+    </FxCompile>
+    <FxCompile Include="thumbnail.hlsl">
+      <Filter>源文件</Filter>
+    </FxCompile>
+    <FxCompile Include="overlay_hdr.hlsl">
       <Filter>源文件</Filter>
     </FxCompile>
   </ItemGroup>

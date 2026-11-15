@@ -8,8 +8,8 @@
 //      由 capture 线程创建、关闭；只在 capture 线程访问，不需要 mutex。
 //      建 pool/会话时新 pool 还没有回调，不会阻塞 FrameArrived。
 //   2. WGC 的 FrameArrived 回调运行在 frame pool 的工作线程上（FreeThreaded 可能并发）；
-//      FrameSink 用 mutex 交接 shot，只做“取帧 → 拷贝到目标纹理 → 入队”；HDR 目标是
-//      DEFAULT+SRV，SDR 目标是可 Map 的 staging，Map/Unmap 在编码线程。
+//      FrameSink 用 mutex 交接 shot，做“取帧 → 拷贝 → 小缩略图 → 入队”；HDR 目标是
+//      DEFAULT+SRV，SDR 目标是 staging。回调仅回读缩略图，整帧 Map/Unmap 在编码线程。
 //   3. 每张截图新建一套 frame pool + 会话，帧处理完直接关闭，不复用 pool。
 //   4. 资源以“代(generation)”为单位整体替换：先建好新一代，成功后才换掉旧的。
 // ─────────────────────────────────────────────────────────────────────────────

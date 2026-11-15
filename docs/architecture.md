@@ -42,11 +42,23 @@ flowchart LR
 - 一次触发把这些资源全部建好，面板收起后**继续保留 30 秒**（`kOverlayLinger`）：这段时间内再按热键直接复用，
   只走动画与渲染；闲置超时才整体释放（窗口、设备、字体、播放器），回到“闲置不占显存/内存”。
 - 面板收起后窗口 `SW_HIDE` 且不再 `Present`，linger 期间不让 DWM 继续合成这个顶层表面；线程阻塞在事件上，
-  只在 linger 到期时醒一次。
-- 保留期间的可计算开销（100% DPI）：交换链 2 × 361 KiB、缩略图纹理 225 KiB、字体图集 0.25–1 MiB；
+  在 UI 通知、窗口消息、stop 或 linger 到期时唤醒。
+- 保留期间的可计算开销（100% DPI，440×150 表面）：SDR 交换链约 2 × 258 KiB，HDR 约 2 × 516 KiB；
+  GPU 缩略图 SDR 225 KiB / HDR 450 KiB，UiBridge 另持有同样大小的 CPU 小图，字体图集约 0.25–1 MiB；
   其余是 D3D 设备/驱动分配与 MediaPlayer（Media Foundation），属黑盒，需用 GPU 私有字节 + Private Bytes
   在目标机上实测。
 - 面板选屏与截图使用同一套规则（`monitor: primary | foreground`），否则双屏时面板会滑到另一块屏上。
+
+### 回调缩略图与 HDR 面板
+
+- `FrameArrived` 中先复制原帧，再用 `thumbnail.hlsl` 生成 320×180 等比 letterbox 小图并发布，最后才把任务送入编码队列。
+- SDR 是 RGBA8/sRGB；HDR 是 RGBA16F/线性 scRGB（1.0 = 80 nit）。只做最近邻缩放，**不做 tone map、PQ 编码、曝光调整或高光裁切**，负色和 >1.0 的 HDR 值也保留。
+- HDR 直接复用捕获目标的 SRV；SDR 优先使用 WGC 源的 SRV，不支持时才复制到临时 DEFAULT+SRV。回调只回读小图，不回读整帧。
+- 回读用非阻塞 Map、250 ms 截止时间；失败只记录日志、跳过预览，原图仍继续编码。小图资源均为单次回调所有。
+- `UiBridge::publish_thumbnail` 与 `publish_filename` 独立更新；同一请求的发布顺序不影响彼此，旧请求结果不能覆盖新请求。编码线程完全不再生成缩略图。
+- Overlay 收到 HDR 小图便重建为 FP16 + `RGB_FULL_G10_NONE_P709` 的 scRGB 交换链，收到 SDR 小图便重建为 BGRA8 SDR 交换链；隐藏期间同样处理切换。D3D 设备、窗口、ImGui 上下文、字体和提示音状态保留，不重播动画。
+- HDR 表面使用专用 ImGui 像素着色器：普通 UI 从 sRGB 解码为线性并按 SDR 白点缩放；HDR 图片保持原始 scRGB 值。混合结果为 DirectComposition 需要的预乘 alpha。
+- 若目标色彩空间/交换链无法创建，则跳过本次面板并记录错误，不把 HDR 原值塞进 SDR UNORM 表面。最终显示输出由 Windows/DWM 按显示器状态合成；本程序不对预览做色调映射。
 
 ## 一次截图
 
@@ -56,11 +68,14 @@ sequenceDiagram
     participant C as capture 线程
     participant P as frame pool 回调
     participant E as 编码线程
+    participant O as Overlay
 
     U->>C: Command::Trigger
     C->>C: 复用上一张预创建的 frame pool + 会话
     C->>P: StartCapture()
     P->>P: 取帧，HDR→DEFAULT+SRV / SDR→staging
+    P->>P: GPU 缩小，回读 320×180（无 tone map）
+    P->>O: 发布 SDR/HDR 缩略图
     P->>E: EncodeJob（纹理 + 设备 + 描述）
     P-->>C: done 信号
     C->>C: Close 会话与 pool
@@ -68,7 +83,7 @@ sequenceDiagram
     E->>E: 编码并写盘
 ```
 
-回调只做 GPU 侧工作，`Map/Unmap` 留给编码线程；`done` 只表示帧已经拷进目标纹理，不表示已经写盘。
+回调只回读小缩略图，整帧 `Map/Unmap` 留给编码线程；`done` 表示回调处理完并已入编码队列，不表示已经写盘。
 编码线程完成一张图后打印一条端到端延迟：
 
 ```text

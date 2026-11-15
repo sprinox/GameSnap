@@ -2,6 +2,7 @@
 
 #include "capture.h"
 #include "ui_bridge.h"
+#include "thumbnail.h"
 
 #include <windows.graphics.capture.interop.h>
 
@@ -177,8 +178,8 @@ namespace gamesnap {
             return info;
         }
 
-        // FrameArrived 回调里只做 GPU 侧的事：取帧 → CopyResource 到 staging → 入队。
-        // Map/Unmap（GPU→CPU）交给编码线程，回调线程不被整帧 memcpy 拖住。
+        // 回调：复制原帧 → GPU 生成/回读小缩略图 → 发布 → 编码入队。
+        // 整帧回读仍在编码线程，小图不经过 tone map，也不等待编码。
         void handle_frame(winrt::Direct3D11CaptureFramePool const& pool, ShotContext& shot) {
             winrt::Direct3D11CaptureFrame frame = pool.TryGetNextFrame();
             if (!frame) {
@@ -229,6 +230,20 @@ namespace gamesnap {
                 shot.d3d->context()->CopyResource(target.get(), source.get());
                 gpu_fence = shot.d3d->signal_fence_locked();
             }
+            const auto copied = SteadyClock::now();
+            shot.timings.copied = copied;
+            if (shot.ui && shot.ui->is_current(shot.sequence)) {
+                std::string thumbnail_error;
+                const auto started = SteadyClock::now();
+                auto thumbnail = make_capture_thumbnail(*shot.d3d,
+                                                        shot.hdr ? target.get() : source.get(), shot.sdr_white_nits, thumbnail_error);
+                if (thumbnail && !shot.canceled->load(std::memory_order_acquire))
+                    shot.ui->publish_thumbnail(shot.sequence, std::move(thumbnail));
+                else if (!thumbnail)
+                    SPDLOG_WARN("[#{:04}] 缩略图生成失败（继续编码）: {}", shot.sequence, thumbnail_error);
+                SPDLOG_DEBUG("[#{:04}] 回调缩略图 {:.2f}ms", shot.sequence,
+                             duration_ms(SteadyClock::now() - started));
+            }
             frame.Close();
             // CopyResource 没有 HRESULT；TDR/拔卡时可能静默失败。GetDeviceRemovedReason 是
             // 唯一廉价的事后反馈，避免把旧内容或垃圾帧交给编码线程。
@@ -236,8 +251,6 @@ namespace gamesnap {
                 shot.failed.store(true, std::memory_order_release);
                 return;
             }
-            const auto copied = SteadyClock::now();
-            shot.timings.copied = copied;
             if (shot.canceled->load(std::memory_order_acquire))
                 return;
 

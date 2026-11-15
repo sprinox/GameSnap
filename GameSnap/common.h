@@ -247,6 +247,7 @@ namespace gamesnap {
         CodecOptions codec;
         bool verbose = false;
         bool selftest = false;  // 不经过 WGC，用合成纹理验证编码链路
+        bool selftest_capture = false;  // 显式选择时再测试真实 WGC 回调，无编码消费者
         // 编码基准：给定一张 PNG，用各种格式/参数重新编码，量体积与耗时。
         std::optional<std::filesystem::path> bench_source;
         // 基准的缩放高度（0 = 不缩放）。用来把 4K 源降到 1080p 做对比。

@@ -3,6 +3,8 @@
 #include <set>
 
 #include "overlay.h"
+#include "selftest.h"
+#include "simd.h"
 
 #include "ui_bridge.h"
 #include "resource.h"
@@ -12,6 +14,7 @@
 
 #include <imgui.h>
 #include <imgui_impl_dx11.h>
+#include "overlay_hdr_ps.h"
 
 #include <winrt/Windows.Media.Core.h>
 #include <winrt/Windows.Media.Playback.h>
@@ -67,8 +70,14 @@ namespace gamesnap {
         public:
             bool initialize(HWND hwnd, std::uint32_t width, std::uint32_t height);
             void shutdown();
-            void set_thumbnail(std::vector<std::uint8_t> const& pixels, std::uint32_t width,
-                               std::uint32_t height);
+            bool set_color_mode(bool hdr);
+            void set_thumbnail(UiBridge::Thumbnail const* thumbnail);
+            static void draw_ui(ImDrawList const*, ImDrawCmd const* command);
+            static void draw_hdr_thumbnail(ImDrawList const*, ImDrawCmd const* command);
+            [[nodiscard]] bool hdr() const noexcept { return hdr_; }
+#if GAMESNAP_SELFTEST
+            bool read_pixel(std::uint32_t x, std::uint32_t y, float (&rgba)[4]);
+#endif
             void begin_frame();
             void end_frame();
 
@@ -88,8 +97,8 @@ namespace gamesnap {
             }
 
         private:
-            bool create_swap_chain(HWND hwnd, std::uint32_t width, std::uint32_t height);
-            bool create_render_target();
+            bool create_swap_chain(HWND hwnd, std::uint32_t width, std::uint32_t height, bool hdr);
+            void bind_hdr_shader(bool thumbnail);
             void release_thumbnail();
 
             winrt::com_ptr<ID3D11Device> device_;
@@ -101,13 +110,18 @@ namespace gamesnap {
             winrt::com_ptr<ID3D11RenderTargetView> render_target_;
             winrt::com_ptr<ID3D11Texture2D> thumbnail_texture_;
             winrt::com_ptr<ID3D11ShaderResourceView> thumbnail_view_;
+            winrt::com_ptr<ID3D11PixelShader> hdr_shader_;
+            winrt::com_ptr<ID3D11Buffer> hdr_constants_;
+            HWND hwnd_ = nullptr;
+            bool hdr_ = false;
+            float ui_white_scale_ = 1.0F;
             // Present 报设备移除后就别再画了（否则一路失败空转到 linger 到期）。
             std::atomic<bool> device_lost_{false};
             std::uint32_t width_ = 0;
             std::uint32_t height_ = 0;
         };
 
-        bool OverlayDevice::create_swap_chain(HWND hwnd, std::uint32_t width, std::uint32_t height) {
+        bool OverlayDevice::create_swap_chain(HWND hwnd, std::uint32_t width, std::uint32_t height, bool hdr) {
             winrt::com_ptr<IDXGIDevice> dxgi_device;
             if (FAILED(device_->QueryInterface(__uuidof(IDXGIDevice), dxgi_device.put_void())))
                 return false;
@@ -121,36 +135,88 @@ namespace gamesnap {
             DXGI_SWAP_CHAIN_DESC1 desc{};
             desc.Width = width;
             desc.Height = height;
-            desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            desc.Format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
             desc.SampleDesc.Count = 1;
             desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
             desc.BufferCount = 2;
             desc.Scaling = DXGI_SCALING_STRETCH;
             desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
             desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
-            if (FAILED(factory->CreateSwapChainForComposition(device_.get(), &desc, nullptr, swap_chain_.put())))
+            winrt::com_ptr<IDXGISwapChain1> swap_chain;
+            if (FAILED(factory->CreateSwapChainForComposition(device_.get(), &desc, nullptr, swap_chain.put())))
                 return false;
-
-            if (FAILED(::DCompositionCreateDevice(dxgi_device.get(), __uuidof(IDCompositionDevice),
-                                                  composition_.put_void())))
+            auto swap_chain3 = swap_chain.try_as<IDXGISwapChain3>();
+            const auto color_space = hdr ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+                                         : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+            UINT support = 0;
+            if (!swap_chain3 || FAILED(swap_chain3->CheckColorSpaceSupport(color_space, &support)) ||
+                !(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) ||
+                FAILED(swap_chain3->SetColorSpace1(color_space))) {
+                SPDLOG_ERROR("overlay {} 色彩空间不可用，拒绝使用错误的表面显示", hdr ? "HDR scRGB" : "SDR");
                 return false;
-            if (FAILED(composition_->CreateTargetForHwnd(hwnd, TRUE, composition_target_.put())))
+            }
+            winrt::com_ptr<ID3D11Texture2D> back_buffer;
+            winrt::com_ptr<ID3D11RenderTargetView> render_target;
+            if (FAILED(swap_chain->GetBuffer(0, __uuidof(ID3D11Texture2D), back_buffer.put_void())) ||
+                FAILED(device_->CreateRenderTargetView(back_buffer.get(), nullptr, render_target.put())))
                 return false;
-            if (FAILED(composition_->CreateVisual(composition_visual_.put())))
+            if (!composition_) {
+                if (FAILED(::DCompositionCreateDevice(dxgi_device.get(), __uuidof(IDCompositionDevice),
+                                                      composition_.put_void())) ||
+                    FAILED(composition_->CreateTargetForHwnd(hwnd, TRUE, composition_target_.put())) ||
+                    FAILED(composition_->CreateVisual(composition_visual_.put())) ||
+                    FAILED(composition_target_->SetRoot(composition_visual_.get())))
+                    return false;
+            }
+            if (FAILED(composition_visual_->SetContent(swap_chain.get())) || FAILED(composition_->Commit()))
                 return false;
-            if (FAILED(composition_visual_->SetContent(swap_chain_.get())))
-                return false;
-            if (FAILED(composition_target_->SetRoot(composition_visual_.get())))
-                return false;
-            return SUCCEEDED(composition_->Commit());
+            context_->OMSetRenderTargets(0, nullptr, nullptr);
+            render_target_ = std::move(render_target);
+            swap_chain_ = std::move(swap_chain);
+            hdr_ = hdr;
+            release_thumbnail();
+            SPDLOG_INFO("overlay 表面重建为 {}", hdr ? "HDR scRGB FP16" : "SDR BGRA8");
+            return true;
         }
 
-        bool OverlayDevice::create_render_target() {
-            render_target_ = nullptr;
-            winrt::com_ptr<ID3D11Texture2D> back_buffer;
-            if (FAILED(swap_chain_->GetBuffer(0, __uuidof(ID3D11Texture2D), back_buffer.put_void())))
-                return false;
-            return SUCCEEDED(device_->CreateRenderTargetView(back_buffer.get(), nullptr, render_target_.put()));
+        bool OverlayDevice::set_color_mode(bool hdr) {
+            if (hdr == hdr_)
+                return true;
+            if (hdr && !hdr_shader_) {
+                D3D11_BUFFER_DESC desc{};
+                desc.ByteWidth = 16;
+                desc.Usage = D3D11_USAGE_DEFAULT;
+                desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+                winrt::com_ptr<ID3D11Buffer> constants;
+                winrt::com_ptr<ID3D11PixelShader> shader;
+                if (FAILED(device_->CreateBuffer(&desc, nullptr, constants.put())) ||
+                    FAILED(device_->CreatePixelShader(kOverlayHdrPS, sizeof(kOverlayHdrPS), nullptr, shader.put())))
+                    return false;
+                hdr_constants_ = std::move(constants);
+                hdr_shader_ = std::move(shader);
+            }
+            // 只重建呈现表面；D3D 设备/ImGui/字体仍有效，run_panel 的引用不会悬空。
+            return create_swap_chain(hwnd_, width_, height_, hdr);
+        }
+
+        void OverlayDevice::bind_hdr_shader(bool thumbnail) {
+            const struct {
+                std::uint32_t thumbnail;
+                float white;
+                float padding[2];
+            } params{thumbnail ? 1U : 0U, ui_white_scale_, {0, 0}};
+            context_->UpdateSubresource(hdr_constants_.get(), 0, nullptr, &params, 0, 0);
+            auto* cb = hdr_constants_.get();
+            context_->PSSetConstantBuffers(0, 1, &cb);
+            context_->PSSetShader(hdr_shader_.get(), nullptr, 0);
+        }
+
+        void OverlayDevice::draw_ui(ImDrawList const*, ImDrawCmd const* command) {
+            static_cast<OverlayDevice*>(command->UserCallbackData)->bind_hdr_shader(false);
+        }
+
+        void OverlayDevice::draw_hdr_thumbnail(ImDrawList const*, ImDrawCmd const* command) {
+            static_cast<OverlayDevice*>(command->UserCallbackData)->bind_hdr_shader(true);
         }
 
         bool OverlayDevice::initialize(HWND hwnd, std::uint32_t width, std::uint32_t height) {
@@ -164,7 +230,8 @@ namespace gamesnap {
             }
             width_ = width;
             height_ = height;
-            return create_swap_chain(hwnd, width, height) && create_render_target();
+            hwnd_ = hwnd;
+            return create_swap_chain(hwnd, width, height, false);
         }
 
         void OverlayDevice::shutdown() {
@@ -174,6 +241,8 @@ namespace gamesnap {
             composition_ = nullptr;
             render_target_ = nullptr;
             swap_chain_ = nullptr;
+            hdr_shader_ = nullptr;
+            hdr_constants_ = nullptr;
             context_ = nullptr;
             device_ = nullptr;
         }
@@ -183,25 +252,31 @@ namespace gamesnap {
             thumbnail_texture_ = nullptr;
         }
 
-        void OverlayDevice::set_thumbnail(std::vector<std::uint8_t> const& pixels, std::uint32_t width,
-                                          std::uint32_t height) {
+        void OverlayDevice::set_thumbnail(UiBridge::Thumbnail const* thumbnail) {
             release_thumbnail();
-            if (pixels.empty() || width == 0 || height == 0)
+            if (!thumbnail)
                 return;
+            const auto width = thumbnail->width, height = thumbnail->height;
+            const auto stride = width * (hdr_ ? 8U : 4U);
+            if (thumbnail->hdr != hdr_ || width == 0 || height == 0 ||
+                thumbnail->pixels.size() != static_cast<std::size_t>(stride) * height)
+                return;
+            ui_white_scale_ = static_cast<float>(std::max(80U, thumbnail->sdr_white_nits)) / 80.0F;
             D3D11_TEXTURE2D_DESC desc{};
             desc.Width = width;
             desc.Height = height;
             desc.MipLevels = 1;
             desc.ArraySize = 1;
-            desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            desc.Format = hdr_ ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
             desc.SampleDesc.Count = 1;
             desc.Usage = D3D11_USAGE_DEFAULT;
             desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
             D3D11_SUBRESOURCE_DATA data{};
-            data.pSysMem = pixels.data();
-            data.SysMemPitch = width * 4;
-            if (SUCCEEDED(device_->CreateTexture2D(&desc, &data, thumbnail_texture_.put())))
-                device_->CreateShaderResourceView(thumbnail_texture_.get(), nullptr, thumbnail_view_.put());
+            data.pSysMem = thumbnail->pixels.data();
+            data.SysMemPitch = stride;
+            if (FAILED(device_->CreateTexture2D(&desc, &data, thumbnail_texture_.put())) ||
+                FAILED(device_->CreateShaderResourceView(thumbnail_texture_.get(), nullptr, thumbnail_view_.put())))
+                SPDLOG_WARN("overlay 上传缩略图失败");
         }
 
         void OverlayDevice::begin_frame() {
@@ -225,6 +300,39 @@ namespace gamesnap {
                 SPDLOG_WARN("overlay Present 失败（设备移除）: {}", describe_hresult(presented));
             }
         }
+
+#if GAMESNAP_SELFTEST
+        bool OverlayDevice::read_pixel(std::uint32_t x, std::uint32_t y, float (&rgba)[4]) {
+            winrt::com_ptr<ID3D11Texture2D> buffer, staging;
+            if (FAILED(swap_chain_->GetBuffer(0, __uuidof(ID3D11Texture2D), buffer.put_void())))
+                return false;
+            D3D11_TEXTURE2D_DESC desc{};
+            buffer->GetDesc(&desc);
+            if (x >= desc.Width || y >= desc.Height ||
+                desc.Format != (hdr_ ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM))
+                return false;
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = desc.MiscFlags = 0;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(device_->CreateTexture2D(&desc, nullptr, staging.put())))
+                return false;
+            context_->CopyResource(staging.get(), buffer.get());
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (FAILED(context_->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped)))
+                return false;
+            const auto* pixel = static_cast<std::uint8_t*>(mapped.pData) + y * mapped.RowPitch + x * (hdr_ ? 8 : 4);
+            if (hdr_)
+                half_to_float_row(reinterpret_cast<std::uint16_t const*>(pixel), rgba, 4);
+            else {
+                rgba[0] = pixel[2] / 255.0F;
+                rgba[1] = pixel[1] / 255.0F;
+                rgba[2] = pixel[0] / 255.0F;
+                rgba[3] = pixel[3] / 255.0F;
+            }
+            context_->Unmap(staging.get(), 0);
+            return true;
+        }
+#endif
 
         class AudioPlayer {
         public:
@@ -388,6 +496,81 @@ namespace gamesnap {
         }
 
     }  // namespace
+
+#if GAMESNAP_SELFTEST
+    bool run_overlay_selftest() {
+        // 单独的隐藏窗口；不启动提示音、不触碰正在运行的用户实例。
+        const HWND hwnd = ::CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW,
+                                            L"STATIC", L"GameSnap preview selftest", WS_POPUP, 0, 0, 64, 64, nullptr, nullptr,
+                                            ::GetModuleHandleW(nullptr), nullptr);
+        if (!hwnd)
+            return false;
+        auto window_guard = ScopeExit{[&] { ::DestroyWindow(hwnd); }};
+        OverlayDevice device;
+        if (!device.initialize(hwnd, 64, 64))
+            return false;
+        ImGui::CreateContext();
+        ImGui::GetIO().IniFilename = nullptr;
+        if (!ImGui_ImplDX11_Init(device.device(), device.context())) {
+            ImGui::DestroyContext();
+            return false;
+        }
+        auto gui_guard = ScopeExit{[&] { ImGui_ImplDX11_Shutdown(); ImGui::DestroyContext(); }};
+        for (const bool hdr : {false, true, false, true, false}) {
+            if (!device.set_color_mode(hdr))
+                return false;
+            UiBridge::Thumbnail thumbnail;
+            thumbnail.width = thumbnail.height = 1;
+            thumbnail.hdr = hdr;
+            thumbnail.sdr_white_nits = 200;
+            const float sample[4]{12.5F, -0.5F, 2.5F, 1.0F};
+            if (hdr) {
+                thumbnail.pixels.resize(8);
+                float_to_half_row(sample, reinterpret_cast<std::uint16_t*>(thumbnail.pixels.data()), 4);
+            } else {
+                thumbnail.pixels = {200, 100, 50, 255};
+            }
+            device.set_thumbnail(&thumbnail);
+            if (!device.thumbnail_view())
+                return false;
+            auto& io = ImGui::GetIO();
+            io.DisplaySize = ImVec2(64, 64);
+            io.DeltaTime = 1.0F / 60.0F;
+            ImGui_ImplDX11_NewFrame();
+            ImGui::NewFrame();
+            auto* list = ImGui::GetBackgroundDrawList();
+            if (hdr)
+                list->AddCallback(OverlayDevice::draw_ui, &device);
+            list->AddRectFilled(ImVec2(0, 0), ImVec2(32, 32), IM_COL32(128, 128, 128, 255));
+            if (hdr)
+                list->AddCallback(OverlayDevice::draw_hdr_thumbnail, &device);
+            list->AddImage(ImTextureRef(static_cast<ImTextureID>(reinterpret_cast<std::uintptr_t>(device.thumbnail_view()))),
+                           ImVec2(32, 0), ImVec2(64, 32));
+            if (hdr)
+                list->AddCallback(OverlayDevice::draw_ui, &device);
+            list->AddRectFilled(ImVec2(0, 32), ImVec2(32, 64), IM_COL32(255, 255, 255, 128));
+            ImGui::Render();
+            device.begin_frame();
+            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+            float ui[4]{}, image[4]{}, alpha[4]{};
+            if (!device.read_pixel(8, 8, ui) || !device.read_pixel(48, 8, image) || !device.read_pixel(8, 40, alpha))
+                return false;
+            const float expected_ui = hdr ? std::pow((128.0F / 255.0F + 0.055F) / 1.055F, 2.4F) * 2.5F : 128.0F / 255.0F;
+            bool ok = std::abs(ui[0] - expected_ui) < 0.004F &&
+                      std::abs(alpha[0] - 128.0F / 255.0F * (hdr ? 2.5F : 1.0F)) < 0.004F &&
+                      std::abs(alpha[3] - 128.0F / 255.0F) < 0.004F;
+            for (int i = 0; i < 3; ++i)
+                ok = ok && std::abs(image[i] - (hdr ? sample[i] : thumbnail.pixels[i] / 255.0F)) < 0.004F;
+            if (!ok) {
+                SPDLOG_ERROR("overlay {} 回读失败: UI={} 图=({},{},{}) alpha=({}, {})",
+                             hdr ? "HDR" : "SDR", ui[0], image[0], image[1], image[2], alpha[0], alpha[3]);
+                return false;
+            }
+            SPDLOG_INFO("overlay {} 表面/着色器/透明度回读通过", hdr ? "HDR" : "SDR");
+        }
+        return true;
+    }
+#endif
 
     // 一次触发建好、linger 期间复用的 overlay 资源。窗口/设备/字体/播放器都在这里，
     // state_ 为空即表示已整体释放。
@@ -633,8 +816,17 @@ namespace gamesnap {
             }
 
             const UiBridge::Snapshot snapshot = bridge_->snapshot();
-            if (snapshot.trigger_serial == last_trigger)
+            if (snapshot.trigger_serial == last_trigger) {
+                // 迟到预览也要更新隐藏窗口的色彩模式；不重复播放提示音/面板动画。
+                if (snapshot.thumbnail && state_ && state_->device &&
+                    snapshot.thumbnail->hdr != state_->device->hdr()) {
+                    if (state_->device->set_color_mode(snapshot.thumbnail->hdr))
+                        state_->device->set_thumbnail(snapshot.thumbnail.get());
+                    else
+                        release_ui();
+                }
                 continue;
+            }
 
             play_audio();  // 先出声，再做 UI 初始化
             if (!ensure_ui()) {
@@ -764,15 +956,18 @@ namespace gamesnap {
                         state.font = font;
                     }
                 }
-                // 缩略图和文件名是分两次发布的（先图、写盘后补文件名），
+                // 回调先发布缩略图，编码阶段再发布文件名；
                 // 指针没变就不必重新上传纹理。
                 if (snapshot.thumbnail != last_thumbnail) {
                     last_thumbnail = snapshot.thumbnail;
                     if (snapshot.thumbnail) {
-                        state.device->set_thumbnail(snapshot.thumbnail->pixels, snapshot.thumbnail->width,
-                                                    snapshot.thumbnail->height);
+                        if (!state.device->set_color_mode(snapshot.thumbnail->hdr)) {
+                            SPDLOG_ERROR("overlay 切换 SDR/HDR 表面失败，结束本次面板显示");
+                            break;
+                        }
+                        state.device->set_thumbnail(snapshot.thumbnail.get());
                     } else {
-                        state.device->set_thumbnail({}, 0, 0);  // 新截图已开始但还没有缩略图：清掉上一张
+                        state.device->set_thumbnail(nullptr);  // 新截图已开始但还没有缩略图：清掉上一张
                     }
                 }
             }
@@ -832,6 +1027,8 @@ namespace gamesnap {
             }
 
             ImDrawList* background = ImGui::GetBackgroundDrawList();
+            if (state.device->hdr())
+                background->AddCallback(OverlayDevice::draw_ui, state.device.get());
             background->AddRectFilled(ImVec2(0, card_top), ImVec2(static_cast<float>(panel_width), card_top + card_height),
                                       IM_COL32(18, 20, 26, 205), 14.0F * scale);
             background->AddRect(ImVec2(1, card_top + 1),
@@ -848,12 +1045,18 @@ namespace gamesnap {
             ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0F);
             ImGui::Begin("##overlay", nullptr, flags);
             ImGui::PopStyleVar(2);
+            if (state.device->hdr())
+                ImGui::GetWindowDrawList()->AddCallback(OverlayDevice::draw_ui, state.device.get());
 
             ImGui::SetCursorPos(ImVec2(padding, padding));
             if (state.device->thumbnail_view() != nullptr) {
+                if (state.device->hdr())
+                    ImGui::GetWindowDrawList()->AddCallback(OverlayDevice::draw_hdr_thumbnail, state.device.get());
                 ImGui::Image(ImTextureRef(static_cast<ImTextureID>(
                                  reinterpret_cast<std::uintptr_t>(state.device->thumbnail_view()))),
                              ImVec2(thumb_width, thumb_height));
+                if (state.device->hdr())
+                    ImGui::GetWindowDrawList()->AddCallback(OverlayDevice::draw_ui, state.device.get());
             } else {
                 ImGui::GetWindowDrawList()->AddRectFilled(
                     ImGui::GetCursorScreenPos(),

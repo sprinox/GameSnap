@@ -54,10 +54,23 @@ Release 默认启用 clang-tidy。机器上没有 `clang-tidy.exe` 时会在 `Mi
 自检还覆盖：FP16 就近偶数舍入及 SIMD 尾部、失败/乱序请求的 UI 序号、显示验证的尾部合并、
 三任务并发重名写入、PNG/JPEG 短 EXIF 标题、JPEG 三通道输出、JXL PQ 10000 nit 元数据、
 AUTO 的 AV1 专属参数隔离，以及负色/超白/奇数尺寸的 CPU/GPU 色调映射对比。
+还覆盖 SDR/HDR 缩略图的通道顺序、letterbox、无 SRV 回退、HDR 原值保留，以及隐藏 DirectComposition
+表面的 SDR→HDR→SDR→HDR→SDR 切换和像素回读（含 UI 白点和预乘透明度）。
 测试输出写入指定目录（包括 `regression` 和 `collision-*` 子目录）；不会修改已有截图。
 
 2026-11-15 在 RTX 4070 上验证 Debug/Release 构建和 GPU/AOM、CPU/JXL、GPU/SVT 三组自检；
 五组色调映射对比的最大 8-bit 通道差为 0。属于合成纹理正确性验证，不代表真实游戏采集或性能基准。
+
+真实 WGC 回调测试需额外显式选择（要求正常交互桌面，受限沙箱可能缺少捕获服务）：
+
+```powershell
+.\GameSnap\x64\Debug\GameSnap.exe --selftest-capture --config .\config.example.yaml --out .\build-preview-test
+```
+
+该测试额外进行 SDR/HDR/SDR 三次真实捕获，但不启动编码消费者：验证任务还未编码时，缩略图已经发布。
+真实捕获帧只在内存中使用，不写屏幕图像；其余合成纹理自检仍照常写入指定测试目录。
+2026-11-15 在 RTX 4070 桌面环境中通过，三次回调缩略图阶段约 6–10 ms；这是单次 Debug 功能验证记录，不是性能保证。
+另以 `GAMESNAP_ENABLE_SELFTEST=1` 构建 Release 自检版本，验证 `/O3` 着色器；色调映射、缩略图及 Overlay 像素回读同样全部通过。
 
 ## clang-format
 

@@ -110,7 +110,8 @@ AVIF 支持 quality/lossless/speed；HEIC（x265）支持 quality/lossless/prese
 | `--format-sdr <格式>` | SDR 输出格式 |
 | `--tone-map <spline\|analysis>` | 色调映射算法 |
 | `--verbose` | 调试日志 |
-| `--selftest` | 合成纹理自检编码链路，不经过 WGC |
+| `--selftest` | Debug 合成纹理自检编码链路、缩略图和 Overlay，不经过 WGC |
+| `--selftest-capture` | Debug 自检并额外验证真实 WGC 回调提前发布小图，见 build.md |
 | `--help` | 显示帮助 |
 
 > **基准参数（`--bench` / `--bench-scale` / `--bench-verify`）** 属于开发者自用的测试工具，

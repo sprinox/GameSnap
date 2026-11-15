@@ -1029,6 +1029,7 @@ verbose: false
             ("tone-map", "色调映射 spline / analysis", cxxopts::value<std::string>())
             ("verbose", "输出调试日志")
             ("selftest", "用合成纹理跑编码链路自检")
+            ("selftest-capture", "自检并验证真实 WGC 回调提前发布 SDR/HDR 缩略图")
             ("bench", "编码基准：给一张 PNG 跑格式矩阵；给一个目录则用当前配置逐张编码并算压缩率",
              cxxopts::value<std::string>())
             ("bench-scale", "基准：把源缩放到指定高度（例如 1080）再编码",
@@ -1159,6 +1160,10 @@ verbose: false
             config.verbose = true;
         if (result.count("selftest") != 0)
             config.selftest = true;
+        if (result.count("selftest-capture") != 0) {
+            config.selftest = true;
+            config.selftest_capture = true;
+        }
 
         if (result.count("bench") != 0) {
             const std::filesystem::path source = utf8_to_wstring(result["bench"].as<std::string>());

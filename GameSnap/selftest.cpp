@@ -28,6 +28,8 @@
 #    include "tonemap.h"
 #    include "ui_bridge.h"
 #    include "system_events.h"
+#    include "thumbnail.h"
+#    include "capture.h"
 
 namespace gamesnap {
     namespace {
@@ -378,17 +380,30 @@ namespace gamesnap {
             UiBridge ui;
             const auto failed_shot = ui.on_trigger();
             const auto current = ui.on_trigger();
-            ui.publish(current, L"current", nullptr);
-            ui.publish(failed_shot, L"stale", nullptr);
+            ui.publish_filename(current, L"current");
+            ui.publish_filename(failed_shot, L"stale");
             if (!check(ui.snapshot().filename == L"current", "跳过失败请求后序号仍匹配"))
                 return false;
             const auto next = ui.on_trigger();
-            ui.publish(current, L"late", nullptr);
+            ui.publish_filename(current, L"late");
             if (!check(ui.snapshot().filename.empty(), "新请求不能显示旧任务的迟到结果"))
                 return false;
             (void)::WaitForSingleObject(ui.trigger_event(), 0);
-            ui.publish(next, L"next", nullptr);
+            ui.publish_filename(next, L"next");
             if (!check(::WaitForSingleObject(ui.trigger_event(), 0) == WAIT_OBJECT_0, "发布唤醒静态 UI"))
+                return false;
+            auto thumbnail = std::make_shared<UiBridge::Thumbnail>();
+            thumbnail->hdr = true;
+            ui.publish_thumbnail(next, thumbnail);
+            if (!check(ui.snapshot().filename == L"next" && ui.snapshot().thumbnail == thumbnail,
+                       "先文件名再缩略图不互相覆盖"))
+                return false;
+            const auto final = ui.on_trigger();
+            ui.publish_thumbnail(final, thumbnail);
+            ui.publish_filename(final, L"final");
+            ui.publish_thumbnail(next, std::make_shared<UiBridge::Thumbnail>());
+            if (!check(ui.snapshot().filename == L"final" && ui.snapshot().thumbnail == thumbnail,
+                       "先缩略图再文件名不互相覆盖，旧缩略图被拒绝"))
                 return false;
             ui.job_enqueued();
             if (!check(ui.snapshot().remaining == 1, "UI 任务计数"))
@@ -607,10 +622,117 @@ namespace gamesnap {
             return true;
         }
 
+        bool test_capture_thumbnail(std::shared_ptr<D3DContext> const& d3d) {
+            for (const bool hdr : {false, true}) {
+                for (const bool srv : {false, true}) {
+                    for (const bool portrait : {false, true}) {
+                        const UINT width = portrait ? 7 : 13, height = portrait ? 13 : 7;
+                        const UINT stride = width * (hdr ? 8 : 4);
+                        std::vector<std::uint8_t> input(stride * height);
+                        if (hdr) {
+                            // 负色和 1000 nit 均须逐位保留，不能被当成 SDR 归一化/裁切。
+                            const float colors[]{12.5F, -0.5F, 2.5F, 0.0F};
+                            for (std::size_t i = 0; i < input.size(); i += 8)
+                                float_to_half_row(colors, reinterpret_cast<std::uint16_t*>(input.data() + i), 4);
+                        } else {
+                            fill_bgra(input.data(), stride, width, height);
+                        }
+                        D3D11_TEXTURE2D_DESC desc{};
+                        desc.Width = width;
+                        desc.Height = height;
+                        desc.MipLevels = desc.ArraySize = 1;
+                        desc.SampleDesc.Count = 1;
+                        desc.Usage = D3D11_USAGE_DEFAULT;
+                        desc.Format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
+                        desc.BindFlags = srv ? D3D11_BIND_SHADER_RESOURCE : 0;
+                        D3D11_SUBRESOURCE_DATA data{input.data(), stride, 0};
+                        winrt::com_ptr<ID3D11Texture2D> texture;
+                        if (!check(SUCCEEDED(d3d->device()->CreateTexture2D(&desc, &data, texture.put())), "缩略图源纹理"))
+                            return false;
+                        std::string error;
+                        const auto started = SteadyClock::now();
+                        const auto thumb = make_capture_thumbnail(*d3d, texture.get(), 200, error);
+                        const auto generated_at = SteadyClock::now();
+                        if (!check(thumb && thumb->width == 320 && thumb->height == 180 && thumb->hdr == hdr, error))
+                            return false;
+                        const UINT draw_width = portrait ? 180 * width / height : 320;
+                        const UINT draw_height = portrait ? 180 : 320 * height / width;
+                        const UINT x0 = (320 - draw_width) / 2, y0 = (180 - draw_height) / 2;
+                        for (UINT y = y0; y < y0 + draw_height; ++y) {
+                            for (UINT x = x0; x < x0 + draw_width; ++x) {
+                                const auto* src = input.data() + (y - y0) * height / draw_height * stride +
+                                                  (x - x0) * width / draw_width * (hdr ? 8 : 4);
+                                const auto* dst = thumb->pixels.data() + (y * 320 + x) * (hdr ? 8 : 4);
+                                if (hdr) {
+                                    const auto* fp16 = reinterpret_cast<std::uint16_t const*>(dst);
+                                    if (!check(std::memcmp(src, dst, 6) == 0 && fp16[3] == 0x3c00, "HDR 小图保留原始 FP16 值且不映射"))
+                                        return false;
+                                } else if (!check(dst[0] == src[2] && dst[1] == src[1] && dst[2] == src[0] && dst[3] == 255,
+                                                  "SDR 缩略图通道顺序/等比采样"))
+                                    return false;
+                            }
+                        }
+                        if (!hdr && !check(thumb->pixels[0] == 45 && thumb->pixels[1] == 48 && thumb->pixels[2] == 58,
+                                           "缩略图 letterbox"))
+                            return false;
+                        SPDLOG_INFO("{} 缩略图 {}x{} SRV={} 通过，{:.2f}ms，{} 字节",
+                                    hdr ? "HDR" : "SDR", width, height, srv,
+                                    duration_ms(generated_at - started), thumb->pixels.size());
+                    }
+                }
+            }
+            return true;
+        }
+
+        bool test_wgc_preview(HMONITOR monitor, std::shared_ptr<D3DContext> const& d3d) {
+            for (const bool hdr : {false, true, false}) {
+                auto ui = std::make_shared<UiBridge>();
+                auto shot = std::make_shared<ShotContext>();
+                shot->ui = ui;
+                shot->sequence = ui->on_trigger();
+                shot->d3d = d3d;
+                shot->jobs = std::make_shared<EncodeQueue>();  // 故意不启动编码线程
+                shot->canceled = std::make_shared<std::atomic<bool>>(false);
+                shot->hdr = hdr;
+                shot->sdr_white_nits = 200;
+                shot->color_space = hdr ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+                shot->timings.input = shot->timings.dequeued = shot->timings.title_done = shot->timings.prepared =
+                    shot->timings.start_capture = SteadyClock::now();
+                std::string error;
+                auto resources = CaptureResources::create(monitor, d3d,
+                                                          hdr ? winrt::DirectXPixelFormat::R16G16B16A16Float : winrt::DirectXPixelFormat::B8G8R8A8UIntNormalized, error);
+                if (!check(resources != nullptr, error))
+                    return false;
+                resources->sink()->arm(shot);
+                resources->start_capture();
+                const bool done = shot->done.try_acquire_for(std::chrono::seconds(5));
+                if (!done)
+                    shot->canceled->store(true, std::memory_order_release);
+                if (!resources->quiesce(std::chrono::seconds(2))) {
+                    resources->abandon();
+                    return check(false, "WGC 回调收尾超时");
+                }
+                resources->stop_capture();
+                resources->close();
+                const auto snapshot = ui->snapshot();
+                EncodeJob unencoded;
+                if (!check(done && !shot->failed.load(std::memory_order_acquire) &&
+                               shot->jobs->try_dequeue(unencoded) && snapshot.remaining == 1 &&
+                               snapshot.thumbnail && snapshot.thumbnail->hdr == hdr && snapshot.filename.empty() &&
+                               snapshot.thumbnail->pixels.size() == 320 * 180 * (hdr ? 8U : 4U),
+                           "真实 WGC 回调必须在编码开始前发布正确类型的缩略图"))
+                    return false;
+                SPDLOG_INFO("真实 WGC {} 回调预览通过（编码线程未启动），{:.2f}ms",
+                            hdr ? "HDR" : "SDR", duration_ms(SteadyClock::now() - shot->timings.input));
+            }
+            return true;
+        }
+
     }  // namespace
 
     bool run_selftest(Config const& config) {
-        SPDLOG_INFO("=== GameSnap 自检：不经过屏幕捕获，验证 staging → 像素转换 → 编码 → 写盘 ===");
+        SPDLOG_INFO("=== GameSnap 自检：转换 / 编码 / 缩略图 / overlay{} ===",
+                    config.selftest_capture ? " / 真实 WGC 回调" : "（合成纹理）");
 
         try {
             winrt::init_apartment(winrt::apartment_type::multi_threaded);
@@ -637,6 +759,10 @@ namespace gamesnap {
         ok = test_codec_metadata(config) && ok;
         ok = test_tonemap_parity(d3d) && ok;
         ok = test_collisions(config, d3d) && ok;
+        ok = test_capture_thumbnail(d3d) && ok;
+        ok = check(run_overlay_selftest(), "SDR/HDR overlay 重建及像素回读") && ok;
+        if (config.selftest_capture)
+            ok = test_wgc_preview(display.monitor, d3d) && ok;
         ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_B8G8R8A8_UNORM, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, .sdr_white_nits = 80, .label = "SDR BGRA"}) &&
              ok;
         ok = run_case(config, d3d, Case{.format = DXGI_FORMAT_R8G8B8A8_UNORM, .color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, .sdr_white_nits = 80, .label = "SDR RGBA"}) &&

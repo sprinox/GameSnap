@@ -62,7 +62,7 @@ namespace {
         }
     }
 
-    int run(gamesnap::Config const& config) {
+    int run(gamesnap::Config const& config, gamesnap::ConsoleState const& console) {
         gamesnap::ComApartment apartment;
         if (!apartment.ok()) {
             SPDLOG_CRITICAL("初始化 COM apartment 失败: {}", gamesnap::describe_hresult(apartment.result()));
@@ -152,7 +152,7 @@ namespace {
         ::SetConsoleCtrlHandler(console_ctrl_handler, FALSE);
         SPDLOG_INFO("已退出");
         const bool failed = capture.fatal_error() || capture_crashed.load(std::memory_order_relaxed);
-        if (failed && ::GetConsoleWindow() == nullptr) {
+        if (failed && !console.has_output()) {
             // 双击启动时没有控制台：捕获失败（权限不足、WGC 不可用等）不能只躺在日志里。
             (void)::MessageBoxW(nullptr,
                                 L"GameSnap 因错误退出。\n详细信息见 exe 目录下的 logs\\GameSnap.log。",
@@ -164,16 +164,15 @@ namespace {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    // 不再改控制台代码页：所有控制台输出都走 WriteConsoleW（spdlog 有
-    // SPDLOG_UTF8_TO_WCHAR_CONSOLE，自己的输出走 write_console_utf8），
-    // 而 SetConsoleOutputCP 改的是父终端共享的属性，退出后会把 cmd 留在 UTF-8 上。
+    // 先确定标准流，再安装处理器/日志 sink；此后不再 AttachConsole 或更换标准句柄。
+    const auto console = gamesnap::initialize_console();
 
     gamesnap::install_terminate_handler();
     gamesnap::install_new_handler();
-    gamesnap::init_logging();
+    gamesnap::init_logging(console);
     if (!gamesnap::check_cpu_features()) {
         // Windows 子系统（双击启动）没有控制台，critical 日志没人看得见：补一个对话框。
-        if (::GetConsoleWindow() == nullptr) {
+        if (!console.has_output()) {
             (void)::MessageBoxW(nullptr, L"CPU 不支持 AVX2 / F16C，GameSnap 无法运行。", L"GameSnap",
                                 MB_ICONERROR | MB_OK);
         }
@@ -189,8 +188,8 @@ int wmain(int argc, wchar_t** argv) {
                                     return arg != nullptr &&
                                            (std::wcscmp(arg, L"--help") == 0 || std::wcscmp(arg, L"-h") == 0);
                                 });
-        // 同样：没有控制台时把"配置有问题"这件事弹出来，别让它只躺在日志里。
-        if (!help_requested && ::GetConsoleWindow() == nullptr) {
+        // 同样：没有可用标准输出时把"配置有问题"这件事弹出来，别让它只躺在日志里。
+        if (!help_requested && !console.has_output()) {
             (void)::MessageBoxW(nullptr,
                                 L"启动参数或配置文件有误。\n详细信息见 exe 目录下的 logs\\GameSnap.log。",
                                 L"GameSnap", MB_ICONERROR | MB_OK);
@@ -234,7 +233,7 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     try {
-        const int code = run(*config);
+        const int code = run(*config, console);
         spdlog::shutdown();
         return code;
     } catch (winrt::hresult_error const& e) {

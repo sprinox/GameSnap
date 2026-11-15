@@ -221,7 +221,7 @@ namespace gamesnap {
             return;
         tray_.uFlags = NIF_INFO;
         wcscpy_s(tray_.szInfoTitle, L"GameSnap");
-        wcscpy_s(tray_.szInfo, L"已就绪：按热键截图。右键托盘图标可切换控制台或退出。");
+        wcscpy_s(tray_.szInfo, L"已就绪：按热键截图。右键托盘图标可退出。");
         tray_.dwInfoFlags = NIIF_INFO;
         tray_.uTimeout = 5000;
         if (::Shell_NotifyIconW(NIM_MODIFY, &tray_) == FALSE)

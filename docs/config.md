@@ -128,16 +128,21 @@ AVIF 支持 quality/lossless/speed；HEIC（x265）支持 quality/lossless/prese
 
 文件位于 exe 目录的 `logs\GameSnap.log`，UTF-8，单文件 8 MB、保留 2 个。
 
-控制台输出是**按运行时有没有控制台**自动开关的：
+启动时独立检查 stdin/stdout/stderr，保留每个标准流的重定向；日志优先使用 stdout，缺失时使用 stderr：
 
 | 场景 | 控制台输出 |
 |---|---|
 | 双击启动（Windows 子系统，没有控制台） | 无，只写文件 |
 | 从 cmd / PowerShell 启动 | 有：`AttachConsole(ATTACH_PARENT_PROCESS)` 挂上父控制台并重定向标准流 |
 | stdout 已重定向到文件/管道 | 有，且写进重定向目标（不会去抢控制台） |
+| 仅 stderr 可用、stdout 缺失且父控制台不可连接 | 日志写入 stderr |
+| stdout 重定向到 `NUL` | 保持静默，不改写到控制台或 stderr；文件日志照常保留 |
 
 程序是 Windows 子系统，双击不会弹出控制台窗口；启动期的致命错误（CPU 不支持 AVX2、配置解析失败）
-在没有控制台时会用 MessageBox 提示，不会静默退出。
+在 stdout/stderr 均不可用时会用 MessageBox 提示；文件、管道或 `NUL` 重定向存在时不弹窗。
+连接父控制台不会修改父终端的代码页或窗口状态。控制台通过 `WriteConsoleW` 输出 Unicode，
+文件/管道写原始 UTF-8；`--help` 不插入按字节计算的换行，以免切开中文字符。
+正常启动不再输出标准句柄地址等诊断信息；CRT 绑定失败时才记录警告。
 
 格式：
 

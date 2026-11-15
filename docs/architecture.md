@@ -144,8 +144,12 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 - 收到 `TaskbarCreated` 广播（explorer 重启）时重新添加图标，否则图标会凭空消失。
 - 捕获资源初始化成功后调 `SystemEventThread::notify_ready()`：向窗口投递 `kTrayNotifyReady`，由线程用 `NIF_INFO` 气球通知（Win10+ 显示为系统通知）。
 - 进程是 **Windows 子系统**（`/SUBSYSTEM:WINDOWS` + `wmainCRTStartup`）：双击不会弹控制台窗口。
-  从终端启动时由 `ensure_console_available()` 调 `AttachConsole(ATTACH_PARENT_PROCESS)` 挂上父控制台，
-  日志额外输出到终端；没有控制台（双击）时就只写 `logs\GameSnap.log`。
+  `wmain` 首先调用 `console.cpp` 的 `initialize_console()`，保全三条标准流后连接父控制台，
+  独立保留文件/管道/`NUL` 重定向，并检查 CRT 绑定结果；句柄用 RAII 管理，重复调用不再改动。
+  随后 `init_logging(console)` 只负责选择标准流 sink 和文件 sink；不再修改句柄。
+  日志优先 stdout、缺失时 stderr；双击且无标准输出时只写 `logs\GameSnap.log`。
+  不分配新控制台、不修改父控制台代码页。普通和紧急 UTF-8 输出共用固定栈缓冲，处理部分写入，
+  不在 UTF-8 字符中间分块，也不截断长消息；紧急入口不分配堆内存、不经过 CRT 流锁。
 
 托盘相关操作全部在 system-events 线程内完成，跨线程只有一个 `std::atomic<HWND>` 和 `PostMessageW`。
 - 捕获资源初始化成功后调 `SystemEventThread::notify_ready()`：向窗口投递 `kTrayNotifyReady`，由线程用 `NIF_INFO` 气球通知（Win10+ 显示为系统通知）。
@@ -193,7 +197,7 @@ Windows.Graphics.Capture 的 `GraphicsCaptureSession` 只有 `StartCapture()` �
 仍保留的预分配 / 常驻项：
 
 - WGC 的 `Direct3D11CaptureFramePool` / `GraphicsCaptureSession`：上一张结束后预创建下一套，用于压低热键延迟；
-- libjpeg 的 `thread_local cinfo` 与行缓冲：`longjmp` 会跳过普通局部对象析构，不能安全改成每张分配，属于非纹理的小缓冲。
+- libjpeg 的 `thread_local cinfo` 与 EXIF 小缓冲：`longjmp` 会跳过普通局部对象析构；JPEG 已直接读取 BGRX，不再保留 RGB 行缓冲。
 
 取舍：
 

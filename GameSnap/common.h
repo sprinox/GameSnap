@@ -1,6 +1,7 @@
 #pragma once
 
 #include "image.h"
+#include "console.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 公共基础设施：Windows / D3D / WinRT 头文件、日志、COM 驻留、时间工具、配置。
@@ -100,14 +101,7 @@ namespace gamesnap {
     };
     FilenamePlaceholders parse_filename_placeholders(std::wstring_view pattern);
 
-    // 交给控制台（或重定向目标）的一段 UTF-8 文本。
-    // 控制台用 WriteConsoleW，绕开会话代码页（cmd 默认 936 时中文会乱码）；
-    // 句柄不是控制台（重定向到文件/管道）时退回 fwrite 原始 UTF-8 字节。
-    void write_console_utf8(std::string_view text, bool to_stderr = false);
-    // 不分配内存的版本：OOM 处理器 / 控制台控制处理器这类不能分配的场景专用。
-    void write_console_utf8_fixed(std::string_view text, bool to_stderr);
-
-    void init_logging();
+    void init_logging(ConsoleState const& console);
     void install_terminate_handler();
     void install_new_handler();
     // 启动时检查 AVX2 / F16C；不满足时记录原因并返回 false。
